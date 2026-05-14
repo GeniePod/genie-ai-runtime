@@ -214,6 +214,26 @@ void rope_inplace_store_kv_fp16(
     cudaStream_t   stream
 );
 
+// CUDA-graph-friendly variant: position is read from a device int* at
+// kernel-execution time, and the K/V cache write destinations are
+// computed inside the kernel as `cache_layer_base + pos * kv_stride`.
+// Lets a single captured graph be replayed for every decode step.
+void rope_inplace_store_kv_fp16_dyn(
+    half*          q,
+    half*          k,
+    const half*    v,
+    half*          k_cache_layer_base,
+    half*          v_cache_layer_base,
+    int            n_heads,
+    int            n_kv_heads,
+    int            head_dim,
+    int            kv_stride,           // = n_kv_heads * head_dim
+    const int*     d_pos,               // device-side int with current pos
+    float          theta_base,
+    bool           neox,
+    cudaStream_t   stream
+);
+
 // ── Flash Attention (single query, decode path) ──────────────────────────
 // Fused: Q×K^T → scale → softmax → ×V, all in shared memory + registers.
 // Tuned for 48 KB shared mem: TILE_Q=1 (decode), TILE_KV=64.
@@ -254,6 +274,24 @@ void flash_attention_prefill_batched(
     int            head_dim,
     int            N,          // number of query tokens
     int            start_pos,  // absolute position of token 0 in the cache
+    float          scale,
+    bool           kv_int8,
+    const float*   kv_scales,
+    cudaStream_t   stream
+);
+
+// CUDA-graph-friendly variant of flash_attention_decode: seq_len is
+// computed inside the kernel as (*d_pos) + 1. Used by the captured
+// decode graph so a single graph can be replayed for every step.
+void flash_attention_decode_dyn(
+    half*          output,
+    const half*    q,
+    const void*    k_cache,
+    const void*    v_cache,
+    int            n_heads,
+    int            n_kv_heads,
+    int            head_dim,
+    const int*     d_pos,
     float          scale,
     bool           kv_int8,
     const float*   kv_scales,

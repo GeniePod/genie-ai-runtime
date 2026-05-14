@@ -299,6 +299,7 @@ Engine::~Engine() { unload(); }
 void Engine::unload() {
     if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
     if (decode_graph_)      { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
+    if (d_pos_) { cudaFree(d_pos_); d_pos_ = nullptr; }
     if (stream_)            { cudaStreamDestroy(stream_); stream_ = nullptr; }
     if (host_logits_) {
         cudaFreeHost(host_logits_);
@@ -718,6 +719,16 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
     }
     host_logits_capacity_ = config_.vocab_size;
 
+    // 4-byte device buffer that holds the current decode position; rewritten
+    // before each captured-graph replay and read by the *_dyn rope/attention
+    // kernels. Allocated even when JLLM_DECODE_GRAPH is off — costs nothing.
+    cudaError_t pos_err = cudaMalloc((void**)&d_pos_, sizeof(int));
+    if (pos_err != cudaSuccess) {
+        fprintf(stderr, "[engine] cudaMalloc d_pos_ (4 B) failed: %s\n",
+                cudaGetErrorString(pos_err));
+        return false;
+    }
+
     budget_.print();
     loaded_ = true;
     return true;
@@ -880,6 +891,86 @@ void Engine::transformer_layer_ffn_block(int layer, half* x_attn, half* swiglu_i
     half* ffn_out = (half*)scratch_.get(H * sizeof(half));
     gemv_quant(ffn_out, lw.w_down, lw.type_w_down, swiglu_in, H, I, stream_);
     vec_add(x_out, x_attn, ffn_out, H, stream_);
+}
+
+// Graph-capture-friendly variant of transformer_layer. Same kernel
+// sequence, same scratch-allocation order (so iter-1+ replay sees the
+// same buffer addresses iter-0 used), but with two substitutions:
+//   • rope_inplace_store_kv_fp16  → rope_inplace_store_kv_fp16_dyn
+//   • flash_attention_decode      → flash_attention_decode_dyn
+// Those kernels read the current decode position from `*d_pos_` at
+// execution time, so a single captured graph stays valid for every
+// decode step. INT8 KV and overflow positions are NOT supported in
+// this path — the caller is expected to fall back to decode_step in
+// those cases (gen_params_.kv_int8 || pos >= max_context).
+void Engine::transformer_layer_graph(int layer, half* x) {
+    const auto& lw = model_weights_.layers[layer];
+    const int H = config_.hidden_dim;
+    const int Q_DIM = config_.n_heads * config_.head_dim;
+    const int KV_DIM = config_.n_kv_heads * config_.head_dim;
+    const int I = config_.intermediate_dim;
+    const bool norm_fp32 = (lw.rms_type == 0);
+
+    half* normed   = (half*)scratch_.get(H * sizeof(half));
+    half* q_buf    = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* k_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* v_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+
+    fused_rmsnorm_residual(normed, x, nullptr, lw.rms_attn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+    gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
+                      k_buf, lw.wk, lw.type_wk, KV_DIM,
+                      v_buf, lw.wv, lw.type_wv, KV_DIM,
+                      normed, H, stream_);
+
+    half* x2        = (half*)scratch_.get(H * sizeof(half));
+    half* attn_out  = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* attn_proj = (half*)scratch_.get(H * sizeof(half));
+
+    if (lw.q_norm && lw.k_norm) {
+        fused_rmsnorm_residual(q_buf, q_buf, nullptr, lw.q_norm,
+                               config_.n_heads, config_.head_dim,
+                               config_.rms_eps, lw.qk_norm_type == 0, stream_);
+        fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
+                               config_.n_kv_heads, config_.head_dim,
+                               config_.rms_eps, lw.qk_norm_type == 0, stream_);
+    }
+
+    rope_inplace_store_kv_fp16_dyn(q_buf, k_buf, v_buf,
+                                   (half*)kv_cache_.key_ptr(layer, 0),
+                                   (half*)kv_cache_.val_ptr(layer, 0),
+                                   config_.n_heads, config_.n_kv_heads,
+                                   config_.head_dim, KV_DIM,
+                                   d_pos_, config_.rope_theta,
+                                   config_.rope_neox, stream_);
+
+    const float scale = 1.0f / sqrtf((float)config_.head_dim);
+    flash_attention_decode_dyn(attn_out, q_buf,
+                               kv_cache_.key_ptr(layer, 0),
+                               kv_cache_.val_ptr(layer, 0),
+                               config_.n_heads, config_.n_kv_heads,
+                               config_.head_dim,
+                               d_pos_, scale,
+                               /*kv_int8=*/false, /*kv_scales=*/nullptr, stream_);
+
+    gemv_quant(attn_proj, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
+    vec_add(x2, x, attn_proj, H, stream_);
+
+    half* normed2    = (half*)scratch_.get(H * sizeof(half));
+    half* gate_buf   = (half*)scratch_.get(I * sizeof(half));
+    half* up_buf     = (half*)scratch_.get(I * sizeof(half));
+    half* swiglu_out = (half*)scratch_.get(I * sizeof(half));
+
+    fused_rmsnorm_residual(normed2, x2, nullptr, lw.rms_ffn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+    gemv_quant_pair(gate_buf, lw.w_gate, lw.type_w_gate, I,
+                    up_buf,   lw.w_up,   lw.type_w_up,   I,
+                    normed2, H, stream_);
+    fused_swiglu(swiglu_out, gate_buf, up_buf, 1, I, stream_);
+
+    half* ffn_out = (half*)scratch_.get(H * sizeof(half));
+    gemv_quant(ffn_out, lw.w_down, lw.type_w_down, swiglu_out, H, I, stream_);
+    vec_add(x, x2, ffn_out, H, stream_);
 }
 
 // ── Batched prefill scaffolding (Path B, issue #12) ──────────────────────
@@ -1145,39 +1236,73 @@ int Engine::decode_step(int pos) {
     return token;
 }
 
-// ── CUDA graph capture (BUG #5 FIX) ─────────────────────────────────────
-// Captures the GPU-side kernels of one decode step.
-// Requirements:
-//   - KV cache length is padded to max_context (fixed graph structure)
-//   - Embedding lookup done outside graph (host→device copy not capturable)
-//   - Sampling done outside graph (host-side operation)
+bool Engine::decode_graph_enabled() const {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_DECODE_GRAPH");
+        return v && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
 
+// Capture the full decode-step GPU pipeline as a CUDA graph:
+//   transformer_layer_graph × n_layers
+//   final RMSNorm
+//   output projection (gemv_quant_f32 → FP32 logits)
+//   D2H cudaMemcpyAsync to the pinned host_logits_ buffer
+//
+// The captured kernels read the current decode position from `*d_pos_`
+// (which the host updates before each replay) so a single graph stays
+// valid for every step. Embedding lookup and sampling stay on the host
+// side around each replay.
+//
+// Requirements (caller-checked before invoking):
+//   - !gen_params_.kv_int8  (the dyn rope/KV-store kernel only emits FP16)
+//   - pos < config_.max_seq_len AND pos within the KV fast pool, so all
+//     captured KV-cache writes go to addresses derived from gpu_pool_
+//     (no CPU overflow path).
 void Engine::build_cuda_graph(int pos) {
     if (graph_captured_) return;
     if (!gen_params_.use_cuda_graph) return;
+    if (!decode_graph_enabled()) return;
+    if (gen_params_.kv_int8) {
+        fprintf(stderr, "[engine] decode-graph: INT8 KV not supported; staying on per-step path\n");
+        return;
+    }
+    if (!kv_cache_.is_fast_position(pos)) {
+        fprintf(stderr, "[engine] decode-graph: pos %d outside KV fast pool; staying on per-step path\n", pos);
+        return;
+    }
 
-    fprintf(stderr, "[engine] Capturing CUDA graph...\n");
+    fprintf(stderr, "[engine] Capturing decode CUDA graph...\n");
 
-    // Pre-allocate a fixed hidden state buffer for graph capture
     int H = config_.hidden_dim;
+
+    // Reset scratch so the captured allocation pattern matches what
+    // decode_step_graph will produce on replay (it starts with one
+    // scratch_.get(x) after scratch_.reset()).
+    scratch_.reset();
     half* graph_x = (half*)scratch_.get(H * sizeof(half));
 
     cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal);
 
-    // Capture all transformer layers
     for (int l = 0; l < config_.n_layers; l++) {
-        transformer_layer(l, pos, graph_x);
+        transformer_layer_graph(l, graph_x);
     }
 
-    // Capture final norm
     half* g_normed = (half*)scratch_.get(H * sizeof(half));
     fused_rmsnorm_residual(g_normed, graph_x, nullptr,
                           model_weights_.output_norm, 1, H, config_.rms_eps, true, stream_);
 
-    // Capture logit projection without an intermediate FP16 logits pass.
     float* g_logits_fp32 = (float*)scratch_.get(config_.vocab_size * sizeof(float));
     gemv_quant_f32(g_logits_fp32, model_weights_.output, model_weights_.output_type,
                    g_normed, config_.vocab_size, H, stream_);
+
+    // D2H copy is inside the captured region so the host only has to
+    // sync once per token. host_logits_ is pinned, allocated once on
+    // load, so its address is stable across replays.
+    cudaMemcpyAsync(host_logits_, g_logits_fp32,
+                    config_.vocab_size * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream_);
 
     cudaError_t err = cudaStreamEndCapture(stream_, &decode_graph_);
     if (err != cudaSuccess) {
@@ -1195,7 +1320,46 @@ void Engine::build_cuda_graph(int pos) {
     }
 
     graph_captured_ = true;
-    fprintf(stderr, "[engine] CUDA graph captured successfully\n");
+    fprintf(stderr, "[engine] decode CUDA graph captured (%d layers + final norm + logits + D2H)\n",
+            config_.n_layers);
+}
+
+int Engine::decode_step_graph(int pos) {
+    int H = config_.hidden_dim;
+
+    // Match the capture-time scratch layout exactly: reset, then one
+    // scratch_.get(x) at offset 0. Every other captured pointer lives
+    // at deterministic offsets above that and survives reset (the bump
+    // allocator only zeroes the cursor, not the memory).
+    scratch_.reset();
+    half* x = (half*)scratch_.get(H * sizeof(half));
+
+    dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
+                      model_weights_.embd_type, stream_);
+
+    // Push the new pos to the device-side int that the captured
+    // rope/attention dyn kernels read.
+    cudaError_t err = cudaMemcpyAsync(d_pos_, &pos, sizeof(int),
+                                      cudaMemcpyHostToDevice, stream_);
+    if (err == cudaSuccess) {
+        err = cudaGraphLaunch(decode_graph_exec_, stream_);
+    }
+    if (err == cudaSuccess) {
+        err = cudaStreamSynchronize(stream_);
+    }
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[engine] decode-graph replay failed: %s; falling back\n",
+                cudaGetErrorString(err));
+        return decode_step(pos);
+    }
+
+    int token = sample_token(host_logits_, config_.vocab_size, gen_params_,
+                             recent_tokens_.data(), recent_tokens_.size());
+
+    recent_tokens_.push_back(token);
+    if ((int)recent_tokens_.size() > 64) recent_tokens_.erase(recent_tokens_.begin());
+    last_token_ = token;
+    return token;
 }
 
 // ── Memory and thermal check ─────────────────────────────────────────────
@@ -1431,8 +1595,30 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             break;
         }
 
+        // Path C Phase 2 (#21): once we've successfully completed one
+        // decode step on the per-token path, capture a CUDA graph for
+        // every subsequent step. Replay covers ~448 launches per token
+        // → one cudaGraphLaunch, saves ~10 ms of host-side overhead
+        // per token. Falls back to per-step on any error and stays off
+        // when JLLM_DECODE_GRAPH is unset.
+        const bool use_graph = decode_graph_enabled()
+                            && graph_captured_
+                            && !gen_params_.kv_int8
+                            && kv_cache_.is_fast_position(pos);
+
         scratch_.reset();
-        int token = decode_step(pos);
+        int token;
+        if (use_graph) {
+            token = decode_step_graph(pos);
+        } else {
+            token = decode_step(pos);
+            if (decode_graph_enabled() && !graph_captured_
+                && !gen_params_.kv_int8 && kv_cache_.is_fast_position(pos)) {
+                // After the first per-token step succeeds, capture the
+                // graph for all future steps in this generate() call.
+                build_cuda_graph(pos);
+            }
+        }
         pos++;
 
         bool is_eos = (token == tokenizer_.eos_id);

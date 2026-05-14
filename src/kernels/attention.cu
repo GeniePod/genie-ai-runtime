@@ -326,6 +326,131 @@ void flash_attention_prefill_batched(
     }
 }
 
+// CUDA-graph-friendly variant of flash_attention_decode_kernel: the
+// per-step seq_len is read from a device int* at kernel-execution time,
+// computed as (*d_pos) + 1. Same online-softmax body otherwise.
+__global__ void flash_attention_decode_kernel_dyn(
+    half*        __restrict__ output,
+    const half*  __restrict__ q,
+    const void*  __restrict__ k_cache,
+    const void*  __restrict__ v_cache,
+    int n_heads, int n_kv_heads, int head_dim,
+    const int*   __restrict__ d_pos,
+    float scale, bool kv_int8, const float* kv_scales)
+{
+    const int head = blockIdx.x;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int tid = threadIdx.x;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int seq_len = (*d_pos) + 1;
+
+    extern __shared__ float smem[];
+    float* s_scores = smem;
+    float* s_out    = smem + ATTN_TILE_KV;
+
+    __shared__ float s_running_max;
+    __shared__ float s_running_sum;
+    __shared__ float s_correction;
+
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        s_out[d] = 0.0f;
+    if (tid == 0) {
+        s_running_max = -FLT_MAX;
+        s_running_sum = 0.0f;
+        s_correction = 1.0f;
+    }
+    __syncthreads();
+
+    for (int kv_start = 0; kv_start < seq_len; kv_start += ATTN_TILE_KV) {
+        int tile_len = min(ATTN_TILE_KV, seq_len - kv_start);
+
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            int kv_pos = kv_start + t;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                float q_val = __half2float(q[head * head_dim + d]);
+                float k_val;
+                if (kv_int8) {
+                    const int8_t* ki = (const int8_t*)k_cache;
+                    float ks = kv_scales ? kv_scales[kv_head] : 1.0f;
+                    k_val = ki[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * ks;
+                } else {
+                    const half* kf = (const half*)k_cache;
+                    k_val = __half2float(
+                        kf[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d]);
+                }
+                dot += q_val * k_val;
+            }
+            s_scores[t] = dot * scale;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float tile_max = -FLT_MAX;
+            for (int t = 0; t < tile_len; ++t) {
+                tile_max = fmaxf(tile_max, s_scores[t]);
+            }
+            const float old_max = s_running_max;
+            s_running_max = fmaxf(s_running_max, tile_max);
+            s_correction = expf(old_max - s_running_max);
+            s_running_sum *= s_correction;
+        }
+        __syncthreads();
+
+        for (int d = tid; d < head_dim; d += blockDim.x)
+            s_out[d] *= s_correction;
+        __syncthreads();
+
+        if (tid == 0) {
+            float tile_sum = 0.0f;
+            for (int t = 0; t < tile_len; ++t) {
+                float p = expf(s_scores[t] - s_running_max);
+                s_scores[t] = p;
+                tile_sum += p;
+            }
+            s_running_sum += tile_sum;
+        }
+        __syncthreads();
+
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                int kv_pos = kv_start + t;
+                float v_val;
+                if (kv_int8) {
+                    const int8_t* vi = (const int8_t*)v_cache;
+                    float vs = kv_scales ? kv_scales[n_kv_heads + kv_head] : 1.0f;
+                    v_val = vi[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * vs;
+                } else {
+                    const half* vf = (const half*)v_cache;
+                    v_val = __half2float(
+                        vf[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d]);
+                }
+                val += s_scores[t] * v_val;
+            }
+            s_out[d] += val;
+        }
+        __syncthreads();
+    }
+
+    float inv_sum = (s_running_sum > 0.0f) ? 1.0f / s_running_sum : 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        output[head * head_dim + d] = __float2half(s_out[d] * inv_sum);
+    }
+}
+
+void flash_attention_decode_dyn(
+    half* output, const half* q, const void* k_cache, const void* v_cache,
+    int n_heads, int n_kv_heads, int head_dim,
+    const int* d_pos,
+    float scale, bool kv_int8, const float* kv_scales, cudaStream_t stream)
+{
+    const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
+    flash_attention_decode_kernel_dyn<<<n_heads, ATTN_BLOCK, smem, stream>>>(
+        output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
+        d_pos, scale, kv_int8, kv_scales);
+}
+
 void flash_attention_decode(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int seq_len,

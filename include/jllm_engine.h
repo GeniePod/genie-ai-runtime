@@ -194,6 +194,11 @@ private:
     bool            graph_captured_ = false;
     float*          host_logits_ = nullptr;
     int             host_logits_capacity_ = 0;
+    // Device-side int written by the host before each decode-graph
+    // replay; read by rope_inplace_store_kv_fp16_dyn and
+    // flash_attention_decode_dyn so a single captured graph works for
+    // every step. Allocated on engine load, freed on unload.
+    int*            d_pos_ = nullptr;
 
     void transformer_layer(int layer, int pos, half* x);
     // Single-token attention pre-Wo: QK-norm (if not already done by the
@@ -241,8 +246,20 @@ private:
     // place per layer (residual additions).
     void transformer_prefill(int layer, int start_pos, int n_tokens, half* x_batch);
     int  decode_step(int pos);
+    // Replay-decode counterpart of decode_step that runs the captured
+    // CUDA graph instead of launching ~450 kernels host-side. The graph
+    // is built once after the first non-graph decode step.
+    int  decode_step_graph(int pos);
     void build_cuda_graph(int pos);
+    // Graph-capture-friendly variant of transformer_layer used while
+    // recording decode_graph_. Same kernel sequence as transformer_layer,
+    // but rope+KV-store and flash-attention read `*d_pos_` instead of
+    // a captured int — so the graph stays valid across decode positions.
+    void transformer_layer_graph(int layer, half* x);
     bool check_memory_and_thermal(int pos);
+    // Has the JLLM_DECODE_GRAPH env var been set to a non-zero value?
+    // Cached on first read. Default off.
+    bool decode_graph_enabled() const;
     // Has the JLLM_BATCHED_PREFILL env var been set to a non-zero value?
     // Cached on first read.
     bool batched_prefill_enabled() const;
