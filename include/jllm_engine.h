@@ -196,9 +196,25 @@ private:
     int             host_logits_capacity_ = 0;
 
     void transformer_layer(int layer, int pos, half* x);
+    // Process a contiguous batch of `n_tokens` prompt tokens through one
+    // transformer layer in a single high-level call. Scaffolding for the
+    // Path B batched-prefill effort (#12) — the initial implementation
+    // delegates to transformer_layer N times, so it produces byte-equal
+    // output but no speedup. Subsequent PRs will replace the inner
+    // kernel calls with batched (GEMM-shaped) variants and the speedup
+    // arrives without changing this entry point.
+    //
+    // Inputs/outputs live in `x_batch` which is laid out as
+    // [n_tokens × hidden_dim] (row-major: token 0's hidden state in
+    // rows 0..hidden_dim-1, etc.). x_batch is read AND written in
+    // place per layer (residual additions).
+    void transformer_prefill(int layer, int start_pos, int n_tokens, half* x_batch);
     int  decode_step(int pos);
     void build_cuda_graph(int pos);
     bool check_memory_and_thermal(int pos);
+    // Has the JLLM_BATCHED_PREFILL env var been set to a non-zero value?
+    // Cached on first read.
+    bool batched_prefill_enabled() const;
 };
 
 }  // namespace jllm

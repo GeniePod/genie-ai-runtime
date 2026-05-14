@@ -871,6 +871,39 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
     vec_add(x, x2, ffn_out, H, stream_);
 }
 
+// ── Batched prefill scaffolding (Path B, issue #12) ──────────────────────
+//
+// The initial implementation delegates to the proven single-token
+// `transformer_layer` N times. That produces byte-identical output to the
+// pre-existing per-token prefill loop and no speedup. The scaffolding's
+// value is in giving future PRs a single high-level entry point where each
+// inner kernel (QKV gemv → batched GEMM, RoPE → batched RoPE, attention →
+// chunked prefill attention, etc.) can be swapped one at a time without
+// touching `generate()` again.
+//
+// Layout invariant: `x_batch[i*H .. (i+1)*H)` is token i's hidden state,
+// read AND written in place per layer (residual additions).
+//
+// KV ordering invariant: at the time we call transformer_layer for token i
+// at layer l, layer l's K/V for positions [start_pos, start_pos+i) are
+// already written. This holds because we iterate tokens in ascending
+// order within each layer, and transformer_layer writes K/V[start_pos+i]
+// before reading the attention range [0, start_pos+i].
+void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x_batch) {
+    const int H = config_.hidden_dim;
+    for (int i = 0; i < n_tokens; i++) {
+        transformer_layer(layer, start_pos + i, x_batch + (int64_t)i * H);
+    }
+}
+
+bool Engine::batched_prefill_enabled() const {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_BATCHED_PREFILL");
+        return v && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 // ── Full decode step ─────────────────────────────────────────────────────
 
 int Engine::decode_step(int pos) {
@@ -1100,19 +1133,68 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     auto t0 = Clock::now();
     half* last_prefill_x = nullptr;
     int H = config_.hidden_dim;
-    for (int i = 0; i < (int)prompt_tokens.size(); i++) {
+    const int N = (int)prompt_tokens.size();
+
+    // x_batch sits at the bottom of scratch; transformer_layer's per-layer
+    // scratch (~120 KB on Qwen3-4B) stacks on top. Path A's normed +
+    // logits buffers stack above that. Reserve a margin so the batched
+    // path falls back gracefully on very long prompts instead of OOM-ing
+    // the bump allocator mid-prefill.
+    constexpr int64_t kBatchedScratchMargin = 16 * 1024 * 1024;
+    const int64_t x_batch_bytes = (int64_t)N * H * sizeof(half);
+    const bool batched_fits =
+        (scratch_.capacity() - x_batch_bytes) >= kBatchedScratchMargin;
+
+    if (batched_prefill_enabled() && N > 0 && batched_fits) {
+        // Path B (issue #12): layer-major prefill. Allocate one
+        // [N × H] activation buffer at the bottom of scratch, dequantize
+        // every prompt embedding into it, then loop layers-outer /
+        // tokens-inner. The inner step still calls the proven
+        // single-token kernels, so output is byte-identical to the
+        // per-token loop. Future PRs swap the inner calls for batched
+        // (GEMM-shaped) variants without touching this dispatch.
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] Path B: batched prefill enabled (JLLM_BATCHED_PREFILL=1)\n");
+            logged = true;
+        }
         scratch_.reset();
-        last_token_ = prompt_tokens[i];
-        half* x = (half*)scratch_.get(H * sizeof(half));
-        dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
-                          model_weights_.embd_type, stream_);
-        for (int l = 0; l < config_.n_layers; l++)
-            transformer_layer(l, i, x);
-        // Hang onto the last token's residual; the scratch pool has NOT
-        // been reset between iterations within prefill, so this pointer
-        // remains valid through the post-prefill sampling step below.
-        if (i == (int)prompt_tokens.size() - 1) {
-            last_prefill_x = x;
+        half* x_batch = (half*)scratch_.get(x_batch_bytes);
+        for (int i = 0; i < N; i++) {
+            dequant_embedding(x_batch + (int64_t)i * H,
+                              model_weights_.tok_embd, prompt_tokens[i], H,
+                              model_weights_.embd_type, stream_);
+        }
+        for (int l = 0; l < config_.n_layers; l++) {
+            transformer_prefill(l, 0, N, x_batch);
+        }
+        last_token_ = prompt_tokens.back();
+        last_prefill_x = x_batch + (int64_t)(N - 1) * H;
+    } else {
+        if (batched_prefill_enabled() && N > 0 && !batched_fits) {
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr,
+                        "[engine] Path B: prompt too long for batched prefill "
+                        "(N=%d, would need %ld bytes of scratch); falling back "
+                        "to per-token prefill\n", N, (long)x_batch_bytes);
+                warned = true;
+            }
+        }
+        for (int i = 0; i < N; i++) {
+            scratch_.reset();
+            last_token_ = prompt_tokens[i];
+            half* x = (half*)scratch_.get(H * sizeof(half));
+            dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
+                              model_weights_.embd_type, stream_);
+            for (int l = 0; l < config_.n_layers; l++)
+                transformer_layer(l, i, x);
+            // Hang onto the last token's residual; the scratch pool has NOT
+            // been reset between iterations within prefill, so this pointer
+            // remains valid through the post-prefill sampling step below.
+            if (i == N - 1) {
+                last_prefill_x = x;
+            }
         }
     }
     cudaStreamSynchronize(stream_);
