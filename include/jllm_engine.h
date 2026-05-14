@@ -196,6 +196,20 @@ private:
     int             host_logits_capacity_ = 0;
 
     void transformer_layer(int layer, int pos, half* x);
+    // Post-QKV portion of a single token's layer pass: QK-norm
+    // (if not already done by the caller — see Engine::transformer_prefill,
+    // which batches QK-norm), RoPE, KV store, attention, output projection,
+    // residual #1, FFN RMSNorm, gate/up, SwiGLU, down, residual #2.
+    //
+    // `q_buf`, `k_buf`, `v_buf` are token-sized projections (already
+    // produced by either gemv_quant_triple in per-token transformer_layer
+    // or the batched QKV path in transformer_prefill). `qk_norm_already`
+    // tells the helper whether QK-norm has been applied externally — set
+    // by transformer_prefill which does QK-norm batched once for all
+    // tokens, false for the per-token transformer_layer entry.
+    void transformer_layer_tail(int layer, int pos, half* x,
+                                half* q_buf, half* k_buf, half* v_buf,
+                                bool qk_norm_already);
     // Process a contiguous batch of `n_tokens` prompt tokens through one
     // transformer layer in a single high-level call. Scaffolding for the
     // Path B batched-prefill effort (#12) — the initial implementation

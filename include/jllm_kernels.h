@@ -106,6 +106,28 @@ void gemv_quant_triple(
     cudaStream_t   stream
 );
 
+// Batched K-quant GEMM. Computes y[N×M] = x[N×K] · Wᵀ[K×M] where W is
+// stored in GGUF K-quant layout (Q4_K / Q5_K / Q6_K — same types as the
+// gemv_quant family). Used during prefill to amortize the weight read
+// across the N prompt tokens — one DRAM load per weight value, N FMAs
+// per load. For N=1 this is just gemv_quant (and the dispatcher routes
+// there to keep the decode path unchanged).
+//
+// Layouts:
+//   x : [N × K] half, row-major (token-outer)
+//   y : [N × M] half, row-major
+//   W : [M × K] K-quant blocks, row-major over output rows
+void gemm_quant_batched(
+    half*          y,
+    const void*    W,
+    int            ggml_type,
+    const half*    x,
+    int            M,
+    int            N,
+    int            K,
+    cudaStream_t   stream
+);
+
 // K-quant GEMV that writes FP32 output. Used for logits to avoid an
 // intermediate FP16 projection plus FP16->FP32 conversion.
 void gemv_quant_f32(

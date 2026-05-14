@@ -819,6 +819,280 @@ static bool gemv_quant_triple_gpu(
     return true;
 }
 
+// ── Batched K-quant GEMM (prefill path) ─────────────────────────────────
+//
+// y[N×M] = x[N×K] · Wᵀ[K×M] where W is Q4_K/Q5_K/Q6_K.
+//
+// Memory-traffic principle: each warp owns one output row r. For every
+// weight value loaded (once per block-iteration) we accumulate N partial
+// sums (one per token). The weights are read from DRAM once and reused
+// N times — N=18 on a 15-token prompt + Qwen3 chat-template wrapping,
+// which is exactly the regime where per-token gemv is bandwidth-bound.
+//
+// Each thread stores a fixed-size acc[MAX_BATCH] register array; the
+// host dispatcher chunks N > MAX_BATCH into multiple kernel launches.
+
+constexpr int GEMM_MAX_BATCH = 32;
+
+// The token-loop inside the kernel is #pragma-unrolled so the compiler can
+// keep acc[] in registers — a runtime-bounded loop with dynamic indexing
+// forces a spill to local memory and erases the bandwidth win.
+
+__global__ void gemm_quant_batched_q4k_kernel(
+    half*             __restrict__ y,         // [N × M] row-major
+    const block_q4_K* __restrict__ W,         // [M × n_blocks]
+    const half*       __restrict__ x,         // [N × K] row-major
+    int M, int N, int K, int rows_per_block)
+{
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+
+    const int n_blocks = K / QK_K;
+    const block_q4_K* row_blocks = W + (int64_t)row * n_blocks;
+
+    float acc[GEMM_MAX_BATCH];
+    #pragma unroll
+    for (int t = 0; t < GEMM_MAX_BATCH; t++) acc[t] = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_q4_K& blk = row_blocks[b];
+        const float dall = raw_fp16_to_float(blk.d_raw);
+        const float dmin = raw_fp16_to_float(blk.dmin_raw);
+        const int k_base = b * QK_K;
+
+        for (int il = 0; il < 4; il++) {
+            const int is = 2 * il;
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, blk.scales, sc1, m1);
+            get_scale_min_k4(is + 1, blk.scales, sc2, m2);
+
+            const float d1 = dall * sc1;
+            const float dm1 = dmin * m1;
+            const float d2 = dall * sc2;
+            const float dm2 = dmin * m2;
+
+            const uint8_t qv = blk.qs[32 * il + lane];
+            const float w_lo = d1 * (qv & 0xF) - dm1;
+            const float w_hi = d2 * (qv >> 4)  - dm2;
+
+            const int k_lo = k_base + 64 * il + lane;
+            const int k_hi = k_lo + 32;
+
+            #pragma unroll
+            for (int t = 0; t < GEMM_MAX_BATCH; t++) {
+                if (t < N) {
+                    const half* xt = x + (int64_t)t * K;
+                    acc[t] += w_lo * __half2float(xt[k_lo]);
+                    acc[t] += w_hi * __half2float(xt[k_hi]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < GEMM_MAX_BATCH; t++) {
+        if (t < N) {
+            float a = warp_reduce_sum(acc[t]);
+            if (lane == 0) y[(int64_t)t * M + row] = __float2half(a);
+        }
+    }
+}
+
+__global__ void gemm_quant_batched_q5k_kernel(
+    half*             __restrict__ y,
+    const block_q5_K* __restrict__ W,
+    const half*       __restrict__ x,
+    int M, int N, int K, int rows_per_block)
+{
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+
+    const int n_blocks = K / QK_K;
+    const block_q5_K* row_blocks = W + (int64_t)row * n_blocks;
+
+    float acc[GEMM_MAX_BATCH];
+    #pragma unroll
+    for (int t = 0; t < GEMM_MAX_BATCH; t++) acc[t] = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_q5_K& blk = row_blocks[b];
+        const float dall = raw_fp16_to_float(blk.d_raw);
+        const float dmin = raw_fp16_to_float(blk.dmin_raw);
+        const int k_base = b * QK_K;
+
+        uint8_t u1 = 1, u2 = 2;
+        for (int il = 0; il < 4; il++) {
+            const int is = 2 * il;
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4(is + 0, blk.scales, sc1, m1);
+            get_scale_min_k4(is + 1, blk.scales, sc2, m2);
+            const float d1 = dall * sc1;
+            const float dm1 = dmin * m1;
+            const float d2 = dall * sc2;
+            const float dm2 = dmin * m2;
+
+            const uint8_t ql = blk.qs[32 * il + lane];
+            const uint8_t qh = blk.qh[lane];
+            const float w_lo = d1 * ((ql & 0xF) + ((qh & u1) ? 16 : 0)) - dm1;
+            const float w_hi = d2 * ((ql >> 4)  + ((qh & u2) ? 16 : 0)) - dm2;
+
+            const int k_lo = k_base + 64 * il + lane;
+            const int k_hi = k_lo + 32;
+
+            #pragma unroll
+            for (int t = 0; t < GEMM_MAX_BATCH; t++) {
+                if (t < N) {
+                    const half* xt = x + (int64_t)t * K;
+                    acc[t] += w_lo * __half2float(xt[k_lo]);
+                    acc[t] += w_hi * __half2float(xt[k_hi]);
+                }
+            }
+            u1 <<= 2; u2 <<= 2;
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < GEMM_MAX_BATCH; t++) {
+        if (t < N) {
+            float a = warp_reduce_sum(acc[t]);
+            if (lane == 0) y[(int64_t)t * M + row] = __float2half(a);
+        }
+    }
+}
+
+__global__ void gemm_quant_batched_q6k_kernel(
+    half*             __restrict__ y,
+    const block_q6_K* __restrict__ W,
+    const half*       __restrict__ x,
+    int M, int N, int K, int rows_per_block)
+{
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+
+    const int n_blocks = K / QK_K;
+    const block_q6_K* row_blocks = W + (int64_t)row * n_blocks;
+
+    float acc[GEMM_MAX_BATCH];
+    #pragma unroll
+    for (int t = 0; t < GEMM_MAX_BATCH; t++) acc[t] = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_q6_K& blk = row_blocks[b];
+        const float d = raw_fp16_to_float(blk.d_raw);
+        const int k_base = b * QK_K;
+
+        for (int n = 0; n < QK_K; n += 128) {
+            const uint8_t* ql = blk.ql + (n / 128) * 64;
+            const uint8_t* qh = blk.qh + (n / 128) * 32;
+            const int8_t*  sc = blk.scales + (n / 128) * 8;
+            const int is = lane / 16;
+
+            const int q1 = (int)((ql[lane +  0] & 0xF) | (((qh[lane] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int)((ql[lane + 32] & 0xF) | (((qh[lane] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int)((ql[lane +  0] >>  4) | (((qh[lane] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int)((ql[lane + 32] >>  4) | (((qh[lane] >> 6) & 3) << 4)) - 32;
+
+            const float w1 = d * (float)sc[is + 0] * (float)q1;
+            const float w2 = d * (float)sc[is + 2] * (float)q2;
+            const float w3 = d * (float)sc[is + 4] * (float)q3;
+            const float w4 = d * (float)sc[is + 6] * (float)q4;
+
+            const int k0 = k_base + n + lane;
+            #pragma unroll
+            for (int t = 0; t < GEMM_MAX_BATCH; t++) {
+                if (t < N) {
+                    const half* xt = x + (int64_t)t * K;
+                    acc[t] += w1 * __half2float(xt[k0 +  0]);
+                    acc[t] += w2 * __half2float(xt[k0 + 32]);
+                    acc[t] += w3 * __half2float(xt[k0 + 64]);
+                    acc[t] += w4 * __half2float(xt[k0 + 96]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < GEMM_MAX_BATCH; t++) {
+        if (t < N) {
+            float a = warp_reduce_sum(acc[t]);
+            if (lane == 0) y[(int64_t)t * M + row] = __float2half(a);
+        }
+    }
+}
+
+static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
+                                   const half* x, int M, int N, int K,
+                                   cudaStream_t stream) {
+    const void* W_device = resolve_weight_device_ptr(W);
+    if (!W_device || !supported_gpu_type(ggml_type)) {
+        return false;
+    }
+
+    const int rows_per_block = gemv_rows_per_block();
+    const int block = rows_per_block * 32;
+    const int grid = (M + rows_per_block - 1) / rows_per_block;
+
+    switch (ggml_type) {
+        case 12:
+            gemm_quant_batched_q4k_kernel<<<grid, block, 0, stream>>>(
+                y, (const block_q4_K*)W_device, x, M, N, K, rows_per_block);
+            break;
+        case 13:
+            gemm_quant_batched_q5k_kernel<<<grid, block, 0, stream>>>(
+                y, (const block_q5_K*)W_device, x, M, N, K, rows_per_block);
+            break;
+        case 14:
+            gemm_quant_batched_q6k_kernel<<<grid, block, 0, stream>>>(
+                y, (const block_q6_K*)W_device, x, M, N, K, rows_per_block);
+            break;
+        default:
+            return false;
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[GEMM] batched GPU launch failed: %s\n",
+                cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+void gemm_quant_batched(half* y, const void* W, int ggml_type, const half* x,
+                        int M, int N, int K, cudaStream_t stream) {
+    // N=1 is just gemv — keep the decode/per-token path bit-identical by
+    // routing there. Anything > GEMM_MAX_BATCH is chunked.
+    if (N <= 0 || M <= 0 || K <= 0) return;
+    if (N == 1) {
+        gemv_quant(y, W, ggml_type, x, M, K, stream);
+        return;
+    }
+    if (fast_gemv_enabled()) {
+        int processed = 0;
+        bool ok = true;
+        while (processed < N && ok) {
+            int chunk = N - processed;
+            if (chunk > GEMM_MAX_BATCH) chunk = GEMM_MAX_BATCH;
+            ok = gemm_quant_batched_gpu(
+                y + (int64_t)processed * M,
+                W, ggml_type,
+                x + (int64_t)processed * K,
+                M, chunk, K, stream);
+            processed += chunk;
+        }
+        if (ok) return;
+        // Fall through to per-token gemv on any GPU failure.
+        fprintf(stderr, "[GEMM] batched GPU path failed; falling back to N gemv calls\n");
+    }
+    for (int t = 0; t < N; t++) {
+        gemv_quant(y + (int64_t)t * M, W, ggml_type, x + (int64_t)t * K,
+                   M, K, stream);
+    }
+}
+
 static bool gemv_quant_cpu(std::vector<float>& h_y, const void* W, int ggml_type,
                            const std::vector<half>& h_x, int M, int K) {
     if (ggml_type != 12 && ggml_type != 13 && ggml_type != 14) {
