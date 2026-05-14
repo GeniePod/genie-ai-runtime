@@ -196,14 +196,25 @@ private:
     int             host_logits_capacity_ = 0;
 
     void transformer_layer(int layer, int pos, half* x);
-    // Single-token attention block: QK-norm (if not done already), RoPE,
-    // KV store, attention, Wo, first residual.
+    // Single-token attention pre-Wo: QK-norm (if not already done by the
+    // caller), RoPE, KV store, attention. Writes attention output (head
+    // mix) to `attn_out` [Q_DIM]. No projection, no residual — caller is
+    // expected to do Wo + first residual, batched or not.
     //
-    // `q_buf`, `k_buf`, `v_buf` are the token's projections (produced by
-    // gemv_quant_triple in per-token transformer_layer or by the batched
-    // QKV path in transformer_prefill). `x_in` is the layer input
-    // (residual #1's left operand); `x_attn_out` receives x_in + Wo(attn).
-    // `qk_norm_already` is true when the caller batched QK-norm.
+    // This split was introduced so transformer_prefill can do per-token
+    // attention compute (the RoPE/KV-store order has to stay sequential
+    // until chunked-prefill attention lands) followed by a single batched
+    // Wo and a single batched residual.
+    void transformer_layer_attn_compute(int layer, int pos,
+                                        half* q_buf, half* k_buf, half* v_buf,
+                                        half* attn_out, bool qk_norm_already);
+    // Single-token attention block: attn_compute + Wo + first residual.
+    // Thin wrapper used by the per-token transformer_layer path.
+    //
+    // `q_buf`, `k_buf`, `v_buf` are the token's projections. `x_in` is the
+    // layer input (residual #1's left operand); `x_attn_out` receives
+    // x_in + Wo(attn). `qk_norm_already` is true when the caller batched
+    // QK-norm.
     void transformer_layer_attn_block(int layer, int pos,
                                       half* x_in,
                                       half* q_buf, half* k_buf, half* v_buf,

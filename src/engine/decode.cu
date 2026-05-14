@@ -810,16 +810,11 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
     transformer_layer_ffn_block(layer, x2, swiglu_out, x);
 }
 
-void Engine::transformer_layer_attn_block(int layer, int pos, half* x_in,
-                                          half* q_buf, half* k_buf, half* v_buf,
-                                          half* x_attn_out, bool qk_norm_already) {
+void Engine::transformer_layer_attn_compute(int layer, int pos,
+                                            half* q_buf, half* k_buf, half* v_buf,
+                                            half* attn_out, bool qk_norm_already) {
     const auto& lw = model_weights_.layers[layer];
-    int H = config_.hidden_dim;
-    int Q_DIM = config_.n_heads * config_.head_dim;
     int KV_DIM = config_.n_kv_heads * config_.head_dim;
-
-    half* attn_out  = (half*)scratch_.get(Q_DIM * sizeof(half));
-    half* attn_proj = (half*)scratch_.get(H * sizeof(half));
 
     if (lw.q_norm && lw.k_norm && !qk_norm_already) {
         fused_rmsnorm_residual(q_buf, q_buf, nullptr, lw.q_norm,
@@ -858,9 +853,21 @@ void Engine::transformer_layer_attn_block(int layer, int pos, half* x_in,
                           kv_cache_.val_ptr(layer, 0),
                           config_.n_heads, config_.n_kv_heads, config_.head_dim,
                           pos + 1, scale, gen_params_.kv_int8, nullptr, stream_);
+}
 
+void Engine::transformer_layer_attn_block(int layer, int pos, half* x_in,
+                                          half* q_buf, half* k_buf, half* v_buf,
+                                          half* x_attn_out, bool qk_norm_already) {
+    const auto& lw = model_weights_.layers[layer];
+    int H = config_.hidden_dim;
+    int Q_DIM = config_.n_heads * config_.head_dim;
+
+    half* attn_out  = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* attn_proj = (half*)scratch_.get(H * sizeof(half));
+
+    transformer_layer_attn_compute(layer, pos, q_buf, k_buf, v_buf,
+                                   attn_out, qk_norm_already);
     gemv_quant(attn_proj, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
-
     vec_add(x_attn_out, x_in, attn_proj, H, stream_);
 }
 
@@ -902,27 +909,30 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
     const int N = n_tokens;
     const bool norm_fp32 = (lw.rms_type == 0);
 
-    // Snapshot just past x_batch. Everything below gets rewound when this
-    // function exits, so the next layer's transformer_prefill starts from
-    // the same low-water mark.
     const int64_t snapshot = scratch_.mark();
 
-    // Persistent batched buffers (live across all per-token loops in this layer):
-    //   normed_batch  [N×H]    — input to QKV
-    //   q/k/v_batch   [N×Q/KV] — QKV output, then QK-normed, then RoPE'd in place
-    //   x_attn_batch  [N×H]    — output of attn_block (= x + Wo(attn))
-    //   normed2_batch [N×H]    — input to gate/up
-    //   gate/up_batch [N×I]    — gate/up output
-    //   swiglu_batch  [N×I]    — input to W_down
-    half* normed_batch  = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
-    half* q_batch       = (half*)scratch_.get((int64_t)N * Q_DIM  * sizeof(half));
-    half* k_batch       = (half*)scratch_.get((int64_t)N * KV_DIM * sizeof(half));
-    half* v_batch       = (half*)scratch_.get((int64_t)N * KV_DIM * sizeof(half));
-    half* x_attn_batch  = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
-    half* normed2_batch = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
-    half* gate_batch    = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
-    half* up_batch      = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
-    half* swiglu_batch  = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
+    // Persistent batched buffers for this layer:
+    //   normed_batch    [N×H]    — input to QKV
+    //   q/k/v_batch     [N×Q/KV] — QKV output, then QK-normed, then RoPE'd in place
+    //   attn_out_batch  [N×Q]    — output of attention (head mix, pre-Wo)
+    //   attn_proj_batch [N×H]    — Wo(attn_out)
+    //   x_attn_batch    [N×H]    — x_batch + attn_proj_batch (residual #1)
+    //   normed2_batch   [N×H]    — input to gate/up
+    //   gate/up_batch   [N×I]    — gate/up output
+    //   swiglu_batch    [N×I]    — input to W_down
+    //   ffn_out_batch   [N×H]    — W_down(swiglu_batch)
+    half* normed_batch    = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* q_batch         = (half*)scratch_.get((int64_t)N * Q_DIM  * sizeof(half));
+    half* k_batch         = (half*)scratch_.get((int64_t)N * KV_DIM * sizeof(half));
+    half* v_batch         = (half*)scratch_.get((int64_t)N * KV_DIM * sizeof(half));
+    half* attn_out_batch  = (half*)scratch_.get((int64_t)N * Q_DIM  * sizeof(half));
+    half* attn_proj_batch = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* x_attn_batch    = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* normed2_batch   = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* gate_batch      = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
+    half* up_batch        = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
+    half* swiglu_batch    = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
+    half* ffn_out_batch   = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
 
     // ── Pre-attention RMSNorm + QKV + QK-norm (all batched) ────────────
     fused_rmsnorm_residual(normed_batch, x_batch, nullptr, lw.rms_attn,
@@ -939,28 +949,27 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
                                config_.rms_eps, lw.qk_norm_type == 0, stream_);
     }
 
-    // ── Per-token attention block (RoPE/KV-store needs sequential order) ──
-    // RoPE + KV store still run per-token because the KV cache is laid out
-    // such that token i's K/V at layer l must be written before token i+1
-    // reads it via the attention causal-mask. Batching these is a separate
-    // (smaller) PR — for now they live inside transformer_layer_attn_block.
-    const int64_t attn_tail_mark = scratch_.mark();
+    // ── Per-token attention compute (RoPE/KV-store/attention) ─────────
+    // RoPE + KV store still run per-token because token i's K/V at layer
+    // l must be written before token i+1's attention reads it. The Wo
+    // projection and residual are hoisted out of the per-token loop into
+    // a single batched call below.
     for (int i = 0; i < N; i++) {
-        scratch_.rewind_to(attn_tail_mark);
-        transformer_layer_attn_block(layer, start_pos + i,
-                                     x_batch     + (int64_t)i * H,
-                                     q_batch     + (int64_t)i * Q_DIM,
-                                     k_batch     + (int64_t)i * KV_DIM,
-                                     v_batch     + (int64_t)i * KV_DIM,
-                                     x_attn_batch + (int64_t)i * H,
-                                     /*qk_norm_already=*/(lw.q_norm && lw.k_norm));
+        transformer_layer_attn_compute(layer, start_pos + i,
+                                       q_batch        + (int64_t)i * Q_DIM,
+                                       k_batch        + (int64_t)i * KV_DIM,
+                                       v_batch        + (int64_t)i * KV_DIM,
+                                       attn_out_batch + (int64_t)i * Q_DIM,
+                                       /*qk_norm_already=*/(lw.q_norm && lw.k_norm));
     }
-    scratch_.rewind_to(attn_tail_mark);
 
-    // ── FFN front: norm + gate/up + SwiGLU (all batched) ───────────────
-    // This is the headline of PR #15: gate_w + up_w are 31.5 MB / layer
-    // on Qwen3-4B — ~43% of per-layer weight bandwidth, was previously
-    // re-streamed N times.
+    // ── Batched Wo + batched residual #1 (NEW in PR #16) ──────────────
+    // Wo is 5.9 MB / layer on Qwen3-4B (~8% of per-layer weight bandwidth).
+    gemm_quant_batched(attn_proj_batch, lw.wo, lw.type_wo, attn_out_batch,
+                       H, N, Q_DIM, stream_);
+    vec_add(x_attn_batch, x_batch, attn_proj_batch, N * H, stream_);
+
+    // ── FFN front: norm + gate/up + SwiGLU (all batched) ──────────────
     fused_rmsnorm_residual(normed2_batch, x_attn_batch, nullptr, lw.rms_ffn,
                            N, H, config_.rms_eps, norm_fp32, stream_);
     gemm_quant_batched(gate_batch, lw.w_gate, lw.type_w_gate, normed2_batch,
@@ -969,16 +978,12 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
                        I, N, H, stream_);
     fused_swiglu(swiglu_batch, gate_batch, up_batch, N, I, stream_);
 
-    // ── Per-token FFN exit: x = x_attn + W_down(swiglu) ────────────────
-    // W_down is still per-token; batching it is the next PR.
-    const int64_t ffn_tail_mark = scratch_.mark();
-    for (int i = 0; i < N; i++) {
-        scratch_.rewind_to(ffn_tail_mark);
-        transformer_layer_ffn_block(layer,
-                                    x_attn_batch + (int64_t)i * H,
-                                    swiglu_batch + (int64_t)i * I,
-                                    x_batch      + (int64_t)i * H);
-    }
+    // ── Batched W_down + batched residual #2 (NEW in PR #16) ──────────
+    // W_down is 25.8 MB / layer on Qwen3-4B (~35% of per-layer weight
+    // bandwidth, second-biggest after gate/up).
+    gemm_quant_batched(ffn_out_batch, lw.w_down, lw.type_w_down, swiglu_batch,
+                       H, N, I, stream_);
+    vec_add(x_batch, x_attn_batch, ffn_out_batch, N * H, stream_);
 
     scratch_.rewind_to(snapshot);
 }
@@ -1223,15 +1228,13 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     const int N = (int)prompt_tokens.size();
 
     // x_batch + transformer_prefill's persistent per-layer batched buffers
-    // (normed, q/k/v, x_attn, normed2, gate/up/swiglu — see the comment
-    // there for the full list) all live in scratch. Approximate their
-    // total footprint as N × (~6H + 3I + 2KV + Q) × 2 bytes and require a
-    // small margin on top for the per-token attn-block scratch and Path A's
-    // logits buffer.
+    // (normed, q/k/v, attn_out, attn_proj, x_attn, normed2, gate/up/swiglu,
+    // ffn_out — see the comment there for the full list) all live in
+    // scratch. Approximate total: N × (5H + 2Q + 2KV + 3I) × 2 bytes.
     const int Q_DIM_est  = config_.n_heads    * config_.head_dim;
     const int KV_DIM_est = config_.n_kv_heads * config_.head_dim;
     const int64_t batched_per_token_bytes =
-        (int64_t)(6 * H + 3 * config_.intermediate_dim + Q_DIM_est + 2 * KV_DIM_est) * sizeof(half);
+        (int64_t)(5 * H + 2 * Q_DIM_est + 2 * KV_DIM_est + 3 * config_.intermediate_dim) * sizeof(half);
     constexpr int64_t kBatchedScratchMargin = 4 * 1024 * 1024;
     const int64_t x_batch_bytes = (int64_t)N * H * sizeof(half);
     const int64_t batched_total = x_batch_bytes + (int64_t)N * batched_per_token_bytes;
