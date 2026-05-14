@@ -224,6 +224,10 @@ int main(int argc, char** argv) {
                 stats.prompt_tokens, stats.prompt_tok_per_sec, stats.prompt_ms);
         fprintf(stderr, "Decode:  %d tokens, %.1f tok/s (%.0f ms)\n",
                 stats.completion_tokens, stats.decode_tok_per_sec, stats.decode_ms);
+        if (stats.ttft_ms > 0) {
+            fprintf(stderr, "TTFT:    %.0f ms  (prompt-submitted -> first token delivered)\n",
+                    stats.ttft_ms);
+        }
         fprintf(stderr, "Memory:  peak %ld MB\n", stats.peak_memory_mb);
         fprintf(stderr, "Thermal: peak %.1f°C\n", stats.peak_thermal_c);
         if (stats.oom_stops > 0)

@@ -58,6 +58,12 @@ struct GenStats {
     int     completion_tokens  = 0;
     float   prompt_ms          = 0;
     float   decode_ms          = 0;
+    // Time-to-first-token: end-to-end wall clock from the start of
+    // generate() (prompt available) to the moment the first sampled
+    // token is delivered to the user via token_cb. Includes
+    // tokenization, prefill, and the first decode step. The most
+    // user-visible latency number for interactive workloads.
+    float   ttft_ms            = 0;
     float   prompt_tok_per_sec = 0;
     float   decode_tok_per_sec = 0;
     int64_t peak_memory_mb     = 0;

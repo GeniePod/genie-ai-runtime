@@ -1071,6 +1071,12 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     gen_params_ = params;
     recent_tokens_.clear();
 
+    // t_request: wall-clock at the moment generate() was called. The
+    // reference point for time-to-first-token, which captures the full
+    // user-visible latency from prompt-submitted to first-token-delivered
+    // (tokenization + prefill + first decode step).
+    auto t_request = Clock::now();
+
     auto prompt_tokens = tokenizer_.encode(prompt);
     stats.prompt_tokens = prompt_tokens.size();
     if (prompt_tokens.empty()) {
@@ -1135,6 +1141,13 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
 
         bool is_eos = (token == tokenizer_.eos_id);
 
+        // Stamp TTFT on the first sampled token (before the callback so
+        // the number captures pipeline cost, not user-side rendering).
+        // `i == 0` guarantees this fires exactly once per generate().
+        if (i == 0) {
+            stats.ttft_ms = Ms(Clock::now() - t_request).count();
+        }
+
         if (token_cb) {
             std::string text = tokenizer_.decode(token);
             token_cb(text.c_str(), is_eos);
@@ -1160,6 +1173,9 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
 
     fprintf(stderr, "[engine] Decode: %d tokens in %.0f ms (%.1f tok/s)\n",
             stats.completion_tokens, stats.decode_ms, stats.decode_tok_per_sec);
+    if (stats.ttft_ms > 0) {
+        fprintf(stderr, "[engine] TTFT (first token): %.0f ms\n", stats.ttft_ms);
+    }
     return stats;
 }
 
