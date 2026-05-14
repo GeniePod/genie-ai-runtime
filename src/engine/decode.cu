@@ -1092,17 +1092,28 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         fprintf(stderr, "\n");
     }
 
-    // Prefill
+    // Prefill — process each prompt token through all 36 transformer layers
+    // and store its K/V in the cache. The last iteration also retains the
+    // final hidden state `last_prefill_x` so we can sample the first
+    // generated token without a redundant forward pass (see Path A
+    // optimization comment below).
     auto t0 = Clock::now();
+    half* last_prefill_x = nullptr;
+    int H = config_.hidden_dim;
     for (int i = 0; i < (int)prompt_tokens.size(); i++) {
         scratch_.reset();
         last_token_ = prompt_tokens[i];
-        int H = config_.hidden_dim;
         half* x = (half*)scratch_.get(H * sizeof(half));
         dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
                           model_weights_.embd_type, stream_);
         for (int l = 0; l < config_.n_layers; l++)
             transformer_layer(l, i, x);
+        // Hang onto the last token's residual; the scratch pool has NOT
+        // been reset between iterations within prefill, so this pointer
+        // remains valid through the post-prefill sampling step below.
+        if (i == (int)prompt_tokens.size() - 1) {
+            last_prefill_x = x;
+        }
     }
     cudaStreamSynchronize(stream_);
     auto t1 = Clock::now();
@@ -1112,19 +1123,92 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     fprintf(stderr, "[engine] Prefill: %d tokens in %.0f ms (%.1f tok/s)\n",
             stats.prompt_tokens, stats.prompt_ms, stats.prompt_tok_per_sec);
 
-    // Decode
+    // Decode timer starts here so the Path A first-token sampling below
+    // and the subsequent decode-loop iterations are both attributed to
+    // decode_ms. Otherwise decode_tok_per_sec would over-report (token
+    // count includes Path A's first token, but if t2 starts after Path A
+    // the elapsed time excludes it).
     auto t2 = Clock::now();
+
+    // ── Path A: sample the first generated token directly from prefill ──
+    //
+    // The previous flow re-ran the entire transformer stack for position
+    // N-1 inside the first decode_step() iteration just to recover logits
+    // from a hidden state we already had. That redundant forward pass
+    // was ~120-150 ms on Qwen3-4B and dominated TTFT after the prefill
+    // bandwidth cost itself.
+    //
+    // Now we run output_norm + logits gemv + sample on `last_prefill_x`
+    // directly, then enter the decode loop already holding the first
+    // sampled token. The decode loop starts at i=1 / pos=N — no double-
+    // store in the KV cache, no redundant transformer-layer pass.
+    int first_token = -1;
+    bool first_is_eos = false;
+    if (!prompt_tokens.empty() && last_prefill_x != nullptr) {
+        half* normed = (half*)scratch_.get(H * sizeof(half));
+        float* logits_fp32 = (float*)scratch_.get(config_.vocab_size * sizeof(float));
+        if (normed && logits_fp32 && host_logits_ &&
+            host_logits_capacity_ >= config_.vocab_size) {
+            fused_rmsnorm_residual(normed, last_prefill_x, nullptr,
+                                   model_weights_.output_norm,
+                                   1, H, config_.rms_eps, true, stream_);
+            gemv_quant_f32(logits_fp32, model_weights_.output,
+                           model_weights_.output_type,
+                           normed, config_.vocab_size, H, stream_);
+            cudaError_t copy_err =
+                cudaMemcpyAsync(host_logits_, logits_fp32,
+                                config_.vocab_size * sizeof(float),
+                                cudaMemcpyDeviceToHost, stream_);
+            if (copy_err == cudaSuccess) {
+                copy_err = cudaStreamSynchronize(stream_);
+            }
+            if (copy_err == cudaSuccess) {
+                first_token = sample_token(host_logits_, config_.vocab_size,
+                                           gen_params_,
+                                           recent_tokens_.data(),
+                                           recent_tokens_.size());
+            } else {
+                fprintf(stderr,
+                        "[engine] WARN: first-token logits copy failed (%s); "
+                        "falling back to full decode_step for first token\n",
+                        cudaGetErrorString(copy_err));
+            }
+        }
+    }
+
+    // Decode loop (t2 already taken above so it covers Path A too).
     int64_t peak_mem = 0;
     float peak_temp = 0;
     const int kv_token_limit = kv_cache_.max_tokens();
-    // The prefill loop already computed and cached the final prompt token at
-    // position N-1. For the first sampled token, recompute that same position
-    // to produce logits, then advance to position N for the sampled token.
-    // Starting at N duplicates the last prompt token in the KV cache with a
-    // shifted RoPE position and corrupts the first generation step.
-    int pos = std::max(0, (int)prompt_tokens.size() - 1);
+    // Path A: the first generated token (if any) was already sampled
+    // above. Position advances to N (one past the prompt) — we did NOT
+    // double-store position N-1 in the KV cache, unlike the previous
+    // recompute-the-last-prompt-position flow.
+    int pos = (int)prompt_tokens.size();
+    int loop_start = 0;
+    if (first_token >= 0) {
+        // Deliver the first token, stamp TTFT, advance loop state.
+        stats.ttft_ms = Ms(Clock::now() - t_request).count();
+        first_is_eos = (first_token == tokenizer_.eos_id);
+        if (token_cb) {
+            std::string text = tokenizer_.decode(first_token);
+            token_cb(text.c_str(), first_is_eos);
+        }
+        last_token_ = first_token;
+        recent_tokens_.push_back(first_token);
+        if ((int)recent_tokens_.size() > 64) recent_tokens_.erase(recent_tokens_.begin());
+        stats.completion_tokens++;
+        // Skip the body of decode-loop iteration 0; it's already been done.
+        loop_start = 1;
+    } else if (!prompt_tokens.empty()) {
+        // Fallback if Path A failed: start from pos=N-1 like the
+        // original code so decode_step's first call recomputes the
+        // last prompt position to get logits. Behavior is identical
+        // to the pre-Path-A code path.
+        pos = std::max(0, (int)prompt_tokens.size() - 1);
+    }
 
-    for (int i = 0; i < params.max_tokens && !stop_flag_; i++) {
+    for (int i = loop_start; i < params.max_tokens && !stop_flag_ && !first_is_eos; i++) {
         if (pos >= kv_token_limit) {
             fprintf(stderr, "\n[engine] Stopping at context limit (%d tokens)\n",
                     kv_token_limit);
@@ -1141,10 +1225,10 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
 
         bool is_eos = (token == tokenizer_.eos_id);
 
-        // Stamp TTFT on the first sampled token (before the callback so
-        // the number captures pipeline cost, not user-side rendering).
-        // `i == 0` guarantees this fires exactly once per generate().
-        if (i == 0) {
+        // Stamp TTFT on the first sampled token. Only fires when Path A
+        // did NOT already stamp it (i.e. fallback path), gated on
+        // ttft_ms == 0.
+        if (stats.ttft_ms == 0.0f) {
             stats.ttft_ms = Ms(Clock::now() - t_request).count();
         }
 
