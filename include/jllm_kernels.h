@@ -234,6 +234,32 @@ void flash_attention_decode(
     cudaStream_t   stream
 );
 
+// Flash Attention for prefill — N queries against the same K/V cache,
+// each with a causal-mask seq_len of `start_pos + token + 1`. One launch
+// covers (n_heads × N) blocks; otherwise the per-(head, token) inner
+// loop is identical to flash_attention_decode_kernel.
+//
+// Saves N-1 kernel launches per layer and improves SM occupancy when
+// n_heads alone is below the Orin Nano's 8-SM × ~16-block sweet spot.
+//
+// All K/V positions in [0, start_pos + N) must be written into the cache
+// before this call — call the per-token RoPE+KV-store sequence first.
+void flash_attention_prefill_batched(
+    half*          output,     // [N × n_heads × head_dim]
+    const half*    q,          // [N × n_heads × head_dim]
+    const void*    k_cache,    // [≥(start_pos+N) × n_kv_heads × head_dim]
+    const void*    v_cache,
+    int            n_heads,
+    int            n_kv_heads,
+    int            head_dim,
+    int            N,          // number of query tokens
+    int            start_pos,  // absolute position of token 0 in the cache
+    float          scale,
+    bool           kv_int8,
+    const float*   kv_scales,
+    cudaStream_t   stream
+);
+
 // ── Softmax (standalone, for logits) ─────────────────────────────────────
 void softmax_inplace(
     float*         x,

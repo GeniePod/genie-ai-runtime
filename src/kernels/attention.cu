@@ -154,6 +154,178 @@ __global__ void flash_attention_decode_kernel(
     }
 }
 
+// Prefill counterpart of flash_attention_decode_kernel. Each block
+// computes attention for one (query_head, query_token) pair. Grid is
+// (n_heads, N). Causal mask collapses to seq_len = start_pos + token + 1
+// per query, so the existing online-softmax loop only needs to widen
+// its q/output addressing by one dimension.
+__global__ void flash_attention_prefill_batched_kernel(
+    half*        __restrict__ output,        // [N × n_heads × head_dim]
+    const half*  __restrict__ q,              // [N × n_heads × head_dim]
+    const void*  __restrict__ k_cache,
+    const void*  __restrict__ v_cache,
+    int n_heads, int n_kv_heads, int head_dim,
+    int start_pos,
+    float scale, bool kv_int8, const float* kv_scales)
+{
+    const int head    = blockIdx.x;
+    const int token   = blockIdx.y;
+    const int seq_len = start_pos + token + 1;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int tid     = threadIdx.x;
+    const int kv_dim  = n_kv_heads * head_dim;
+    const int q_dim   = n_heads    * head_dim;
+
+    extern __shared__ float smem[];
+    float* s_scores = smem;
+    float* s_out    = smem + ATTN_TILE_KV;
+
+    __shared__ float s_running_max;
+    __shared__ float s_running_sum;
+    __shared__ float s_correction;
+
+    const half* q_local   = q      + (int64_t)token * q_dim + (int64_t)head * head_dim;
+    half*       out_local = output + (int64_t)token * q_dim + (int64_t)head * head_dim;
+
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        s_out[d] = 0.0f;
+    if (tid == 0) {
+        s_running_max = -FLT_MAX;
+        s_running_sum = 0.0f;
+        s_correction  = 1.0f;
+    }
+    __syncthreads();
+
+    for (int kv_start = 0; kv_start < seq_len; kv_start += ATTN_TILE_KV) {
+        int tile_len = min(ATTN_TILE_KV, seq_len - kv_start);
+
+        // Q × K^T for tile
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            int kv_pos = kv_start + t;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                float q_val = __half2float(q_local[d]);
+                float k_val;
+                if (kv_int8) {
+                    const int8_t* ki = (const int8_t*)k_cache;
+                    float ks = kv_scales ? kv_scales[kv_head] : 1.0f;
+                    k_val = ki[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * ks;
+                } else {
+                    const half* kf = (const half*)k_cache;
+                    k_val = __half2float(
+                        kf[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d]);
+                }
+                dot += q_val * k_val;
+            }
+            s_scores[t] = dot * scale;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float tile_max = -FLT_MAX;
+            for (int t = 0; t < tile_len; ++t) {
+                tile_max = fmaxf(tile_max, s_scores[t]);
+            }
+            const float old_max = s_running_max;
+            s_running_max = fmaxf(s_running_max, tile_max);
+            s_correction  = expf(old_max - s_running_max);
+            s_running_sum *= s_correction;
+        }
+        __syncthreads();
+
+        for (int d = tid; d < head_dim; d += blockDim.x)
+            s_out[d] *= s_correction;
+        __syncthreads();
+
+        if (tid == 0) {
+            float tile_sum = 0.0f;
+            for (int t = 0; t < tile_len; ++t) {
+                float p = expf(s_scores[t] - s_running_max);
+                s_scores[t] = p;
+                tile_sum += p;
+            }
+            s_running_sum += tile_sum;
+        }
+        __syncthreads();
+
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                int kv_pos = kv_start + t;
+                float v_val;
+                if (kv_int8) {
+                    const int8_t* vi = (const int8_t*)v_cache;
+                    float vs = kv_scales ? kv_scales[n_kv_heads + kv_head] : 1.0f;
+                    v_val = vi[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * vs;
+                } else {
+                    const half* vf = (const half*)v_cache;
+                    v_val = __half2float(
+                        vf[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d]);
+                }
+                val += s_scores[t] * v_val;
+            }
+            s_out[d] += val;
+        }
+        __syncthreads();
+    }
+
+    float inv_sum = (s_running_sum > 0.0f) ? 1.0f / s_running_sum : 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        out_local[d] = __float2half(s_out[d] * inv_sum);
+    }
+}
+
+void flash_attention_prefill_batched(
+    half* output, const half* q, const void* k_cache, const void* v_cache,
+    int n_heads, int n_kv_heads, int head_dim,
+    int N, int start_pos,
+    float scale, bool kv_int8, const float* kv_scales, cudaStream_t stream)
+{
+    if (N <= 0) return;
+    if (!fast_attention_enabled() || kv_int8) {
+        // No CUDA fast path for INT8 KV in the per-token kernel either —
+        // fall back to N sequential flash_attention_decode calls, which
+        // already have a CPU-reference fallback for INT8.
+        const int q_dim = n_heads * head_dim;
+        for (int t = 0; t < N; t++) {
+            flash_attention_decode(
+                output + (int64_t)t * q_dim,
+                q      + (int64_t)t * q_dim,
+                k_cache, v_cache,
+                n_heads, n_kv_heads, head_dim,
+                start_pos + t + 1, scale, kv_int8, kv_scales, stream);
+        }
+        return;
+    }
+
+    static bool logged = false;
+    if (!logged) {
+        fprintf(stderr, "[attention] Using CUDA chunked-prefill attention path\n");
+        logged = true;
+    }
+
+    const dim3 grid(n_heads, N, 1);
+    const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
+    flash_attention_prefill_batched_kernel<<<grid, ATTN_BLOCK, smem, stream>>>(
+        output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
+        start_pos, scale, kv_int8, kv_scales);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[attention] chunked-prefill CUDA launch failed: %s; "
+                "falling back to N decode launches\n", cudaGetErrorString(err));
+        const int q_dim = n_heads * head_dim;
+        for (int t = 0; t < N; t++) {
+            flash_attention_decode(
+                output + (int64_t)t * q_dim,
+                q      + (int64_t)t * q_dim,
+                k_cache, v_cache,
+                n_heads, n_kv_heads, head_dim,
+                start_pos + t + 1, scale, kv_int8, kv_scales, stream);
+        }
+    }
+}
+
 void flash_attention_decode(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int seq_len,

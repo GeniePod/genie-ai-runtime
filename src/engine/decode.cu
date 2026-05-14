@@ -949,18 +949,48 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
                                config_.rms_eps, lw.qk_norm_type == 0, stream_);
     }
 
-    // ── Per-token attention compute (RoPE/KV-store/attention) ─────────
+    // ── Per-token RoPE + KV store ─────────────────────────────────────
     // RoPE + KV store still run per-token because token i's K/V at layer
-    // l must be written before token i+1's attention reads it. The Wo
-    // projection and residual are hoisted out of the per-token loop into
-    // a single batched call below.
+    // l must be written before token i+1's attention reads it. The
+    // attention itself is now batched (one launch covers all N queries
+    // via flash_attention_prefill_batched).
     for (int i = 0; i < N; i++) {
-        transformer_layer_attn_compute(layer, start_pos + i,
-                                       q_batch        + (int64_t)i * Q_DIM,
-                                       k_batch        + (int64_t)i * KV_DIM,
-                                       v_batch        + (int64_t)i * KV_DIM,
-                                       attn_out_batch + (int64_t)i * Q_DIM,
-                                       /*qk_norm_already=*/(lw.q_norm && lw.k_norm));
+        const int pos = start_pos + i;
+        half* q_t = q_batch + (int64_t)i * Q_DIM;
+        half* k_t = k_batch + (int64_t)i * KV_DIM;
+        half* v_t = v_batch + (int64_t)i * KV_DIM;
+        if (!gen_params_.kv_int8 && kv_cache_.is_fast_position(pos)) {
+            rope_inplace_store_kv_fp16(q_t, k_t, v_t,
+                                      (half*)kv_cache_.key_ptr(layer, pos),
+                                      (half*)kv_cache_.val_ptr(layer, pos),
+                                      config_.n_heads, config_.n_kv_heads,
+                                      config_.head_dim, pos, config_.rope_theta,
+                                      config_.rope_neox, stream_);
+        } else {
+            rope_inplace(q_t, k_t, config_.n_heads, config_.n_kv_heads,
+                         config_.head_dim, pos, config_.rope_theta,
+                         config_.rope_neox, stream_);
+            if (gen_params_.kv_int8) {
+                fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), nullptr, k_t, 1, KV_DIM, stream_);
+                fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), nullptr, v_t, 1, KV_DIM, stream_);
+            } else {
+                cudaMemcpyAsync(kv_cache_.key_ptr(layer, pos), k_t,
+                                KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+                cudaMemcpyAsync(kv_cache_.val_ptr(layer, pos), v_t,
+                                KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+            }
+        }
+    }
+
+    // ── Batched attention (NEW in PR #17): all N queries in one launch ──
+    {
+        const float scale = 1.0f / sqrtf((float)config_.head_dim);
+        flash_attention_prefill_batched(
+            attn_out_batch, q_batch,
+            kv_cache_.key_ptr(layer, 0), kv_cache_.val_ptr(layer, 0),
+            config_.n_heads, config_.n_kv_heads, config_.head_dim,
+            N, start_pos, scale,
+            gen_params_.kv_int8, nullptr, stream_);
     }
 
     // ── Batched Wo + batched residual #1 (NEW in PR #16) ──────────────
