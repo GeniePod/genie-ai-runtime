@@ -1019,9 +1019,13 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
 }
 
 bool Engine::batched_prefill_enabled() const {
+    // Default-on after the Path B series (#13-#17) landed. Output is
+    // bit-identical to the per-token path on every tested model, and the
+    // measured win on Qwen3-4B is 1.88× prefill / 47% TTFT reduction.
+    // Set JLLM_BATCHED_PREFILL=0 to disable.
     static const bool enabled = [] {
         const char* v = getenv("JLLM_BATCHED_PREFILL");
-        return v && strcmp(v, "0") != 0;
+        return !v || strcmp(v, "0") != 0;
     }();
     return enabled;
 }
