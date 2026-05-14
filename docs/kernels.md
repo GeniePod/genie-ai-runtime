@@ -60,6 +60,55 @@ Dequant:   8 INT4 values from one uint32, multiply by group scale
 6. Lane 0 writes y[row]
 ```
 
+## gemm_quant_batched — K-Quant GEMM for Prefill
+
+**File:** `src/kernels/gemv_q4.cu` (kernels: `gemm_quant_batched_q4k_kernel`,
+`gemm_quant_batched_q5k_kernel`, `gemm_quant_batched_q6k_kernel`).
+**Validated:** All weight matrices in Qwen3-4B Q4_K_M prefill.
+
+### What it does
+
+Computes `y[N × M] = x[N × K] · Wᵀ[K × M]` for Q4_K / Q5_K / Q6_K
+weights. Each warp owns one output row `r` and holds `N` register
+accumulators; for every weight value loaded from DRAM, the warp issues
+`N` FMAs against `x[t][k]`. The weights are streamed from DRAM **once**
+and re-used across all `N` query tokens — that's the entire point of
+the batched path.
+
+```
+Grid:   (ceil(M / rows_per_block), 1)
+Block:  rows_per_block × 32 threads (one warp per output row)
+Per-warp register state: GEMM_MAX_BATCH (32) fp32 accumulators
+```
+
+`N=1` fast-routes to `gemv_quant` so the decode/per-token path is
+untouched and bit-identical.
+
+### Why `acc[]` stays in registers
+
+A naïve `for (int t = 0; t < N; t++) acc[t] += ...` with runtime `t`
+forces dynamic indexing into the register array, which the NVCC
+compiler spills to local memory and tanks the bandwidth win. The
+kernel uses `#pragma unroll` over the static `GEMM_MAX_BATCH=32` bound
+with an inner `if (t < N)` predicate, so the compiler keeps every
+accumulator slot in a real register (verified zero spills in PTXAS
+output — 56 regs/thread for Q4_K, 64 for Q5/Q6_K).
+
+### Output layout
+
+`y[token * M + row]` — row-major, token-outer. Matches what
+`gemm_quant_batched(attn_proj, lw.wo, ...)` and friends expect when
+the next batched kernel slices by token.
+
+### Byte-equality
+
+Within each warp the partial-sum order across `(block, inner_iter,
+K-stride)` is identical to `gemv_quant`. Token `t`'s accumulator
+receives exactly the same FMAs in the same order, so after
+`warp_reduce_sum` the output is bit-identical to the per-token GEMV
+call. Validated end-to-end across PRs #14, #15, #16 (47-token
+completions match byte-for-byte).
+
 ## fused_norm — RMSNorm + Residual Add
 
 **File:** `src/kernels/fused_norm.cu`
@@ -140,6 +189,46 @@ INT8 KV: dequantize on-the-fly in the dot product loop
 - Scores: shared memory only (never written to DRAM)
 - Output: one write at the end
 
+## attention (chunked prefill) — Flash Attention for N queries
+
+**File:** `src/kernels/attention.cu` (kernel:
+`flash_attention_prefill_batched_kernel`).
+**Validated:** Qwen3 multi-token prefill in Path B.
+
+### What it does
+
+Same online-softmax inner loop as `flash_attention_decode_kernel`, but
+extended to process all `N` query tokens against a populated K/V cache
+in **one** kernel launch. Each block computes one `(query_head,
+query_token)` pair.
+
+```
+Grid:   (n_heads, N)              ← N is the batched prefill width
+Block:  128 threads
+Per-block seq_len: start_pos + token + 1  (causal mask)
+```
+
+For Qwen3-4B with `n_heads = 32` and `N = 18`, grid size goes from
+`(32, 1)` per per-token launch × 18 launches = 576 block-launches to
+`(32, 18) = 576` blocks in **one** launch. Same total work, lifts
+per-SM occupancy from ~4 to ~72 blocks, and removes 17 host-side
+launch overheads per layer (× 36 layers = 612 saved launches per
+prefill).
+
+### Preconditions
+
+Every K/V position in `[start_pos, start_pos + N)` must be written to
+the cache **before** this kernel launches.
+`transformer_prefill` enforces that by running the per-token RoPE +
+KV-store loop synchronously on the same stream first, then this
+kernel.
+
+### Fallback
+
+`fast_attention_enabled() == false` or INT8 KV cache falls back to N
+sequential `flash_attention_decode` calls so the existing CPU-reference
+attention is preserved for testing.
+
 ## rope — Rotary Position Embedding
 
 **File:** `src/kernels/rope.cu`
@@ -204,10 +293,16 @@ Converts FP16 logits to FP32 on GPU before D2H copy for sampling.
 
 | Kernel | Bottleneck | Registers | Shared mem |
 |--------|-----------|-----------|------------|
-| gemv_q4/q5/q6 K | Memory bandwidth | 40-48 | 0 |
+| gemv_q4/q5/q6 K | Memory bandwidth | 40 | 0 |
+| gemm_quant_batched (Q4_K) | Memory bandwidth | 56 | 0 |
+| gemm_quant_batched (Q5_K / Q6_K) | Memory bandwidth | 64 | 0 |
 | fused_norm | Memory bandwidth | 26 | 128 bytes |
-| attention | Memory bandwidth | 40 | (64 + head_dim) × 4 |
+| flash_attention_decode | Memory bandwidth | 40 | (64 + head_dim) × 4 |
+| flash_attention_prefill_batched | Memory bandwidth | 40 | (64 + head_dim) × 4 |
 | rope | Compute (trig) | 13 | 0 |
 | softmax | Memory bandwidth | 23 | ~36 bytes |
 | swiglu | Memory bandwidth | 14 | 0 |
 | fp16_to_int8 | Memory bandwidth | 14 | 4 bytes |
+
+All `gemm_quant_batched` kernels ship with zero spill stores / loads
+in PTXAS output.

@@ -76,11 +76,12 @@ All intermediate buffers allocated from `ScratchPool` (reset each decode step).
 ```
 Tokenize prompt → token IDs
 │
-├── Prefill phase:
-│   For each prompt token:
-│     scratch.reset()
-│     embedding lookup + all transformer layers
-│     (builds KV cache, no sampling)
+├── Prefill phase (Path B, default):
+│   Allocate x_batch[N × hidden_dim] in scratch
+│   Dequant all prompt embeddings into x_batch rows
+│   For each layer l in [0, n_layers):
+│     transformer_prefill(l, start_pos=0, N, x_batch)
+│   Path A: sample first token from x_batch[N-1] (skip a forward pass)
 │
 ├── Decode phase:
 │   For each output token (up to max_tokens):
@@ -92,6 +93,83 @@ Tokenize prompt → token IDs
 │
 └── Return GenStats
 ```
+
+Set `JLLM_BATCHED_PREFILL=0` to fall back to the original per-token
+prefill (one token at a time, calling `transformer_layer` directly).
+
+## transformer_prefill — Layer-major Batched Prefill
+
+`transformer_prefill(layer, start_pos, n_tokens, x_batch)` — one layer
+across all N prompt tokens. Maintains a set of persistent batched
+buffers (allocated at the function's scratch snapshot) and combines
+batched kernels with two short per-token loops:
+
+```
+Persistent batched buffers in scratch (rewound on exit):
+  normed_batch    [N × H]
+  q_batch         [N × Q_DIM]
+  k_batch         [N × KV_DIM]
+  v_batch         [N × KV_DIM]
+  attn_out_batch  [N × Q_DIM]
+  attn_proj_batch [N × H]
+  x_attn_batch    [N × H]
+  normed2_batch   [N × H]
+  gate_batch      [N × I]
+  up_batch        [N × I]
+  swiglu_batch    [N × I]
+  ffn_out_batch   [N × H]
+
+┌─ Attention ──────────────────────────────────────────────────────┐
+│  1. fused_rmsnorm_residual  (rows=N)                             │
+│  2. gemm_quant_batched × 3  → q_batch, k_batch, v_batch          │
+│  3. fused_rmsnorm_residual  Qwen3 QK-norm (rows=N × n_heads /    │
+│     N × n_kv_heads)                                              │
+│  4. Per-token loop (RoPE + KV store — sequential, causal):       │
+│       rope_inplace_store_kv_fp16(q[i], k[i], v[i], cache@pos+i)  │
+│  5. flash_attention_prefill_batched  one launch, grid=(n_heads,N)│
+│     → attn_out_batch                                             │
+│  6. gemm_quant_batched(Wo)  → attn_proj_batch                    │
+│  7. vec_add(x_attn_batch ← x_batch + attn_proj_batch, n=N×H)     │
+└──────────────────────────────────────────────────────────────────┘
+
+┌─ FFN ────────────────────────────────────────────────────────────┐
+│  8.  fused_rmsnorm_residual  (rows=N)                            │
+│  9.  gemm_quant_batched × 2  → gate_batch, up_batch              │
+│  10. fused_swiglu  (rows=N)                                      │
+│  11. gemm_quant_batched(W_down)  → ffn_out_batch                 │
+│  12. vec_add(x_batch ← x_attn_batch + ffn_out_batch, n=N×H)      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Every weight matrix in the layer runs through one `gemm_quant_batched`
+call — each weight value is read from DRAM **once** and re-used across
+all `N` query tokens, instead of being re-streamed `N` times by
+`gemv_quant`.
+
+The only per-token work that remains is RoPE + KV store: token `i`'s
+K/V must be written to the cache before token `i+1` reads it via the
+causal attention mask. The attention itself is then batched into one
+launch via `flash_attention_prefill_batched`.
+
+## transformer_layer — Per-token (decode + opt-out prefill)
+
+`transformer_layer(layer, pos, x)` runs the same logic for one token.
+Used by `decode_step` and by the `JLLM_BATCHED_PREFILL=0` prefill
+fallback. Composed of:
+
+```
+1. RMSNorm
+2. gemv_quant_triple  → q, k, v
+3. transformer_layer_attn_block:
+     a. attn_compute: QK-norm (cond) + RoPE + KV store + attention
+     b. gemv_quant(Wo) + vec_add(first residual)
+4. RMSNorm + gemv_quant_pair(gate/up) + swiglu (per-token)
+5. transformer_layer_ffn_block:
+     gemv_quant(W_down) + vec_add(second residual)
+```
+
+`transformer_layer_attn_compute` is a private helper called from both
+`attn_block` (per-token) and `transformer_prefill` (batched dispatch).
 
 ## CUDA Graphs
 
@@ -147,6 +225,7 @@ Returned after generation:
 | `completion_tokens` | Number of tokens generated |
 | `prompt_ms` | Time for prefill phase |
 | `decode_ms` | Time for decode phase |
+| `ttft_ms` | Time-to-first-token: wall-clock from generate() entry to first sampled token delivered (tokenization + prefill + first decode step) |
 | `prompt_tok_per_sec` | Prefill throughput |
 | `decode_tok_per_sec` | Decode throughput |
 | `peak_memory_mb` | Maximum memory usage observed |

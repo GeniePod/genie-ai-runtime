@@ -4,43 +4,44 @@
 
 | Spec | Value |
 |------|-------|
-| GPU TOPS (INT8) | 67 |
-| DLA TOPS (INT8) | ~10 |
-| Total TOPS | ~77 |
+| GPU TOPS (INT8, sparse) | 67 |
 | Memory | 8 GB LPDDR5 |
 | Bandwidth | 102 GB/s |
 | CUDA cores | 1024 (8 SMs × 128) |
 | Tensor Cores | 32 |
-| Power modes | 7W / 10W / 15W / 25W |
+| Power modes | 7W / 10W / 15W / 25W MAXN SUPER |
 | Ridge point | 0.66 OP/byte |
+
+The DLA is not used — the LLM workload runs entirely on the GPU.
 
 ## Current Validated Result
 
-First coherent on-device validation was completed on Jetson Orin Nano Super
-8 GB, L4T 36.4, CUDA 12.6, 25 W mode, GPU locked at 918 MHz.
-
+Hardware: Jetson Orin Nano Super 8 GB, L4T 36.4, CUDA 12.6, 25 W MAXN
+SUPER, GPU locked at 918 MHz.
 Model: `Qwen3-4B-Q4_K_M.gguf` (2381 MB)
-Prompt: `Hello, this is testing.`
-Context: auto-capped to 4096 tokens
+Prompt: `Hello, who are you?` (18 tokens after Qwen chat template)
+Context: 1024 tokens
 
-| Metric | Result |
-|--------|--------|
+| Metric | alpha.3 (Path B default-on) |
+|--------|---|
 | Prompt tokens | 18 |
-| Prompt eval | 12,377 ms, 1.5 tok/s |
-| Decode tokens | 19 |
-| Decode | 13,109 ms, 1.4 tok/s |
-| Peak memory | 3425 MB |
-| Peak temperature | 50.0°C |
-| Output | `Hello! It seems like you're testing the system. How can I assist you today?` |
+| Prefill | 1168 ms, **15.4 tok/s** |
+| Decode tokens | 47 |
+| Decode | 6307 ms, **7.5 tok/s** |
+| **TTFT** | **1181 ms** |
+| Peak memory | 3161 MB |
+| Peak temperature | 53.0°C |
+| Output | `Hello! I'm Qwen, a large-scale language model developed by Alibaba Group. I can help with a variety of tasks, including answering questions, writing articles, creating stories, and more. How can I assist you today?` |
 
-Validated fast paths are now default:
+Validated fast paths are all default:
 
 | Path | Runtime switch to disable |
 |------|---------------------------|
-| K-quant GEMV | `JLLM_FAST_GEMV=0` |
+| Layer-major batched prefill (Path B) | `JLLM_BATCHED_PREFILL=0` |
+| K-quant GEMV / GEMM | `JLLM_FAST_GEMV=0` |
 | Token embedding dequantization | `JLLM_FAST_EMBD=0` |
 | RMSNorm | `JLLM_FAST_NORM=0` |
-| Decode attention | `JLLM_FAST_ATTN=0` |
+| Decode + chunked-prefill attention | `JLLM_FAST_ATTN=0` |
 
 The output projection is materialized into CUDA device memory automatically
 when the memory budget allows it. Set `JLLM_DEVICE_OUTPUT=0` to force the
@@ -56,34 +57,52 @@ These numbers are correctness/brings-up numbers, not final throughput targets.
 The largest remaining cost is still K-quant weight bandwidth and the final
 vocabulary projection/sampling path.
 
-## Decode Throughput Optimization Branch
+## Path B — Layer-major Batched Prefill (2026-05-15)
 
-Branch: `optimize/decode-throughput`
-Commit: `28a6bc1 Optimize decode hot path`
-Date: 2026-05-14
+Series: PRs #13 → #17 + default-flip #18.
 
-Same hardware, model, prompt, context, power mode, and output as the Week 1
-smoke test. This branch changed the K-quant GEMV lane mapping, removed
-per-token CUDA temporary allocation in the logits path, reused a pinned host
-logits buffer, and added a fast top-k sampling path.
+Same hardware, model, prompt, and output as the alpha.2 baseline. Each
+PR was validated byte-identical to the previous main before merging.
 
-| Metric | Main baseline | Optimization branch | Speedup |
-|--------|---------------|---------------------|---------|
-| Prompt eval | 12,377 ms, 1.5 tok/s | 2,406 ms, 7.5 tok/s | 5.0x |
-| Decode | 13,109 ms, 1.4 tok/s | 2,887 ms, 6.6 tok/s | 4.7x |
-| Decode tokens | 19 | 19 | same |
-| Peak memory | 3425 MB | 3687 MB | +262 MB |
-| Peak temperature | 50.0°C | 51.6°C | +1.6°C |
+| PR | Change | Prefill | TTFT |
+|---|---|---|---|
+| main (alpha.2) | per-token prefill baseline | 8.2 tok/s | 2200 ms |
+| #13 | scaffolding (no kernel change) | 8.2 (byte-equal) | 2200 ms |
+| #14 | batched QKV GEMM | 9.0 (+11%) | 2003 ms |
+| #15 | + batched gate/up + SwiGLU | 12.0 (+33%) | 1520 ms |
+| #16 | + batched Wo + W_down + residuals | 14.8 (+23%) | 1231 ms |
+| #17 | + chunked-prefill attention | **15.4 (+4%)** | **1181 ms** |
+| #18 | flip default to on | (no perf change) | — |
 
-Optimization branch output remained coherent:
+**Final: prefill 1.88×, TTFT down 47%**, decode unchanged at 7.5 tok/s
+because decode is N=1 and there's nothing to amortize.
 
-```
-Hello! It seems like you're testing the system. How can I assist you today?
-```
+### Why the wins
 
-This is still a short smoke benchmark because the model emits `<|im_end|>` after
-19 completion tokens. A longer fixed-length prompt is still needed before using
-these numbers as the final v0.2 benchmark.
+The bandwidth math undercounted the actual gain in every PR; we kept
+beating bandwidth-only estimates by 3-10×. Two effects beyond raw
+weight bandwidth:
+
+1. **Kernel launch overhead.** A per-token Qwen3-4B prefill ran ~250
+   kernel launches per token × 18 tokens = 4500 launches; the batched
+   path runs ~10 launches per layer × 36 layers ≈ 360. At ~5-10 µs per
+   launch that's tens of ms saved.
+2. **L2 cache pressure.** With per-token, each prompt token's full
+   weight set is streamed before the next one starts, so the LPDDR5
+   controller sees the same weight pages 18 times. Layer-major
+   touches each weight page once and lets the L2 keep activations
+   hot across the per-layer loop.
+
+The two effects together explain why each individual PR over-delivered
+relative to the static bandwidth estimate.
+
+### Path C — decode
+
+Decode at 7.5 tok/s is ~13% of LPDDR5 ceiling (38 tok/s on this
+model). Reference llama.cpp on the same hardware hits ~18 tok/s.
+There is real headroom; the plan is tracked in issue
+[#19](https://github.com/GeniePod/genie-ai-runtime/issues/19) and
+needs a profiler pass before any kernel work begins.
 
 ## Why LLM Decode is Bandwidth-Bound
 
