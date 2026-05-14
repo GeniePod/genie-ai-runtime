@@ -159,6 +159,12 @@ public:
     void* get(int64_t size);  // bump pointer, reset each forward pass
     void  reset();            // call at start of each decode step
 
+    // Save current allocation cursor and rewind back to it later. Used by
+    // batched prefill to reset transient per-layer scratch while keeping
+    // the prompt-activation buffer (allocated below the mark) intact.
+    int64_t mark() const { return offset_; }
+    void    rewind_to(int64_t saved_offset);
+
     int64_t used() const { return offset_; }
     int64_t capacity() const { return capacity_; }
 

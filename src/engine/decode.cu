@@ -891,9 +891,29 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
 // before reading the attention range [0, start_pos+i].
 void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x_batch) {
     const int H = config_.hidden_dim;
+    // Each transformer_layer call stacks ~120 KB of intermediate scratch.
+    // The per-token prefill path got away with this because it called
+    // scratch_.reset() between tokens, capping peak usage at one token's
+    // worth (~4.4 MB across 36 layers). In Path B the loop is layer-major
+    // and runs n_tokens × n_layers transformer_layer calls *without* the
+    // existing per-token reset — that's enough to overflow the 64 MB
+    // pool on even a 15-token prompt.
+    //
+    // The fix: snapshot scratch position just past x_batch, then rewind
+    // back to it between every call. x_batch sits below the snapshot
+    // (allocated by generate() before this is called) so it survives the
+    // rewind, while per-layer intermediates get a fresh region each time.
+    const int64_t snapshot = scratch_.mark();
     for (int i = 0; i < n_tokens; i++) {
+        scratch_.rewind_to(snapshot);
         transformer_layer(layer, start_pos + i, x_batch + (int64_t)i * H);
     }
+    // Restore scratch on the way out so the next layer's snapshot starts
+    // from the same low-water mark. Without this, each layer's residual
+    // ~120 KB would accumulate across 36 layers (~4 MB) — survivable on
+    // a 15-token prompt but burns headroom we'd rather give to x_batch
+    // on long prompts.
+    scratch_.rewind_to(snapshot);
 }
 
 bool Engine::batched_prefill_enabled() const {

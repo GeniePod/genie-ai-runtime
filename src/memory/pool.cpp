@@ -60,4 +60,13 @@ void ScratchPool::reset() {
     offset_ = 0;
 }
 
+void ScratchPool::rewind_to(int64_t saved_offset) {
+    if (saved_offset < 0 || saved_offset > capacity_) {
+        fprintf(stderr, "[scratch] WARN: rewind_to(%ld) out of range "
+                "[0, %ld]; ignoring\n", saved_offset, capacity_);
+        return;
+    }
+    offset_ = saved_offset;
+}
+
 }  // namespace jllm
