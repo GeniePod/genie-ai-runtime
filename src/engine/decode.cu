@@ -795,7 +795,6 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
                                  x2, /*qk_norm_already=*/false);
 
     // 3b. FFN front (norm + gate/up + swiglu) per-token.
-    bool norm_fp32 = (lw.rms_type == 0);
     half* normed2    = (half*)scratch_.get(H * sizeof(half));
     half* gate_buf   = (half*)scratch_.get(I * sizeof(half));
     half* up_buf     = (half*)scratch_.get(I * sizeof(half));
