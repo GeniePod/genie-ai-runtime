@@ -48,6 +48,22 @@ static bool q4k_uint32_loads_enabled() {
     return enabled;
 }
 
+// Path E (#33): tensor-core MMQ kernel for Q4_K prefill GEMM. Replaces
+// gemm_quant_batched_q4k_kernel's scalar FMAs with mma.sync.aligned.
+// m16n8k16.row.col.f32.f16.f16.f32 against a 16×32 FP16 staging tile
+// dequantized into shared memory. Validated standalone at ~74 GFLOPS
+// vs ~48 GFLOPS for the scalar batched kernel on the Qwen3-4B Wo shape
+// (#34, #35, #36). Opt-in via JLLM_MMQ_Q4K=1 while we A/B vs alpha.6;
+// flips to default once we have end-to-end byte-bounded output drift
+// and a verified prefill tok/s number.
+static bool mmq_q4k_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_MMQ_Q4K");
+        return v && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 static const void* resolve_weight_device_ptr(const void* W) {
     if (const void* mapped = resolve_mapped_weight_device_ptr(W)) {
         return mapped;
@@ -1413,6 +1429,128 @@ __global__ void gemm_quant_batched_q6k_kernel(
     }
 }
 
+// Path E phase E3b: tensor-core MMQ kernel for Q4_K prefill GEMM. Same
+// math as the standalone version validated in tests/test_mmq_q4k_gemm.cu
+// (PR #36). One warp per CUDA block computes a 16×8 output tile; grid is
+// (ceil(N / 8), ceil(M / 16), 1). 16×32 FP16 staging tile in shared mem.
+// Two m16n8k16 MMAs per sub-block × 8 sub-blocks × n_blocks per row tile.
+//
+// FP32 accumulator across the full K reduction; rounded to FP16 at
+// writeback. Boundary masking on both M (last row tile may be partial)
+// and N (last col tile may be partial — typical N=33 ⇒ 5 N-tiles, last
+// one carries 1 valid token).
+
+constexpr int MMQ_Q4K_TILE_M = 16;
+constexpr int MMQ_Q4K_TILE_N = 8;
+
+__global__ void gemm_mmq_q4k_kernel(half*             __restrict__ y,
+                                    const block_q4_K* __restrict__ W,
+                                    const half*       __restrict__ x,
+                                    int M, int N, int K)
+{
+    const int row_base = blockIdx.y * MMQ_Q4K_TILE_M;
+    const int tok_base = blockIdx.x * MMQ_Q4K_TILE_N;
+    if (row_base >= M) return;
+
+    const int lane    = threadIdx.x & 31;
+    const int groupID = lane >> 2;
+    const int tinG    = lane &  3;
+
+    const int n_blocks = K / QK_K;
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    __shared__ half A_tile[MMQ_Q4K_TILE_M][32];
+
+    for (int b = 0; b < n_blocks; b++) {
+        #pragma unroll
+        for (int sb = 0; sb < 8; sb++) {
+            const int il     = sb >> 1;
+            const int parity = sb &  1;
+            const int col    = lane;
+
+            #pragma unroll
+            for (int row = 0; row < MMQ_Q4K_TILE_M; row++) {
+                const int g_row = row_base + row;
+                if (g_row < M) {
+                    const block_q4_K& blk = W[(int64_t)g_row * n_blocks + b];
+                    const float dall = raw_fp16_to_float(blk.d_raw);
+                    const float dmin = raw_fp16_to_float(blk.dmin_raw);
+                    uint8_t sc, mn;
+                    get_scale_min_k4(sb, blk.scales, sc, mn);
+                    const float d  = dall * sc;
+                    const float dm = dmin * mn;
+                    const uint8_t qb = blk.qs[32 * il + col];
+                    const float val  = parity
+                        ? (d * (qb >> 4)  - dm)
+                        : (d * (qb & 0xF) - dm);
+                    A_tile[row][col] = __float2half(val);
+                } else {
+                    A_tile[row][col] = __float2half(0.0f);
+                }
+            }
+            __syncwarp();
+
+            const int k_block_base = b * QK_K + sb * 32;
+
+            #pragma unroll
+            for (int km = 0; km < 2; km++) {
+                const int ka = km * 16;
+
+                half2 a0_h = *reinterpret_cast<const half2*>(&A_tile[groupID    ][ka + tinG * 2]);
+                half2 a1_h = *reinterpret_cast<const half2*>(&A_tile[groupID + 8][ka + tinG * 2]);
+                half2 a2_h = *reinterpret_cast<const half2*>(&A_tile[groupID    ][ka + tinG * 2 + 8]);
+                half2 a3_h = *reinterpret_cast<const half2*>(&A_tile[groupID + 8][ka + tinG * 2 + 8]);
+
+                uint32_t a0 = *reinterpret_cast<uint32_t*>(&a0_h);
+                uint32_t a1 = *reinterpret_cast<uint32_t*>(&a1_h);
+                uint32_t a2 = *reinterpret_cast<uint32_t*>(&a2_h);
+                uint32_t a3 = *reinterpret_cast<uint32_t*>(&a3_h);
+
+                const int g_tok = tok_base + groupID;
+                const int k_pos = k_block_base + ka;
+
+                uint32_t b0, b1;
+                if (g_tok < N) {
+                    half2 b0_h = *reinterpret_cast<const half2*>(&x[(int64_t)g_tok * K + k_pos + tinG * 2]);
+                    half2 b1_h = *reinterpret_cast<const half2*>(&x[(int64_t)g_tok * K + k_pos + tinG * 2 + 8]);
+                    b0 = *reinterpret_cast<uint32_t*>(&b0_h);
+                    b1 = *reinterpret_cast<uint32_t*>(&b1_h);
+                } else {
+                    b0 = 0;
+                    b1 = 0;
+                }
+
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0, %1, %2, %3}, "
+                    "{%4, %5, %6, %7}, "
+                    "{%8, %9}, "
+                    "{%0, %1, %2, %3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                      "r"(b0), "r"(b1)
+                );
+            }
+            __syncwarp();
+        }
+    }
+
+    const int tok0  = tok_base + tinG * 2;
+    const int tok1  = tok_base + tinG * 2 + 1;
+    const int row_a = row_base + groupID;
+    const int row_b = row_base + groupID + 8;
+
+    if (row_a < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_a] = __float2half(d0);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_a] = __float2half(d1);
+    }
+    if (row_b < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_b] = __float2half(d2);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_b] = __float2half(d3);
+    }
+}
+
 static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
                                    const half* x, int M, int N, int K,
                                    cudaStream_t stream) {
@@ -1424,6 +1562,34 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
     const int rows_per_block = gemv_rows_per_block();
     const int block = rows_per_block * 32;
     const int grid = (M + rows_per_block - 1) / rows_per_block;
+
+    // Path E E3b: Q4_K only, opt-in. Falls through to the scalar
+    // batched kernel below for Q5_K / Q6_K, which Path E does not
+    // touch yet (Q6_K is blocked by the 210-byte alignment issue from
+    // #29; Q5_K is uncommon in our workloads).
+    if (ggml_type == 12 && mmq_q4k_enabled()) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr,
+                    "[GEMM] Path E MMQ Q4_K tensor-core kernel enabled "
+                    "(JLLM_MMQ_Q4K=1)\n");
+        }
+        dim3 mmq_grid((N + MMQ_Q4K_TILE_N - 1) / MMQ_Q4K_TILE_N,
+                      (M + MMQ_Q4K_TILE_M - 1) / MMQ_Q4K_TILE_M, 1);
+        gemm_mmq_q4k_kernel<<<mmq_grid, 32, 0, stream>>>(
+            y, (const block_q4_K*)W_device, x, M, N, K);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "[GEMM] MMQ Q4_K launch failed (%s), falling back to "
+                    "scalar batched kernel\n",
+                    cudaGetErrorString(err));
+            // Fall through to the scalar path below.
+        } else {
+            return true;
+        }
+    }
 
     switch (ggml_type) {
         case 12:
