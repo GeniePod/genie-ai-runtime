@@ -343,6 +343,82 @@ __device__ __forceinline__ float dot_q6k_row(
     return acc;
 }
 
+// uint32-load variant of dot_q6k_row.
+//
+// Q6_K's per-block layout (ql[128] + qh[64] + scales[16] + d) has the same
+// 4-sub-block geometry as Q4_K's qs[128] when you treat each n iteration's
+// 64-byte ql slice as two 32-byte halves. So the Q4_K-style lane mapping
+// from #25 transfers directly:
+//
+//   il_q6    = lane >> 3                     (which 32-byte ql sub-block: 0..3)
+//   sub_base = (lane & 7) << 2               (byte offset within sub-block)
+//   n_iter   = il_q6 >> 1                    (0 for il_q6 0,1; 1 for il_q6 2,3)
+//
+// Per lane per block:
+//   • 1 uint32 load from ql at offset 32*il_q6 + sub_base
+//       → 4 bytes, each yielding low+high nibbles for 2 K-positions
+//   • 1 uint32 load from qh at offset 32*n_iter + sub_base
+//       → 4 bytes, each carrying 2-bit fields for the same low+high
+//         K-positions (bits 0-1/4-5 for il_q6 even; bits 2-3/6-7 for odd)
+//   • 2 scale bytes (lo / hi range), loaded once per block per lane
+//   • 8 x reads and 8 FMAs, identical math to dot_q6k_row
+//
+// Total: 2 uint32 weight loads per block per lane (was 6 byte loads). Same
+// 8 FMAs. Float-add associativity changes vs the byte path, but FP16
+// output typically rounds back to the same bits on sane K dims.
+__device__ __forceinline__ float dot_q6k_row_uint32(
+    const block_q6_K* __restrict__ row_blocks,
+    const half*       __restrict__ x,
+    int n_blocks,
+    int lane)
+{
+    const int il_q6     = lane >> 3;
+    const int sub_base  = (lane & 7) << 2;
+    const int n_iter    = il_q6 >> 1;
+    const int il_in_n   = il_q6 & 1;
+    const int lo_shift  = il_in_n * 2;     // 0 or 2
+    const int hi_shift  = lo_shift + 4;    // 4 or 6
+    const int sc_lo_idx = n_iter * 8 + il_in_n * 2 + (sub_base >> 4);
+    const int sc_hi_idx = sc_lo_idx + 4;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_q6_K& blk = row_blocks[b];
+        const float d = raw_fp16_to_float(blk.d_raw);
+        const int k_base = b * QK_K;
+
+        const int8_t sc_lo = blk.scales[sc_lo_idx];
+        const int8_t sc_hi = blk.scales[sc_hi_idx];
+        const float w_lo = d * (float)sc_lo;
+        const float w_hi = d * (float)sc_hi;
+
+        const uint32_t ql32 =
+            *(const uint32_t*)(blk.ql + 32 * il_q6 + sub_base);
+        const uint32_t qh32 =
+            *(const uint32_t*)(blk.qh + 32 * n_iter + sub_base);
+
+        // K-position bases:
+        //   K_lo_base = block_base + n_iter*128 + il_in_n*32 + sub_base
+        //   K_hi_base = K_lo_base + 64
+        const int k_lo_base = k_base + n_iter * 128 + il_in_n * 32 + sub_base;
+
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            const uint8_t ql_byte = (uint8_t)(ql32 >> (s * 8));
+            const uint8_t qh_byte = (uint8_t)(qh32 >> (s * 8));
+
+            const int q_lo = (int)((ql_byte & 0xF) | (((qh_byte >> lo_shift) & 3) << 4)) - 32;
+            const int q_hi = (int)((ql_byte >>  4) | (((qh_byte >> hi_shift) & 3) << 4)) - 32;
+
+            acc += w_lo * (float)q_lo * __half2float(x[k_lo_base + s     ]);
+            acc += w_hi * (float)q_hi * __half2float(x[k_lo_base + s + 64]);
+        }
+    }
+
+    return acc;
+}
+
 __device__ __forceinline__ float dot_quant_row(
     const void* __restrict__ W,
     int ggml_type,
@@ -717,6 +793,32 @@ __global__ void gemv_quant_add_uint32_q4k_kernel(
     }
 }
 
+// Q6_K-only residual-fused variant using dot_q6k_row_uint32.
+// Decode hits this kernel for W_down (Q6_K, ~8% of decode wall-clock
+// per #19's profile). Same dispatch shape as the Q4_K kernel above —
+// just a different per-row dot helper.
+__global__ void gemv_quant_add_uint32_q6k_kernel(
+    half*             __restrict__ y,
+    const block_q6_K* __restrict__ W,
+    const half*       __restrict__ x,
+    const half*       __restrict__ residual,
+    int M, int K, int rows_per_block)
+{
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+
+    const int n_blocks = K / QK_K;
+    float acc = dot_q6k_row_uint32(
+        W + (int64_t)row * n_blocks, x, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        const half projected = __float2half(acc);
+        y[row] = __float2half(__half2float(projected) +
+                              __half2float(residual[row]));
+    }
+}
+
 template<int Type0, int Type1>
 __global__ void gemv_quant_pair_typed_kernel(
     half*        __restrict__ y0,
@@ -829,14 +931,13 @@ __global__ void gemv_quant_triple_uint32_q4k_kernel(
 }
 
 // Q4_K + Q4_K + Q6_K triple-output kernel. This is the Qwen3-4B case
-// (Wq, Wk are Q4_K; Wv is Q6_K). The Q4_K rows take the uint32 path;
-// the Q6_K rows still go through the byte-by-byte dot_q6k_row helper
-// because we haven't written a uint32 variant for Q6_K yet (Q6_K
-// already runs at 30-40% of peak — less room to win, different block
-// layout). The block of 32 rows is heterogeneous: some warps in a
-// block run dot_q4k_row_uint32 and others run dot_q6k_row. That's
-// fine — warps are independent and the lane mapping for each helper
-// is self-contained.
+// (Wq, Wk are Q4_K; Wv is Q6_K). All three row ranges run uint32 weight
+// loads: Q4_K rows via dot_q4k_row_uint32, the Q6_K Wv rows via
+// dot_q6k_row_uint32 (added alongside the W_down kernel below). The
+// block of 32 rows is still heterogeneous in helper choice — different
+// warps in one block call different per-row dot helpers — but that's
+// fine: warps are independent and each helper's lane mapping is
+// self-contained.
 __global__ void gemv_quant_triple_uint32_q4k_q4k_q6k_kernel(
     half*             __restrict__ y0,
     const block_q4_K* __restrict__ W0,
@@ -870,7 +971,7 @@ __global__ void gemv_quant_triple_uint32_q4k_q4k_q6k_kernel(
         if (lane == 0) y1[local_row] = __float2half(acc);
     } else {
         const int local_row = row - M0 - M1;
-        float acc = dot_q6k_row(
+        float acc = dot_q6k_row_uint32(
             W2 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
         acc = warp_reduce_sum(acc);
         if (lane == 0) y2[local_row] = __float2half(acc);
@@ -1160,20 +1261,26 @@ static bool gemv_quant_add_gpu(half* y, const void* W, int ggml_type,
     const int block = rows_per_block * 32;
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
-    // Q4_K only — uint32 weight loads, opt-in via JLLM_Q4K_UINT32_LOADS.
-    // On Q5_K / Q6_K the per-byte loop already runs at higher arithmetic
-    // intensity per byte; vectorizing those is a separate exercise.
-    if (ggml_type == 12 && q4k_uint32_loads_enabled()) {
+    // Q4_K / Q6_K uint32 weight loads. Same env var so one flag covers
+    // every quantization that has a uint32 helper. Q5_K stays on the
+    // byte path (no production caller / no uint32 helper).
+    if (q4k_uint32_loads_enabled() && (ggml_type == 12 || ggml_type == 14)) {
         static bool logged = false;
         if (!logged) {
-            fprintf(stderr, "[GEMV] Q4_K uint32 weight-load path enabled\n");
+            fprintf(stderr, "[GEMV] uint32 weight-load path enabled (type=%d)\n",
+                    ggml_type);
             logged = true;
         }
-        gemv_quant_add_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
-            y, (const block_q4_K*)W_device, x, residual, M, K, rows_per_block);
+        if (ggml_type == 12) {
+            gemv_quant_add_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
+                y, (const block_q4_K*)W_device, x, residual, M, K, rows_per_block);
+        } else { // 14
+            gemv_quant_add_uint32_q6k_kernel<<<grid, block, 0, stream>>>(
+                y, (const block_q6_K*)W_device, x, residual, M, K, rows_per_block);
+        }
         cudaError_t err = cudaGetLastError();
         if (err == cudaSuccess) return true;
-        fprintf(stderr, "[GEMV] Q4_K uint32 launch failed: %s; falling back\n",
+        fprintf(stderr, "[GEMV] uint32 add launch failed: %s; falling back\n",
                 cudaGetErrorString(err));
         // Fall through to the byte-load typed kernel below.
     }
