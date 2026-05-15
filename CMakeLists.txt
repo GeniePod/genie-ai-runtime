@@ -165,3 +165,10 @@ add_test(NAME mmq_q4k_precompute COMMAND test_mmq_q4k_precompute)
 add_executable(test_mmq_q4k_multiwarp tests/test_mmq_q4k_multiwarp.cu)
 target_link_libraries(test_mmq_q4k_multiwarp PRIVATE CUDA::cudart)
 add_test(NAME mmq_q4k_multiwarp COMMAND test_mmq_q4k_multiwarp)
+
+# Path F phase F1: KV cache serialization round-trip. Standalone test
+# that exercises the on-disk format (header + body) we'll use in F3 to
+# persist per-conversation KV state. No engine integration yet.
+add_executable(test_kv_serialize tests/test_kv_serialize.cu)
+target_link_libraries(test_kv_serialize PRIVATE CUDA::cudart)
+add_test(NAME kv_serialize COMMAND test_kv_serialize)
