@@ -133,4 +133,100 @@ void KVCachePool::clear() {
     gpu_tokens_ = 0;
 }
 
+// Path F3b: per-layer gather of the populated portion into a packed
+// host buffer. dst layout:
+//
+//   per layer l in [0, n_layers):
+//     [ used_tokens × eb/2 key bytes  ]
+//     [ used_tokens × eb/2 value bytes ]
+//
+// where eb = entry_bytes() = 2 × n_kv_heads × head_dim × kv_type_bytes.
+// Within each layer slab in gpu_pool_, keys live at offset
+// [layer × max_context × eb, ...) and values follow at offset + max_context × eb/2.
+bool KVCachePool::gather_used_to_host(void* dst, int used_tokens) const {
+    if (!gpu_pool_ || used_tokens <= 0) return false;
+    if (used_tokens > cfg_.max_context) return false;
+
+    const int64_t eb       = entry_bytes();
+    const int64_t half_eb  = eb / 2;
+    const int64_t layer_in_stride  = (int64_t)cfg_.max_context * eb;
+    const int64_t layer_out_stride = (int64_t)used_tokens * eb;
+    const int64_t key_used_bytes   = (int64_t)used_tokens * half_eb;
+
+    uint8_t* d = static_cast<uint8_t*>(dst);
+    for (int l = 0; l < cfg_.n_layers; l++) {
+        const uint8_t* src_keys = static_cast<const uint8_t*>(gpu_pool_)
+                                  + l * layer_in_stride;
+        const uint8_t* src_vals = src_keys + (int64_t)cfg_.max_context * half_eb;
+
+        uint8_t* dst_keys = d + l * layer_out_stride;
+        uint8_t* dst_vals = dst_keys + key_used_bytes;
+
+        cudaError_t err;
+        err = cudaMemcpy(dst_keys, src_keys, key_used_bytes,
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] gather: layer %d keys D2H: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaMemcpy(dst_vals, src_vals, key_used_bytes,
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] gather: layer %d vals D2H: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool KVCachePool::scatter_from_host(const void* src, int used_tokens,
+                                    bool zero_remaining)
+{
+    if (!gpu_pool_ || used_tokens <= 0) return false;
+    if (used_tokens > cfg_.max_context) return false;
+
+    const int64_t eb               = entry_bytes();
+    const int64_t half_eb          = eb / 2;
+    const int64_t layer_out_stride = (int64_t)cfg_.max_context * eb;
+    const int64_t layer_in_stride  = (int64_t)used_tokens * eb;
+    const int64_t key_used_bytes   = (int64_t)used_tokens * half_eb;
+    const int64_t key_unused_bytes = (int64_t)(cfg_.max_context - used_tokens) * half_eb;
+
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    for (int l = 0; l < cfg_.n_layers; l++) {
+        uint8_t* dst_keys = static_cast<uint8_t*>(gpu_pool_) + l * layer_out_stride;
+        uint8_t* dst_vals = dst_keys + (int64_t)cfg_.max_context * half_eb;
+
+        const uint8_t* src_keys = s + l * layer_in_stride;
+        const uint8_t* src_vals = src_keys + key_used_bytes;
+
+        cudaError_t err;
+        err = cudaMemcpy(dst_keys, src_keys, key_used_bytes,
+                         cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] scatter: layer %d keys H2D: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaMemcpy(dst_vals, src_vals, key_used_bytes,
+                         cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] scatter: layer %d vals H2D: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+        if (zero_remaining && key_unused_bytes > 0) {
+            err = cudaMemset(dst_keys + key_used_bytes, 0, key_unused_bytes);
+            if (err != cudaSuccess) return false;
+            err = cudaMemset(dst_vals + key_used_bytes, 0, key_unused_bytes);
+            if (err != cudaSuccess) return false;
+        }
+    }
+    used_tokens_ = used_tokens;
+    gpu_tokens_  = used_tokens;
+    return true;
+}
+
 }  // namespace jllm

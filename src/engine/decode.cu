@@ -14,6 +14,7 @@
 #include "jllm_engine.h"
 #include "../persistence/kv_cache_file.h"
 #include <chrono>
+#include <vector>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -1753,6 +1754,13 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             if (!ensure_dir(dir)) {
                 fprintf(stderr, "[kv_cache] skip save (dir unavailable)\n");
             } else {
+                // F3b: packed body — n_layers × used_tokens × entry_bytes.
+                // For Qwen3-4B with used_tokens=37 / max_context=1024:
+                // body shrinks from 144 MB → ~5.4 MB → ~200 ms save vs
+                // F3's 5.6 s.
+                const int64_t packed_bytes =
+                    kv_cache_.packed_used_bytes(total_tokens);
+
                 KVCacheFileHeader hdr{};
                 hdr.magic         = KVCACHE_MAGIC;
                 hdr.version       = KVCACHE_VERSION;
@@ -1762,20 +1770,24 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                 hdr.kv_type_bytes = (uint32_t)kv_cfg.kv_type_bytes;
                 hdr.max_context   = (uint32_t)kv_cfg.max_context;
                 hdr.used_tokens   = (uint32_t)total_tokens;
-                hdr.body_bytes    = (uint64_t)kv_cache_.gpu_pool_bytes();
+                hdr.body_bytes    = (uint64_t)packed_bytes;
                 std::memcpy(hdr.model_hash, model_fingerprint_,
                             sizeof(hdr.model_hash));
 
                 auto t_save0 = Clock::now();
-                bool ok = save_kv_to_file(path, hdr,
-                                          kv_cache_.gpu_pool_ptr(),
-                                          (size_t)hdr.body_bytes);
+                std::vector<uint8_t> staging((size_t)packed_bytes);
+                bool ok = kv_cache_.gather_used_to_host(staging.data(),
+                                                       total_tokens);
+                if (ok) {
+                    ok = save_kv_to_file(path, hdr, staging.data(),
+                                         (size_t)packed_bytes);
+                }
                 auto t_save1 = Clock::now();
                 float save_ms = Ms(t_save1 - t_save0).count();
                 if (ok) {
                     fprintf(stderr,
                             "[kv_cache] Saved %lu bytes to %s "
-                            "(%d tokens, %.0f ms)\n",
+                            "(%d tokens packed, %.0f ms)\n",
                             (unsigned long)hdr.body_bytes, path.c_str(),
                             total_tokens, save_ms);
                 } else {

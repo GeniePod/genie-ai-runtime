@@ -32,20 +32,23 @@ struct KVCacheFileHeader {
 #pragma pack(pop)
 static_assert(sizeof(KVCacheFileHeader) == 128, "header must be 128 bytes");
 
-// Atomic save: stages device buffer to host, writes <path>.tmp, fsyncs,
-// renames to <path>. Returns false on any I/O or cudaMemcpy failure;
-// rejects mismatched header.body_bytes vs body_bytes argument.
+// Atomic save: writes <path>.tmp, fsyncs, renames to <path>. Returns
+// false on any I/O failure. host_buffer must already contain the body
+// bytes the caller wants persisted (the persistence layer is purely
+// I/O — gather from device → host is the caller's responsibility,
+// typically via KVCachePool::gather_used_to_host).
 bool save_kv_to_file(const std::string& path,
                      const KVCacheFileHeader& hdr,
-                     const void* d_buffer,
+                     const void* host_buffer,
                      size_t body_bytes);
 
 // Load: validates magic, version, and fstat'd size vs hdr.body_bytes.
-// Refuses truncated files. Copies body into d_buffer (must be at least
-// hdr.body_bytes in capacity).
+// Refuses truncated files. Copies body into host_buffer (must be at
+// least hdr.body_bytes in capacity). Scattering to the device pool is
+// the caller's responsibility, typically via KVCachePool::scatter_from_host.
 bool load_kv_from_file(const std::string& path,
                        KVCacheFileHeader& hdr,
-                       void* d_buffer,
+                       void* host_buffer,
                        size_t buffer_capacity);
 
 // FNV-1a-64 over (file_size as 8 bytes || first 256 B of file). The

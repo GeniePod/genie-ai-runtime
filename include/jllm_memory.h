@@ -142,6 +142,27 @@ public:
         return (int64_t)cfg_.n_layers * cfg_.max_context * entry_bytes();
     }
 
+    // Path F3b: packed-on-disk size when only `used_tokens` are populated.
+    // Per layer we keep used_tokens keys + used_tokens values, so the
+    // packed body is roughly used_tokens / max_context of the full pool.
+    int64_t packed_used_bytes(int used_tokens) const {
+        if (used_tokens <= 0) return 0;
+        return (int64_t)cfg_.n_layers * used_tokens * entry_bytes();
+    }
+
+    // Path F3b: gather the populated portion (positions [0, used_tokens)
+    // of every layer) into a host buffer for serialization. dst must be
+    // at least packed_used_bytes(used_tokens) bytes. Lays out
+    // per-layer: [keys 0..used_tokens-1][values 0..used_tokens-1].
+    bool gather_used_to_host(void* dst, int used_tokens) const;
+
+    // Path F3b (used by F4): scatter a packed body back into the GPU
+    // pool. zero_remaining = true memsets positions [used_tokens,
+    // max_context) of each layer to 0 first; F4 will pass true to make
+    // sure stale state from prior turns doesn't leak into attention.
+    bool scatter_from_host(const void* src, int used_tokens,
+                           bool zero_remaining);
+
 private:
     Config cfg_ = {};
     void*  gpu_pool_ = nullptr;   // cudaMalloc — GPU-visible fast pool

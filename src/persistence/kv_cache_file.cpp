@@ -21,7 +21,7 @@ namespace jllm {
 
 bool save_kv_to_file(const std::string& path,
                      const KVCacheFileHeader& hdr,
-                     const void* d_buffer,
+                     const void* host_buffer,
                      size_t body_bytes)
 {
     if (hdr.body_bytes != body_bytes) {
@@ -32,15 +32,6 @@ bool save_kv_to_file(const std::string& path,
     }
 
     std::string tmp_path = path + ".tmp";
-
-    std::vector<uint8_t> host_staging(body_bytes);
-    cudaError_t err = cudaMemcpy(host_staging.data(), d_buffer, body_bytes,
-                                 cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[kv_cache] save: cudaMemcpy D2H failed: %s\n",
-                cudaGetErrorString(err));
-        return false;
-    }
 
     int fd = ::open(tmp_path.c_str(),
                     O_WRONLY | O_CREAT | O_TRUNC,
@@ -55,10 +46,10 @@ bool save_kv_to_file(const std::string& path,
         fprintf(stderr, "[kv_cache] save: header write short\n");
         ::close(fd); ::unlink(tmp_path.c_str()); return false;
     }
+    const uint8_t* src = static_cast<const uint8_t*>(host_buffer);
     size_t written = 0;
     while (written < body_bytes) {
-        ssize_t n = ::write(fd, host_staging.data() + written,
-                            body_bytes - written);
+        ssize_t n = ::write(fd, src + written, body_bytes - written);
         if (n <= 0) {
             fprintf(stderr, "[kv_cache] save: body write failed at %zu/%zu\n",
                     written, body_bytes);
@@ -82,7 +73,7 @@ bool save_kv_to_file(const std::string& path,
 
 bool load_kv_from_file(const std::string& path,
                        KVCacheFileHeader& hdr,
-                       void* d_buffer,
+                       void* host_buffer,
                        size_t buffer_capacity)
 {
     int fd = ::open(path.c_str(), O_RDONLY);
@@ -125,11 +116,10 @@ bool load_kv_from_file(const std::string& path,
         ::close(fd); return false;
     }
 
-    std::vector<uint8_t> host_staging(hdr.body_bytes);
+    uint8_t* dst = static_cast<uint8_t*>(host_buffer);
     size_t read = 0;
     while (read < hdr.body_bytes) {
-        ssize_t n = ::read(fd, host_staging.data() + read,
-                           hdr.body_bytes - read);
+        ssize_t n = ::read(fd, dst + read, hdr.body_bytes - read);
         if (n <= 0) {
             fprintf(stderr, "[kv_cache] load: body read failed at %zu/%lu\n",
                     read, (unsigned long)hdr.body_bytes);
@@ -138,14 +128,6 @@ bool load_kv_from_file(const std::string& path,
         read += (size_t)n;
     }
     ::close(fd);
-
-    cudaError_t err = cudaMemcpy(d_buffer, host_staging.data(), hdr.body_bytes,
-                                 cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[kv_cache] load: cudaMemcpy H2D failed: %s\n",
-                cudaGetErrorString(err));
-        return false;
-    }
     return true;
 }
 
