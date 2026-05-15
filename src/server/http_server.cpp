@@ -183,6 +183,22 @@ static void handle_client(int client, Engine& engine) {
         GenParams params;
         // TODO: parse max_tokens, temperature from JSON body
 
+        // Path F (#45): pick up an optional conversation_id from the
+        // request body. Validate before forwarding; an invalid id is
+        // dropped to single-shot mode rather than rejected as a 4xx so
+        // existing OpenAI-compatible clients don't break if they pass
+        // something unexpected.
+        std::string conv_id = extract_json_string(body, "conversation_id");
+        if (!conv_id.empty()) {
+            if (validate_conversation_id(conv_id)) {
+                params.conversation_id = conv_id;
+            } else {
+                fprintf(stderr,
+                        "[http] WARNING: conversation_id '%s' rejected — "
+                        "must match [A-Za-z0-9_-]{1,64}\n", conv_id.c_str());
+            }
+        }
+
         send_response(client, 200, "application/json",
                      build_completion_json(engine, prompt, params));
     }

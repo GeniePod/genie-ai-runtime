@@ -31,6 +31,7 @@ struct Args {
     bool        chat        = false;
     bool        raw_prompt  = false;
     bool        think       = false;
+    std::string conversation_id;       // Path F: optional persistent-KV id
 };
 
 static std::string lower_copy(std::string s) {
@@ -88,6 +89,7 @@ Args parse_args(int argc, char** argv) {
         else if (strcmp(argv[i], "--raw") == 0) args.raw_prompt = true;
         else if (strcmp(argv[i], "--think") == 0) args.think = true;
         else if (strcmp(argv[i], "--no-think") == 0) args.think = false;
+        else if (strcmp(argv[i], "--conv-id") == 0 && i+1 < argc) args.conversation_id = argv[++i];
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
                 "jetson-llm — Memory-first LLM runtime for Jetson Orin\n\n"
@@ -106,6 +108,9 @@ Args parse_args(int argc, char** argv) {
                 "  --no-think Disable Qwen3 thinking output (default)\n"
                 "  --int8-kv  Use experimental INT8 KV cache\n"
                 "  --fp16-kv  Use FP16 KV cache (default)\n"
+                "  --conv-id ID  Path F: persistent-KV conversation id\n"
+                "                ([A-Za-z0-9_-]{1,64}). F2 plumbing only —\n"
+                "                no persistence yet; engine logs the id.\n"
                 "  -h         This help\n\n"
                 "Jetson-specific:\n"
                 "  Auto-detects power mode, thermal state, and available memory.\n"
@@ -175,6 +180,17 @@ int main(int argc, char** argv) {
     params.top_p = args.top_p;
     params.context_limit = args.context;
     params.kv_int8 = args.kv_int8;
+
+    if (!args.conversation_id.empty()) {
+        if (!jllm::validate_conversation_id(args.conversation_id)) {
+            fprintf(stderr,
+                    "[cli] WARNING: --conv-id '%s' rejected — must match "
+                    "[A-Za-z0-9_-]{1,64}. Running in single-shot mode.\n",
+                    args.conversation_id.c_str());
+        } else {
+            params.conversation_id = args.conversation_id;
+        }
+    }
 
     fprintf(stderr, "Loading model...\n");
     if (!engine.load(args.model_path, params)) {

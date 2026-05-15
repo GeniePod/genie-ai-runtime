@@ -49,7 +49,22 @@ struct GenParams {
     int   context_limit = 0;
     bool  use_cuda_graph = true;
     bool  kv_int8       = false;
+
+    // Path F (#45): persistent KV cache identifier. Empty = single-shot,
+    // no cross-turn state. Non-empty = the engine will (in F3+) try to
+    // load <conversation_id>.bin at request start and write it back at
+    // turn end. Plumbed-but-ignored in F2; engine logs it for now.
+    //
+    // Validated by validate_conversation_id(): only [A-Za-z0-9_-] and
+    // ≤ 64 chars accepted. Invalid IDs are dropped at the CLI / HTTP
+    // boundary, never reach the engine.
+    std::string conversation_id;
 };
+
+// Returns true if `id` is empty or matches /^[A-Za-z0-9_-]{1,64}$/.
+// Empty is treated as "feature disabled", not an error. Locked down
+// before F3 starts using the value to build file paths.
+bool validate_conversation_id(const std::string& id);
 
 using TokenCallback = std::function<void(const char* text, bool is_eos)>;
 

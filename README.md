@@ -170,6 +170,8 @@ Short flags only. CLI: `-m` model, `-p` prompt, `-n` max tokens,
 `-h` help. Server: `-m` model, `-p` **port** (not prompt — heads up),
 `-c` context, `--fp16-kv` to disable INT8 KV cache.
 
+`--conv-id <id>` (Path F, see [#45](https://github.com/GeniePod/genie-ai-runtime/issues/45)) tags a request with a persistent-KV conversation identifier (`[A-Za-z0-9_-]{1,64}`). The HTTP server accepts the same id via a `conversation_id` field in `/v1/chat/completions`. Currently plumbing only — the engine logs the id but does not yet persist or hydrate KV state. F3 wires the save/load hooks against the on-disk format from [#46](https://github.com/GeniePod/genie-ai-runtime/pull/46).
+
 ## Runtime Flags
 
 Fast CUDA paths are enabled by default. Per-kernel fallbacks remain available

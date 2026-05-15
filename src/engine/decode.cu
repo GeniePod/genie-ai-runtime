@@ -1432,12 +1432,42 @@ bool Engine::check_memory_and_thermal(int pos) {
 
 // ── Main generation loop ─────────────────────────────────────────────────
 
+bool validate_conversation_id(const std::string& id) {
+    if (id.empty()) return true;
+    if (id.size() > 64) return false;
+    for (char c : id) {
+        const bool ok = (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') ||
+                         c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                           TokenCallback token_cb) {
     GenStats stats = {};
     stop_flag_ = false;
     gen_params_ = params;
     recent_tokens_.clear();
+
+    // Path F (#45): plumbing only in F2 — log conversation_id if set; the
+    // F3 hooks (save on turn end, hydrate on turn start) consume it.
+    // validate_conversation_id() ran at the CLI / HTTP boundary; we
+    // re-check defensively here in case a future call site forgets.
+    if (!params.conversation_id.empty()) {
+        if (!validate_conversation_id(params.conversation_id)) {
+            fprintf(stderr,
+                    "[engine] WARNING: rejecting invalid conversation_id "
+                    "(must match [A-Za-z0-9_-]{1,64}); single-shot mode\n");
+        } else {
+            fprintf(stderr,
+                    "[engine] conversation_id=%s (Path F plumbing — "
+                    "persistence not yet wired in F2)\n",
+                    params.conversation_id.c_str());
+        }
+    }
 
     // t_request: wall-clock at the moment generate() was called. The
     // reference point for time-to-first-token, which captures the full
