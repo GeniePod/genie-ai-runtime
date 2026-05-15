@@ -9,39 +9,47 @@ on a 7.6 GB iGPU without crowding out whisper.cpp + Piper + Home Assistant.
 
 ## Status
 
-`v0.1.0-alpha.3` — Path B (layer-major batched prefill) merged and
-default-on. Validated on Jetson Orin Nano Super 8 GB with
-`Qwen3-4B-Q4_K_M.gguf`.
+`v0.1.0-alpha.5` — Path C (Q4_K uint32 weight loads) merged and
+default-on, stacked on top of Path B's batched prefill. Validated on
+Jetson Orin Nano Super 8 GB with `Qwen3-4B-Q4_K_M.gguf`.
 
 Current validated path:
 - Coherent Qwen3 instruct output with automatic chat template and no-think mode.
 - GGUF tokenizer loads Qwen BPE merges and special tokens.
 - Qwen3 architecture fixes: 128-dim attention heads, Q/K RMSNorm, NeoX RoPE,
   tied output embeddings.
-- Default GPU decode kernels for K-quant GEMV, RMSNorm, and single-token
-  attention on Orin SM 8.7.
-- **Batched prefill**: K-quant GEMM, batched RMSNorm + QK-norm + SwiGLU,
-  chunked-prefill attention. Reads each weight value from DRAM once per
-  layer and re-uses it across all N prompt tokens.
+- **Batched prefill (Path B)**: K-quant GEMM, batched RMSNorm + QK-norm +
+  SwiGLU, chunked-prefill attention. Reads each weight value from DRAM
+  once per layer and re-uses it across all N prompt tokens.
+- **Decode K-quant GEMV uint32 path (Path C)**: each lane reads four
+  packed q-bytes as one `uint32_t` from `blk.qs`. Eliminates the
+  byte-by-byte inner loop on the hot decode kernels (Wo, gate/up pair,
+  QKV triple). Folds the residual add into the gemv itself. Q6_K still
+  on the byte path (block layout doesn't satisfy 4-byte alignment).
+- Device-resident layer weights — copied into a per-layer device arena
+  at load time instead of streaming from mmap'd host memory.
 - Jetson power reporting handles L4T R36 sysfs paths and `nvpmodel` wattage
   strings such as `NV Power Mode: 25W`.
 
 Latest on-device measurement: Qwen3-4B Q4_K_M, 25 W MAXN SUPER, GPU
 locked at 918 MHz, 18-token prompt.
 
-| | alpha.2 (per-token) | alpha.3 (Path B) | Δ |
-|---|---|---|---|
-| Prefill | 8.2 tok/s | **15.4 tok/s** | **+88% (1.88×)** |
-| TTFT | 2200 ms | **1181 ms** | **−47%** |
-| Decode | 7.5 tok/s | 7.5 tok/s | unchanged |
-| Output | reference | bit-identical | ✓ |
+| | alpha.2 (per-token) | alpha.3 (Path B) | alpha.5 (+ Path C) | Cumulative Δ |
+|---|---|---|---|---|
+| Prefill | 8.2 tok/s | **15.4 tok/s** | 15.2 tok/s | **+85%** |
+| TTFT | 2200 ms | **1181 ms** | ~1180 ms | **−46%** |
+| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | **+21%** |
+| Output | reference | bit-identical | bit-identical | ✓ |
 
 Path B detail: PRs [#13](https://github.com/GeniePod/genie-ai-runtime/pull/13)
 → [#17](https://github.com/GeniePod/genie-ai-runtime/pull/17), default
 flip in [#18](https://github.com/GeniePod/genie-ai-runtime/pull/18).
-Decode is the remaining bottleneck — see issue
-[#19](https://github.com/GeniePod/genie-ai-runtime/issues/19) for the
-Path C plan.
+Path C detail: PRs [#25](https://github.com/GeniePod/genie-ai-runtime/pull/25)
+(Wo) → [#26](https://github.com/GeniePod/genie-ai-runtime/pull/26)
+(gate/up) → [#27](https://github.com/GeniePod/genie-ai-runtime/pull/27)
+(QKV triple) → default flip [#28](https://github.com/GeniePod/genie-ai-runtime/pull/28).
+Plan + negative results in
+[#19](https://github.com/GeniePod/genie-ai-runtime/issues/19).
 
 ## Why
 
@@ -124,19 +132,20 @@ Fast CUDA paths are enabled by default. Per-kernel fallbacks remain available
 for debugging:
 
 ```
-JLLM_BATCHED_PREFILL=0  # disable Path B (layer-major batched prefill); default: on
-JLLM_FAST_GEMV=0  # use CPU reference K-quant GEMV
-JLLM_FAST_EMBD=0  # use CPU reference token embedding dequantization
-JLLM_FAST_NORM=0  # use CPU reference RMSNorm
-JLLM_FAST_ATTN=0  # use CPU reference decode attention (also disables chunked-prefill attention)
-JLLM_FAST_SAMPLE=0  # use full-vocab reference sampling path
-JLLM_DEVICE_OUTPUT=0  # disable automatic output projection device copy
-JLLM_DEVICE_LAYERS=36  # opt into layer weight device copies; set N to cap copied layers
-JLLM_MAPPED_WEIGHTS=0  # experimental: skip mapped-host CUDA weights and prefer device copies
-JLLM_KV_OVERFLOW=1024  # optional extra CPU overflow tokens (default: 0)
-JLLM_GEMV_ROWS=4  # use the previous 4-row GEMV launch shape (default: 8)
-JLLM_PROFILE=1  # print per-token decode timing breakdown
-JLLM_DEBUG_KERNELS=1  # print first-token kernel diagnostics
+JLLM_BATCHED_PREFILL=0   # disable Path B (layer-major batched prefill); default: on
+JLLM_Q4K_UINT32_LOADS=0  # disable Path C (Q4_K uint32 weight loads on decode); default: on
+JLLM_FAST_GEMV=0         # use CPU reference K-quant GEMV
+JLLM_FAST_EMBD=0         # use CPU reference token embedding dequantization
+JLLM_FAST_NORM=0         # use CPU reference RMSNorm
+JLLM_FAST_ATTN=0         # use CPU reference decode attention (also disables chunked-prefill attention)
+JLLM_FAST_SAMPLE=0       # use full-vocab reference sampling path
+JLLM_DEVICE_OUTPUT=0     # disable automatic output projection device copy
+JLLM_DEVICE_LAYERS=36    # opt into layer weight device copies; set N to cap copied layers
+JLLM_MAPPED_WEIGHTS=0    # experimental: skip mapped-host CUDA weights and prefer device copies
+JLLM_KV_OVERFLOW=1024    # optional extra CPU overflow tokens (default: 0)
+JLLM_GEMV_ROWS=8         # legacy 8-row GEMV launch shape; default is 4 since the decode-side residual-fusion landed
+JLLM_PROFILE=1           # print per-token decode timing breakdown
+JLLM_DEBUG_KERNELS=1     # print first-token kernel diagnostics
 ```
 
 For Qwen instruct/chat models, CLI prompts are chat-wrapped by default. Use

@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.1.0-alpha.5 — 2026-05-15
+
+Path C: vectorized weight loads for the Q4_K decode GEMV family, plus
+the decode-side memory & fusion work that landed directly on main
+between alpha.3 and Path C. Validated on Jetson Orin Nano Super 8 GB,
+Qwen3-4B Q4_K_M, 25 W MAXN SUPER.
+
+| | alpha.3 | alpha.5 | Δ |
+|---|---|---|---|
+| Decode | 7.5 tok/s | **9.1 tok/s** | **+21% (1.21×)** |
+| Prefill | 15.4 tok/s | 15.2 tok/s | unchanged (noise) |
+| TTFT | 1181 ms | ~1180 ms | unchanged |
+| Output | reference | bit-identical | ✓ |
+
+### Added (Path C — Q4_K uint32 weight loads, PRs #25 / #26 / #27 / #28)
+
+- `dot_q4k_row_uint32` — per-row Q4_K dot helper. Each lane reads
+  four packed q-bytes as one `uint32_t` from `blk.qs + 32*il + sub_base`,
+  eliminating the byte-by-byte inner loop. Same arithmetic, same FMAs,
+  fewer issued load instructions and constant-per-lane scales.
+- `gemv_quant_add_uint32_q4k_kernel` — residual-fused Q4_K single-output
+  kernel (decode Wo, ~20% of decode wall-clock).
+- `gemv_quant_pair_uint32_q4k_kernel` — Q4_K + Q4_K dual-output kernel
+  (decode gate/up, ~44% of decode wall-clock — the biggest single share).
+- `gemv_quant_triple_uint32_q4k_kernel` — pure Q4_K triple.
+- `gemv_quant_triple_uint32_q4k_q4k_q6k_kernel` — Qwen3-4B QKV triple
+  (Wq, Wk Q4_K; Wv Q6_K). Q4_K rows take the uint32 path; Q6_K rows
+  fall through to the byte path inside the same kernel.
+- `JLLM_Q4K_UINT32_LOADS` env var, default on. Dispatchers in
+  `gemv_quant_add_gpu` / `gemv_quant_pair_gpu` / `gemv_quant_triple_gpu`
+  route through the uint32 kernels when the flag is set and fall back
+  to the existing typed byte-load kernels on any `cudaError`.
+
+### Added (decode-path work on main between alpha.3 and Path C)
+
+- Device-resident weight arena (`Pack device-resident layer weights`,
+  `Allocate runtime pools before device weights`, and friends) —
+  weights are now copied into a single device allocation per layer
+  group instead of streaming from mmap'd host memory through pinned
+  mappings. Trades load-time memory pressure for steady-state
+  bandwidth determinism on Tegra.
+- Decode GEMV residual-add fusion — the residual `vec_add` is folded
+  into the typed gemv (`gemv_quant_add_typed_kernel<Type>`), removing
+  one launch per layer per token.
+- `gemv_rows_per_block` default lowered from 8 to 4 — more grid
+  parallelism on the small-M shapes that show up in decode.
+- `Map tied output when device copy cannot fit` / `Map tied output
+  after runtime buffers` — graceful fallback for the
+  tied-token-embedding output projection when the device arena would
+  overflow the budget.
+
+### Changed
+
+- Decode-path `gemv_quant_add_typed_kernel<12>` is no longer the hot
+  kernel by default — `gemv_quant_add_uint32_q4k_kernel` is, because
+  `JLLM_Q4K_UINT32_LOADS` is now on by default. Set the env var to `0`
+  to opt back into the byte path (same grammar as
+  `JLLM_BATCHED_PREFILL` after alpha.3).
+
+### Closed-without-merge (negative-result PRs, documented inline)
+
+- #23 — Decode CUDA Graphs capture. Build correct, output
+  bit-identical, but no speedup: kernel launches were already
+  overlapping with GPU execution on the LPDDR5-bound workload, so
+  eliminating host-side launch overhead bought ≤0%. Closed with the
+  diagnosis attached.
+- #24 — Split-K Q4_K GEMV. Same idea didn't help: SPLIT_K=4 grew
+  block size 4× and register pressure dropped blocks-per-SM 4×, so
+  total warps-per-SM was unchanged. The bottleneck is arithmetic
+  intensity per byte loaded, not per-warp MSHR depth.
+- #29 — Q6_K uint32 weight loads. Crashed with
+  `cudaErrorMisalignedAddress`: `block_q6_K` is 210 B (not divisible
+  by 4), so consecutive blocks alternate between 4- and 2-aligned
+  memory positions and half the `uint32_t` loads fault. Format
+  constraint, not fixable inside the kernel. Closed with the
+  diagnosis.
+
+### Known limits
+
+- Q6_K decode kernels (W_down ~8% of decode, output logits ~7%) are
+  still on the byte-by-byte path. Q6_K already runs at ~30-40% of
+  LPDDR5 peak vs Q4_K's old ~10%, so the headroom is smaller, and
+  the 210-byte block size rules out the obvious uint32 vectorization.
+  Tracked as a future Q6_K uint16 attempt if it ever rises to the top
+  of a profile.
+
 ## v0.1.0-alpha.3 — 2026-05-15
 
 Path B: layer-major batched prefill. Validated on Jetson Orin Nano

@@ -60,6 +60,74 @@ Dequant:   8 INT4 values from one uint32, multiply by group scale
 6. Lane 0 writes y[row]
 ```
 
+## Q4_K uint32 weight loads (Path C, default-on)
+
+**File:** `src/kernels/gemv_q4.cu` (helper: `dot_q4k_row_uint32`,
+kernels: `gemv_quant_add_uint32_q4k_kernel`,
+`gemv_quant_pair_uint32_q4k_kernel`, `gemv_quant_triple_uint32_q4k_kernel`,
+`gemv_quant_triple_uint32_q4k_q4k_q6k_kernel`).
+**Validated:** Bit-identical output to the byte path on Qwen3-4B Q4_K_M
+decode; +21% decode tok/s end-to-end. Series: PRs #25 / #26 / #27, default
+flip #28.
+
+### What it does
+
+Same math as the byte-by-byte `dot_q4k_row` helper, but each lane reads
+**four packed q-bytes as one `uint32_t`** from `blk.qs + 32*il + sub_base`
+instead of one byte per inner iteration. The 4-iteration `il` inner loop
+disappears: a single warp instruction (32 lanes × 4 bytes) covers all
+128 bytes of `qs` for the block in one L1 line.
+
+Lane mapping:
+
+```
+il       = lane >> 3            // which 32-byte qs sub-block (0..3)
+sub_base = (lane & 7) << 2      // byte offset within sub-block (0,4,...,28)
+```
+
+Per block per lane:
+
+| | Byte path | uint32 path |
+|---|---|---|
+| Weight loads | 4 × `ld.global.b8` | **1 × `ld.global.b32`** |
+| x loads | 8 × `ld.global.b16` | 8 × `ld.global.b16` (unchanged) |
+| FMAs | 8 | 8 (same K-positions, same arithmetic) |
+| Scale lookups | recomputed per inner iter | constant per lane per block |
+
+### Why this is legal
+
+`sizeof(block_q4_K) == 144`, which is divisible by 4. So every block
+starts at a 4-aligned address in row memory, and `blk.qs + 32*il + sub_base`
+is also 4-aligned (32 and 4 are both multiples of 4). The same pattern
+**doesn't apply to `block_q6_K`** (210 B, divisible by 2 but not 4) — see
+#29 for the failed attempt.
+
+### Production callers (decode hot path)
+
+| Kernel | Routed to | Decode share |
+|---|---|---|
+| Wo (residual-fused) | `gemv_quant_add_uint32_q4k_kernel` | ~20% |
+| gate/up pair | `gemv_quant_pair_uint32_q4k_kernel` | ~44% (the biggest) |
+| QKV triple (Q4_K + Q4_K + Q6_K, Qwen3-4B) | `gemv_quant_triple_uint32_q4k_q4k_q6k_kernel` | ~14% (Q6_K Wv row stays on byte path) |
+| QKV triple (Q4_K + Q4_K + Q4_K, other models) | `gemv_quant_triple_uint32_q4k_kernel` | varies |
+
+Each dispatcher (`gemv_quant_add_gpu` / `gemv_quant_pair_gpu` /
+`gemv_quant_triple_gpu`) checks `q4k_uint32_loads_enabled()` and the
+`ggml_type` mix, then routes accordingly. Any `cudaError` falls through to
+the typed byte-load kernel — never crashes generation.
+
+### Bit-equality argument
+
+The 32-lane warp_reduce_sum that follows the per-lane dot is identical
+to the byte path. Each lane's accumulator now folds 8 FMAs over one
+sub-block's K-positions instead of 8 FMAs spread across four `il`
+sub-blocks' K-positions, so float-add associativity is broken in
+principle. In practice on Qwen3-4B at FP16 the rounded result matches
+the byte path **to the exact bit** on the standard test prompt — verified
+across PRs #25 / #26 / #27 (47-token completion matches verbatim each
+time). The `JLLM_Q4K_UINT32_LOADS=0` opt-out is there as the rollback for
+any deployment that trips a numeric edge case.
+
 ## gemm_quant_batched — K-Quant GEMM for Prefill
 
 **File:** `src/kernels/gemv_q4.cu` (kernels: `gemm_quant_batched_q4k_kernel`,

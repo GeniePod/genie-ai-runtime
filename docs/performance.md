@@ -22,22 +22,28 @@ Model: `Qwen3-4B-Q4_K_M.gguf` (2381 MB)
 Prompt: `Hello, who are you?` (18 tokens after Qwen chat template)
 Context: 1024 tokens
 
-| Metric | alpha.3 (Path B default-on) |
+| Metric | alpha.5 (Path B + Path C default-on) |
 |--------|---|
 | Prompt tokens | 18 |
-| Prefill | 1168 ms, **15.4 tok/s** |
+| Prefill | 1153 ms, **15.6 tok/s** |
 | Decode tokens | 47 |
-| Decode | 6307 ms, **7.5 tok/s** |
-| **TTFT** | **1181 ms** |
-| Peak memory | 3161 MB |
-| Peak temperature | 53.0°C |
+| Decode | 5184 ms, **9.1 tok/s** |
+| **TTFT** | **1194 ms** |
+| Peak memory | ~3550 MB |
+| Peak temperature | ~53°C |
 | Output | `Hello! I'm Qwen, a large-scale language model developed by Alibaba Group. I can help with a variety of tasks, including answering questions, writing articles, creating stories, and more. How can I assist you today?` |
+
+Bit-identical to the alpha.2 byte-path output. Across every Path B and Path C
+PR the generated text matched the baseline exactly on this prompt — float-add
+associativity is broken in principle by the batched and uint32 paths, but
+rounding to FP16 erases the difference for the standard prompt.
 
 Validated fast paths are all default:
 
 | Path | Runtime switch to disable |
 |------|---------------------------|
 | Layer-major batched prefill (Path B) | `JLLM_BATCHED_PREFILL=0` |
+| Q4_K uint32 decode weight loads (Path C) | `JLLM_Q4K_UINT32_LOADS=0` |
 | K-quant GEMV / GEMM | `JLLM_FAST_GEMV=0` |
 | Token embedding dequantization | `JLLM_FAST_EMBD=0` |
 | RMSNorm | `JLLM_FAST_NORM=0` |
@@ -96,13 +102,97 @@ weight bandwidth:
 The two effects together explain why each individual PR over-delivered
 relative to the static bandwidth estimate.
 
-### Path C — decode
+## Path C — Q4_K uint32 weight loads (2026-05-15)
 
-Decode at 7.5 tok/s is ~13% of LPDDR5 ceiling (38 tok/s on this
-model). Reference llama.cpp on the same hardware hits ~18 tok/s.
-There is real headroom; the plan is tracked in issue
-[#19](https://github.com/GeniePod/genie-ai-runtime/issues/19) and
-needs a profiler pass before any kernel work begins.
+Series: PRs #25 / #26 / #27 + default-flip #28. Two negative results
+(#23 CUDA Graphs, #24 split-K) closed without merge — instructive,
+documented inline. One more (#29 Q6_K uint32) failed on a block-size
+alignment constraint, also closed.
+
+Same hardware, model, prompt, and output as alpha.3. Each merged PR
+was validated byte-identical to the previous main.
+
+| PR | Change | Decode | Δ |
+|---|---|---|---|
+| main (alpha.3) | per-token byte loads | 7.5 tok/s | — |
+| #23 ✗ | CUDA Graphs decode capture | 7.3 (−2.7%) | closed, no merge |
+| #24 ✗ | split-K Q4_K GEMV | 7.6 (−1%) | closed, no merge |
+| #25 | Q4_K Wo uint32 (residual-fused) | 8.0 | +6.7% |
+| #26 | + Q4_K gate/up pair uint32 | 8.7 | +16.0% |
+| #27 | + Q4_K QKV triple uint32 (V on byte path) | 8.9 | +18.7% |
+| #28 | flip default to on | (no perf change) | — |
+| #29 ✗ | Q6_K uint32 (block_q6_K is 210 B) | crashed, closed | — |
+| **alpha.5 main** | | **9.1 tok/s** | **+21%** |
+
+### What worked
+
+The Q4_K block (`block_q4_K`, 144 bytes, divisible by 4) lets every
+block start at a 4-byte-aligned address in row memory. That makes
+the byte-by-byte `qs[]` reads in `dot_q4k_row` legally replaceable
+with a single `uint32_t` load per lane per block. Lane mapping:
+
+```
+il       = lane >> 3            // which 32-byte qs sub-block (0..3)
+sub_base = (lane & 7) << 2      // byte offset within sub-block
+```
+
+Per block per lane:
+
+| | Byte path | uint32 path |
+|---|---|---|
+| Weight loads | 4 × `ld.global.b8` | **1 × `ld.global.b32`** |
+| x loads | 8 × `ld.global.b16` | 8 × `ld.global.b16` (unchanged) |
+| FMAs | 8 | 8 (identical math) |
+| Scale recomputes | 4 (per inner iter) | 1 (constant per lane per block) |
+
+4× fewer issued weight loads + zero inner-loop control. The wins
+landed on three production kernels: `gemv_quant_add_typed_kernel<12>`
+(Wo + residual), `gemv_quant_pair_typed_kernel<12,12>` (gate/up), and
+`gemv_quant_triple_typed_kernel<12,12,14>` (QKV — Q4_K rows on the
+uint32 path; the Q6_K Wv row still byte-by-byte inside the same
+kernel).
+
+### What didn't work, and why
+
+**#23 CUDA Graphs (decode capture).** The hypothesis was that
+~22,800 host-side `cudaLaunchKernel` calls (~24 µs each on Jetson
+L4T) were a meaningful cost. Measured result: ≤0% speedup, slight
+regression. The launches were already overlapping with GPU
+execution on the LPDDR5-bound workload — eliminating host-side
+overhead doesn't help when the CPU was already idle waiting for the
+GPU. Lesson: `cudaLaunchKernel` API wall-time in `nsys` is NOT a
+proxy for stall time; it includes time spent waiting on the GPU.
+
+**#24 Split-K Q4_K GEMV.** The hypothesis was that per-warp MSHR
+depth (~32 outstanding requests per warp) limited DRAM
+concurrency. SPLIT_K=4 was supposed to give 4× more warps per row.
+Measured result: ≤0%. Block size grew 128 → 512 threads, register
+pressure dropped blocks-per-SM 4×, so total warps-per-SM was
+unchanged. The bottleneck is arithmetic intensity per byte loaded
+(Q4_K does 2 FMAs/byte; Q6_K does 4 — and Q6_K runs 3-4× faster per
+peak bandwidth). The fix is in the inner loop, not the outer warp
+schedule.
+
+**#29 Q6_K uint32 weight loads.** Same lane-mapping trick should
+have worked. It didn't. `block_q6_K` is 210 bytes, not divisible by
+4, so consecutive blocks in row memory alternate between 4-aligned
+and 2-aligned positions. Half the uint32 weight loads fault with
+`cudaErrorMisalignedAddress`, the CUDA context goes sticky, and
+every subsequent kernel (including byte-path fallback, RMSNorm,
+attention) fails. Closed with the diagnosis. Q6_K can be vectorized
+with `uint16` loads (2-byte aligned, which 210 B satisfies) for
+roughly half the speedup; not pursued because Q6_K already runs at
+30-40% of LPDDR5 peak and W_down + logits sum to only ~15% of
+decode wall-clock.
+
+### Where decode time goes at alpha.5
+
+The pre-Path-C profile in
+[#19](https://github.com/GeniePod/genie-ai-runtime/issues/19#issuecomment-4453495578)
+showed 93% of decode in five K-quant GEMV kernels. Path C
+vectorized four of them. The new bottleneck distribution is unknown
+until someone reruns `nsys` against alpha.5 — that profile is the
+next prerequisite for any further decode optimization.
 
 ## Why LLM Decode is Bandwidth-Bound
 
