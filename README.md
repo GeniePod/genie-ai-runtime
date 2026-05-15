@@ -9,11 +9,10 @@ on a 7.6 GB iGPU without crowding out whisper.cpp + Piper + Home Assistant.
 
 ## Status
 
-`v0.1.0-alpha.7` — Path E (tensor-core MMQ Q4_K prefill GEMM) merged
-on top of Paths B (batched prefill), C (Q4_K uint32 decode), and D
-(right-sized prefill GEMM unroll). Validated on Jetson Orin Nano
-Super 8 GB with `Qwen3-4B-Q4_K_M.gguf` — **prefill 28.3 tok/s, ahead
-of llama.cpp's 17.97 by +57 %.**
+`v0.1.0-alpha.8` — Path E E5 (multi-warp cooperative MMQ Q4_K prefill
+GEMM) merged on top of alpha.7's E4 single-warp MMQ. Validated on
+Jetson Orin Nano Super 8 GB with `Qwen3-4B-Q4_K_M.gguf` — **prefill
+38.7 tok/s, ahead of llama.cpp's 17.97 by +115 %.**
 
 Current validated path:
 - Coherent Qwen3 instruct output with automatic chat template and no-think mode.
@@ -33,15 +32,17 @@ Current validated path:
   slots on predicated-off iterations. At the typical chat-wrapped
   N≈33 the host dispatcher chunks 32+1 → 20+13, raising second-launch
   utilization from 3 % to 65 %. +7.1 % prefill, byte-identical output.
-- **Tensor-core MMQ Q4_K prefill GEMM (Path E)**: replaces the scalar
-  Q4_K batched kernel's CUDA-core FMAs with
+- **Tensor-core MMQ Q4_K prefill GEMM (Path E, multi-warp)**: replaces
+  the scalar Q4_K batched kernel's CUDA-core FMAs with
   `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` on SM 8.7. A
   16×32 FP16 staging tile is dequantized from one Q4_K block into
   shared memory; 16 × 8 = 128 (d, dm) scale pairs precomputed once
-  per block, distributed across the warp. 96 regs/thread, ≥ 210
-  GFLOPS on every Qwen3-4B prefill shape, aggregate ~245 GFLOPS vs
-  ~126 for the scalar baseline. +70.8 % end-to-end prefill, output
-  text sensibly identical (FP16-ULP-bounded float-add drift only).
+  per block. **4 warps per CUDA block share one dequanted A-tile
+  across 4 contiguous N-stripes (32 tokens at a time, vs 8 for
+  alpha.7's single-warp variant)** — dequant cost amortized 4×.
+  39 regs/thread, ~407 GFLOPS aggregate on Qwen3-4B prefill shapes,
+  output text sensibly identical (FP16-ULP-bounded float-add drift
+  only).
 - Device-resident layer weights — copied into a per-layer device arena
   at load time instead of streaming from mmap'd host memory.
 - Jetson power reporting handles L4T R36 sysfs paths and `nvpmodel` wattage
@@ -51,21 +52,21 @@ Latest on-device measurement: Qwen3-4B Q4_K_M, 25 W MAXN SUPER, GPU
 locked at 918 MHz, 18-token user prompt (kernel sees N≈33 after Qwen3
 chat-template wrap).
 
-| | alpha.2 (per-token) | alpha.3 (Path B) | alpha.5 (+ Path C) | alpha.6 (+ Path D) | alpha.7 (+ Path E) | Cumulative Δ |
-|---|---|---|---|---|---|---|
-| Prefill | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | **28.3 ± 0.0 tok/s** | **+245 %** |
-| TTFT | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | **~1170 ms** (decode-limited now) | **−47 %** |
-| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | **+21 %** |
-| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | ✓ |
+| | alpha.2 | alpha.3 | alpha.5 | alpha.6 | alpha.7 | alpha.8 | Cumulative Δ |
+|---|---|---|---|---|---|---|---|
+| Prefill | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | 28.16 tok/s | **38.68 ± 0.1 tok/s** | **+372 %** |
+| TTFT | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | ~1170 ms | **~860 ms** | **−61 %** |
+| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | **+21 %** |
+| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | sensibly-identical¹ | ✓ |
 
 ¹ Path E's `mma.sync` reorders float adds differently than scalar FMAs;
 byte-equality breaks at FP16 ULP, generated text remains
 character-for-character the same on the reference prompt.
 
-Same-day re-baseline used for alpha.6 → alpha.7 Δ (alpha.6 = 16.6 tok/s
-re-measured today, alpha.7 = 28.3 tok/s, mean gap 827 ms vs combined σ
-≈ 2 ms → ≫100σ separation). **vs `llama-bench pp18 = 17.97 ± 0.65 tok/s`
-genie-ai-runtime now leads by +57 %.**
+Same-day re-baseline used for alpha.7 → alpha.8 Δ (scalar fallback path
+re-measured today at 16.45 tok/s, alpha.8 = 38.68 tok/s, mean gap
+1153 ms vs combined σ ≈ 6 ms → ~190σ separation). **vs `llama-bench
+pp18 = 17.97 ± 0.65 tok/s` genie-ai-runtime now leads by +115 %.**
 
 Path B detail: PRs [#13](https://github.com/GeniePod/genie-ai-runtime/pull/13)
 → [#17](https://github.com/GeniePod/genie-ai-runtime/pull/17), default
@@ -80,7 +81,9 @@ Path E detail: PRs [#34](https://github.com/GeniePod/genie-ai-runtime/pull/34)
 (single-tile skeleton) → [#36](https://github.com/GeniePod/genie-ai-runtime/pull/36)
 (full GEMM kernel) → [#38](https://github.com/GeniePod/genie-ai-runtime/pull/38)
 (per-(row, sb) scale precompute) → [#39](https://github.com/GeniePod/genie-ai-runtime/pull/39)
-(integrate behind `JLLM_MMQ_Q4K`).
+(integrate behind `JLLM_MMQ_Q4K`, alpha.7) → [#41](https://github.com/GeniePod/genie-ai-runtime/pull/41)
+(multi-warp cooperative dequant) → [#42](https://github.com/GeniePod/genie-ai-runtime/pull/42)
+(integrate multi-warp variant, alpha.8).
 Path E plan + first-integration negative result: [#33](https://github.com/GeniePod/genie-ai-runtime/issues/33).
 Plan + earlier negative results in
 [#19](https://github.com/GeniePod/genie-ai-runtime/issues/19).

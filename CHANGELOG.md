@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.1.0-alpha.8 — 2026-05-16
+
+Path E E5: multi-warp cooperative MMQ Q4_K prefill kernel. Replaces
+alpha.7's single-warp `gemm_mmq_q4k_kernel` (E4 variant) with a
+4-warp-per-CUDA-block cooperative version that shares one dequanted
+16×32 FP16 A-tile across 4 contiguous N-stripes (8 tokens each).
+Dequant cost amortized 4×. Validated on Jetson Orin Nano Super 8 GB,
+same hardware/model/prompt as alpha.7.
+
+| | scalar fallback | alpha.8 (Path E E5) | Δ vs scalar | Δ vs alpha.7 (E4) |
+|---|---|---|---|---|
+| Prefill | 16.45 tok/s (2006 ± 5 ms) | **38.68 tok/s (853 ± 3 ms)** | **+135 %** | **+37 %** |
+| TTFT | 2014 ms | **~862 ms** | **−57 %** | −27 % |
+| Decode | 10.0 tok/s | 10.0 tok/s | unchanged | unchanged |
+| Output | reference | character-for-character identical | ✓ | ✓ |
+
+Mean gap ≈ 1153 ms vs combined σ ≈ 6 ms → ~190σ separation.
+**vs `llama-bench pp18 = 17.97 ± 0.65 tok/s`: genie-ai-runtime now
+leads by +115 %.** Cumulative prefill since alpha.2: **+372 %**.
+
+### Path E series (continued)
+
+| PR | Phase | Status | What |
+|---|---|---|---|
+| #41 | E5 — multi-warp standalone | merged | 4 warps cooperate on one A-tile across 4 N-stripes; 39 regs/thread; ~407 GFLOPS aggregate |
+| #42 | E5b — integration | **merged** | This release. +37 % vs alpha.7, +135 % vs scalar |
+
+### Changed
+
+- `gemm_mmq_q4k_kernel` body replaced with the multi-warp variant.
+  Same name, same signature, same `JLLM_MMQ_Q4K` env flag — only the
+  launch shape differs (`grid.x` divisor 8 → 32, block size 32 → 128).
+- Dispatcher comment + stderr announcement updated to "multi-warp".
+
+### Added (kernel internals)
+
+- `MMQ_Q4K_N_WARPS = 4`, `MMQ_Q4K_BLOCK_N = 32` constants.
+- Per-(row, sub-block) scale precompute now uses **128 threads × 1
+  entry each** (vs alpha.7's 32 lanes × 4 entries).
+- Cooperative dequant: 128 threads × 4 elements = 16 × 32 staging
+  tile. Thread `t` covers `row = t/8`, cols `(t&7)*4 + [0..3]` — 8
+  threads share each row's block_q4_K read (L1-cache friendly).
+- Block-wide `__syncthreads()` replaces `__syncwarp()` at the
+  precompute / dequant / MMA boundaries.
+
+### Why the win held end-to-end
+
+E3b (#37) regressed prefill 27 % despite a +5 % standalone GFLOPS gain
+on Wo. E5b (#42) translates 1.66× standalone GFLOPS into 1.37× end-to-end
+prefill (and +135 % vs scalar). The difference: the multi-warp kernel
+is **uniform across shapes** (~405 GFLOPS on every Qwen3-4B prefill
+GEMM in #41), so the integration mix doesn't get bottlenecked on a
+single weak shape. With E3 we only tested Wo (M=2560) standalone and
+got blindsided when the integrated workload was dominated by gate/up
+(M=9728) and down (K=9728); E5 covers all six shapes uniformly.
+
+### Not in this release
+
+- **Q5_K / Q6_K MMQ.** Still scalar. Q5_K port is the obvious next
+  step (likely a clean adaptation of E5's structure with a slightly
+  different dequant). Q6_K remains blocked on the 210-byte alignment
+  problem from #29 for any vectorized inner load.
+- **Further occupancy / pipelining.** Current kernel is at 2.7 %
+  tensor-core utilization, still well below peak. The remaining
+  knobs (B-fragment shared-mem staging, async `cp.async` prefetch,
+  compile-time N specialization) would each cost more engineering
+  than the gain we'd see on Orin Nano Super's bandwidth budget.
+
 ## v0.1.0-alpha.7 — 2026-05-16
 
 Path E: tensor-core MMQ Q4_K prefill GEMM. Replaces the scalar

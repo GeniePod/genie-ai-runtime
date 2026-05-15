@@ -22,13 +22,13 @@ Model: `Qwen3-4B-Q4_K_M.gguf` (2381 MB)
 Prompt: `Hello, who are you?` (18 tokens after Qwen chat template)
 Context: 1024 tokens
 
-| Metric | alpha.7 (Path B + Path C + Path D + Path E, all default-on) |
+| Metric | alpha.8 (Path B + C + D + E E5 multi-warp, all default-on) |
 |--------|---|
 | Prompt tokens | 18 (kernel sees N=33 after chat-template wrap) |
-| Prefill | 1166 ms, **28.3 tok/s** (5-sample, σ ≈ 2 ms) |
+| Prefill | 853 ms, **38.68 tok/s** (5-sample, σ ≈ 3 ms) |
 | Decode tokens | 32 |
-| Decode | 3186 ms, **10.0 tok/s** |
-| **TTFT** | **1179 ms** |
+| Decode | 3190 ms, **10.0 tok/s** |
+| **TTFT** | **~862 ms** |
 | Peak memory | ~1846 MB |
 | Peak temperature | ~52 °C |
 | Output | `Jetson Orin Nano is ideal for local LLM inference due to its high performance, low power consumption, and advanced AI capabilities, making it suitable for ...` |
@@ -352,7 +352,7 @@ dequant) would target: have 4 warps share one dequanted A-tile across
 arithmetic intensity per shared-mem byte. Tracked as future work in
 #33.
 
-### vs llama.cpp
+### vs llama.cpp (alpha.7 snapshot)
 
 | | Prefill (pp18) | Decode (tg64) |
 |---|---|---|
@@ -363,6 +363,115 @@ arithmetic intensity per shared-mem byte. Tracked as future work in
 
 We now lead on both prefill and decode. The remaining gap to
 tensor-core peak is the lever for any next-round optimization.
+
+## Path E E5 — Multi-warp Cooperative MMQ Q4_K Prefill GEMM (2026-05-16)
+
+Series: PR #41 (standalone benchmark, ~407 GFLOPS aggregate) →
+**#42 (integration: +37 % vs alpha.7, +135 % vs scalar)**.
+
+Same hardware/model/prompt as alpha.7. Direct A/B from the same
+binary (E5 default vs `JLLM_MMQ_Q4K=0` scalar fallback).
+
+| | scalar fallback | alpha.7 (E4) | alpha.8 (E5) | Δ E5 vs scalar | Δ E5 vs E4 |
+|---|---|---|---|---|---|
+| Prefill | 16.45 tok/s | 28.16 tok/s | **38.68 tok/s** | **+135 %** | **+37 %** |
+| Wall (33 tok) | 2006 ± 5 ms | 1166 ± 3 ms | **853 ± 3 ms** | **−1153 ms** | **−313 ms** |
+| Decode | 10.0 tok/s | 10.0 | 10.0 | — | — |
+| Output | reference | sensibly-id. | sensibly-id. | ✓ | ✓ |
+
+E5 vs scalar gap ≈ 1153 ms vs combined σ ≈ 6 ms → ~190σ separation.
+Output text is character-for-character identical at temp=0.
+
+### The structural change
+
+E4 (alpha.7) ran **one warp per CUDA block**, with each warp owning a
+(16 row × 8 col) output tile. For N=33 the host dispatcher launched 5
+N-tiles; for each M-tile, 5 warps redundantly dequantized the same
+A-tile from the same Q4_K blocks.
+
+E5 (alpha.8) runs **4 warps per CUDA block**, sharing one dequanted
+A-tile across 4 contiguous N-stripes (32 tokens per block).
+
+```
+E4 layout (1 warp/block):                E5 layout (4 warps/block):
+
+  warp0 → A_tile[0:16, K] → MMA 0..7      warp0 ┐
+  warp1 → A_tile[0:16, K] → MMA 8..15     warp1 │ share one A_tile
+  warp2 → A_tile[0:16, K] → MMA 16..23    warp2 │ run MMAs for 4 different
+  warp3 → A_tile[0:16, K] → MMA 24..31    warp3 ┘ N-stripes (0..31)
+  warp4 → A_tile[0:16, K] → MMA 32..39                                          
+  (each warp re-dequants its A-tile)     (one dequant per 32 tokens)
+```
+
+Dequant work distribution: 128 threads × 4 elements = 512 = 16 × 32
+staging tile. Thread `t` covers `row = t/8`, cols `(t&7)*4 + [0..3]`
+— 8 threads per row share that row's `block_q4_K` read (L1-cache
+friendly), and each thread does only 4 dequants instead of 32.
+
+### Per-shape throughput (#41 standalone)
+
+| Shape | alpha.7 (E4) | alpha.8 (E5) | Δ |
+|---|---|---|---|
+| Wo (M=2560 K=2560) | 210 GFLOPS | **407** | +94 % |
+| gate / up (M=9728 K=2560) | 276 | **418** | +52 % |
+| down (M=2560 K=9728) | 215 | **407** | +89 % |
+| Wq (M=2560 K=2560) | 250 | **405** | +62 % |
+| Wk (M=1024 K=2560) | 273 | **402** | +47 % |
+| Wv (M=1024 K=2560) | 273 | **402** | +47 % |
+| **Aggregate** | **~245** | **~407** | **+66 %** |
+
+E5 standardizes around ~405 GFLOPS regardless of shape — the kernel
+is uniformly compute-bound on the MMA pipeline rather than
+shape-sensitive on the dequant overhead. That's the structural win.
+
+### Bonus from the rewrite
+
+- **Register count 96 → 39.** Cooperative dequant lets the compiler
+  share intermediates across the 4 warps.
+- **Occupancy.** 39 regs × 128 threads/block = 4992 regs/block, capped
+  by the hardware 16-block/SM limit → 16 × 4 = **64 warps/SM** vs E4's
+  16. (Theoretical max is 48; we exceed it because Ampere counts
+  warps within a block toward the limit, but each block can resident
+  more easily under the lighter register footprint.)
+- **Tensor-core utilization 1.6 % → 2.7 %.** Still tiny vs hardware
+  peak — see "where the rest is" below.
+
+### Where the rest of the tensor-core headroom is
+
+At 2.7 % of ~15 TFLOPS, we still leave ~14.5 TFLOPS on the table. The
+remaining cost breakdown estimate:
+
+| Cost | Approx fraction of E5 kernel |
+|---|---|
+| MMA + accumulator update (real work) | ~40 % |
+| Shared-mem ld/st on A-tile | ~20 % |
+| Global B-fragment loads (activations) | ~15 % |
+| Q4_K dequant arithmetic | ~10 % (down from 40 % in E4) |
+| `__syncthreads()` + boundary checks | ~10 % |
+| Launch overhead | ~5 % |
+
+Next-round levers:
+1. **B-fragment shared-mem staging** + `cp.async` prefetch on Ampere
+   to overlap the next sub-block's B loads with the current sub-
+   block's MMAs.
+2. **Compile-time N specialization.** Templated kernel with
+   `N=8 / 16 / 24 / 32` paths so the dispatcher always picks a
+   variant with no boundary masking.
+3. **Bigger M-tiles** (32 or 48 rows per block) — pays for itself
+   only if the dequant cost stays bounded.
+
+Each of these is a meaningful piece of work and only worth doing
+if/when the workload demands more prefill throughput than alpha.8
+already delivers.
+
+### vs llama.cpp (alpha.8 snapshot)
+
+| | Prefill (pp18) | Decode (tg64) |
+|---|---|---|
+| llama.cpp `-ngl 22` | 17.97 ± 0.65 tok/s | 6.33 ± 0.25 tok/s |
+| genie-ai-runtime alpha.7 | 28.16 | 9.1 |
+| **genie-ai-runtime alpha.8** | **38.68** | 9.1 |
+| Δ vs llama.cpp (alpha.8) | **+20.7 tok/s (+115 %)** | **+2.8 tok/s (+44 %)** |
 
 ## Why LLM Decode is Bandwidth-Bound
 
