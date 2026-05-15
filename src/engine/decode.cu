@@ -1441,6 +1441,118 @@ bool Engine::check_memory_and_thermal(int pos) {
 
 // ── Main generation loop ─────────────────────────────────────────────────
 
+// F4b: hydrate KV from a saved cache file if compatible. Returns the
+// number of tokens at the start of `prompt_tokens` that are already
+// resident in kv_cache_ after this call (= longest common prefix
+// between cached and new tokens). 0 means no hydration; the caller
+// must run a cold prefill.
+int Engine::try_hydrate_kv(const std::vector<int>& prompt_tokens,
+                           const std::string& conv_id)
+{
+    if (conv_id.empty() || !validate_conversation_id(conv_id)) return 0;
+    if (prompt_tokens.empty()) return 0;
+
+    const std::string dir  = default_kv_cache_dir();
+    const std::string path = path_for_conv_id(dir, conv_id);
+
+    KVCacheFileHeader hdr{};
+    if (!peek_kv_header(path, &hdr)) return 0;
+
+    const auto& kv_cfg = kv_cache_.config();
+
+    // Compatibility checks. Any mismatch → drop to cold prefill.
+    if (std::memcmp(hdr.model_hash, model_fingerprint_, sizeof(hdr.model_hash)) != 0) {
+        fprintf(stderr, "[kv_cache] hydrate: model fingerprint mismatch "
+                        "for %s — cache built against a different model\n",
+                path.c_str());
+        return 0;
+    }
+    if ((int)hdr.n_layers      != kv_cfg.n_layers      ||
+        (int)hdr.n_kv_heads    != kv_cfg.n_kv_heads    ||
+        (int)hdr.head_dim      != kv_cfg.head_dim      ||
+        (int)hdr.max_context   != kv_cfg.max_context   ||
+        (int)hdr.kv_type_bytes != kv_cfg.kv_type_bytes)
+    {
+        fprintf(stderr, "[kv_cache] hydrate: shape mismatch on %s "
+                        "(layers/heads/head_dim/ctx/kv_bytes) — using cold "
+                        "prefill\n", path.c_str());
+        return 0;
+    }
+    if (hdr.used_tokens == 0 || hdr.used_tokens > (uint32_t)kv_cfg.max_context) {
+        return 0;
+    }
+
+    // Read tokens + body. We need to allocate a host buffer for the
+    // body before calling load_kv_from_file.
+    std::vector<uint32_t> cached_tokens;
+    std::vector<uint8_t>  staging((size_t)hdr.body_bytes);
+
+    auto t_load0 = Clock::now();
+    KVCacheFileHeader hdr2{};
+    bool ok = load_kv_from_file(path, hdr2, &cached_tokens,
+                                staging.data(), staging.size());
+    if (!ok) {
+        fprintf(stderr, "[kv_cache] hydrate: load failed for %s\n",
+                path.c_str());
+        return 0;
+    }
+    if (cached_tokens.size() != hdr.used_tokens) {
+        fprintf(stderr, "[kv_cache] hydrate: tokens vector size %zu != "
+                        "header used_tokens %u\n",
+                cached_tokens.size(), hdr.used_tokens);
+        return 0;
+    }
+
+    // Longest common prefix between cached and new prompt tokens.
+    const int max_match = std::min((int)cached_tokens.size(),
+                                   (int)prompt_tokens.size());
+    int matched = 0;
+    while (matched < max_match &&
+           cached_tokens[matched] == (uint32_t)prompt_tokens[matched]) {
+        matched++;
+    }
+    if (matched == 0) {
+        fprintf(stderr, "[kv_cache] hydrate: no common prefix vs cached "
+                        "(%u tokens) — cold prefill\n", hdr.used_tokens);
+        return 0;
+    }
+
+    // Compact the saved per-layer packed body (each layer is
+    // hdr.used_tokens × eb) into the matched-only layout that
+    // scatter_from_host expects (each layer is `matched` × eb).
+    const int64_t eb       = 2LL * kv_cfg.n_kv_heads * kv_cfg.head_dim
+                                * kv_cfg.kv_type_bytes;
+    const int64_t half_eb  = eb / 2;
+    const int64_t src_layer_stride = (int64_t)hdr.used_tokens * eb;
+    const int64_t dst_layer_stride = (int64_t)matched * eb;
+    const int64_t matched_keys_bytes = (int64_t)matched * half_eb;
+
+    std::vector<uint8_t> compact((size_t)kv_cfg.n_layers * dst_layer_stride);
+    for (int l = 0; l < kv_cfg.n_layers; l++) {
+        const uint8_t* src_keys = staging.data() + l * src_layer_stride;
+        const uint8_t* src_vals = src_keys + (int64_t)hdr.used_tokens * half_eb;
+        uint8_t* dst_keys = compact.data() + l * dst_layer_stride;
+        uint8_t* dst_vals = dst_keys + matched_keys_bytes;
+        std::memcpy(dst_keys, src_keys, (size_t)matched_keys_bytes);
+        std::memcpy(dst_vals, src_vals, (size_t)matched_keys_bytes);
+    }
+
+    if (!kv_cache_.scatter_from_host(compact.data(), matched,
+                                     /*zero_remaining=*/true)) {
+        fprintf(stderr, "[kv_cache] hydrate: scatter_from_host failed\n");
+        return 0;
+    }
+
+    auto t_load1 = Clock::now();
+    float load_ms = Ms(t_load1 - t_load0).count();
+    fprintf(stderr,
+            "[kv_cache] Hydrated %d / %u cached tokens from %s "
+            "(prompt %zu, %.0f ms) — skipping prefill for matched prefix\n",
+            matched, hdr.used_tokens, path.c_str(),
+            prompt_tokens.size(), load_ms);
+    return matched;
+}
+
 bool validate_conversation_id(const std::string& id) {
     if (id.empty()) return true;
     if (id.size() > 64) return false;
@@ -1502,6 +1614,13 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     std::vector<uint32_t> kv_tokens;
     kv_tokens.reserve(prompt_tokens.size() + params.max_tokens);
     for (int t : prompt_tokens) kv_tokens.push_back((uint32_t)t);
+
+    // Path F4b (#45): try hydrating KV state from a persisted cache for
+    // this conversation_id. Returns the longest common prefix between
+    // the cached tokens and prompt_tokens; we'll skip prefill for that
+    // range. 0 means cold prefill (no cache file or no match).
+    const int prefill_start = try_hydrate_kv(prompt_tokens,
+                                             params.conversation_id);
     if (debug_kernels_enabled()) {
         fprintf(stderr, "[tokenizer] prompt tokens:");
         for (int i = 0; i < (int)prompt_tokens.size() && i < 16; i++) {
@@ -1536,33 +1655,42 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     const bool batched_fits =
         (scratch_.capacity() - batched_total) >= kBatchedScratchMargin;
 
-    if (batched_prefill_enabled() && N > 0 && batched_fits) {
+    // Path F4b: prefill works on tokens [prefill_start, N). Positions
+    // [0, prefill_start) are already in kv_cache_ via try_hydrate_kv.
+    // M is the number of tokens actually prefilled this turn; M=0 means
+    // the cache already covered the full prompt — handled as a special
+    // case below (no Path A residual, fall through to fallback decode).
+    const int M = N - prefill_start;
+
+    if (M > 0 && batched_prefill_enabled() && batched_fits) {
         // Path B (issue #12): layer-major prefill. Allocate one
-        // [N × H] activation buffer at the bottom of scratch, dequantize
-        // every prompt embedding into it, then loop layers-outer /
-        // tokens-inner. The inner step still calls the proven
-        // single-token kernels, so output is byte-identical to the
-        // per-token loop. Future PRs swap the inner calls for batched
-        // (GEMM-shaped) variants without touching this dispatch.
+        // [M × H] activation buffer (M = tokens to prefill this turn),
+        // dequantize each new prompt embedding into it, then loop
+        // layers-outer / tokens-inner. transformer_prefill writes
+        // KV[prefill_start + i] for i in [0, M) and reads attention
+        // history [0, prefill_start + i] — picks up the hydrated
+        // prefix transparently.
         static bool logged = false;
         if (!logged) {
             fprintf(stderr, "[engine] Path B: batched prefill enabled (JLLM_BATCHED_PREFILL=1)\n");
             logged = true;
         }
         scratch_.reset();
-        half* x_batch = (half*)scratch_.get(x_batch_bytes);
-        for (int i = 0; i < N; i++) {
+        const int64_t x_batch_bytes_m = (int64_t)M * H * sizeof(half);
+        half* x_batch = (half*)scratch_.get(x_batch_bytes_m);
+        for (int i = 0; i < M; i++) {
             dequant_embedding(x_batch + (int64_t)i * H,
-                              model_weights_.tok_embd, prompt_tokens[i], H,
+                              model_weights_.tok_embd,
+                              prompt_tokens[prefill_start + i], H,
                               model_weights_.embd_type, stream_);
         }
         for (int l = 0; l < config_.n_layers; l++) {
-            transformer_prefill(l, 0, N, x_batch);
+            transformer_prefill(l, prefill_start, M, x_batch);
         }
         last_token_ = prompt_tokens.back();
-        last_prefill_x = x_batch + (int64_t)(N - 1) * H;
-    } else {
-        if (batched_prefill_enabled() && N > 0 && !batched_fits) {
+        last_prefill_x = x_batch + (int64_t)(M - 1) * H;
+    } else if (M > 0) {
+        if (batched_prefill_enabled() && !batched_fits) {
             static bool warned = false;
             if (!warned) {
                 fprintf(stderr,
@@ -1572,7 +1700,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                 warned = true;
             }
         }
-        for (int i = 0; i < N; i++) {
+        for (int i = prefill_start; i < N; i++) {
             scratch_.reset();
             last_token_ = prompt_tokens[i];
             half* x = (half*)scratch_.get(H * sizeof(half));
@@ -1587,6 +1715,14 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                 last_prefill_x = x;
             }
         }
+    } else {
+        // M == 0: hydrate covered the entire prompt. Nothing to prefill.
+        // Set last_token_ so the decode loop's fallback path picks up
+        // properly — Path A's last_prefill_x is null in this case, which
+        // forces the loop into the fallback that re-runs decode_step at
+        // pos = N - 1 to recover logits for the final token.
+        last_token_ = prompt_tokens.back();
+        last_prefill_x = nullptr;
     }
     cudaStreamSynchronize(stream_);
     auto t1 = Clock::now();

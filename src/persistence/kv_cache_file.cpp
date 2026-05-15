@@ -240,6 +240,41 @@ bool compute_model_fingerprint(const std::string& gguf_path,
     return true;
 }
 
+bool peek_kv_header(const std::string& path, KVCacheFileHeader* out_hdr) {
+    if (!out_hdr) return false;
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+
+    KVCacheFileHeader hdr{};
+    if (::read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) {
+        ::close(fd); return false;
+    }
+    if (hdr.magic != KVCACHE_MAGIC) {
+        fprintf(stderr, "[kv_cache] peek: bad magic 0x%x in %s\n",
+                hdr.magic, path.c_str());
+        ::close(fd); return false;
+    }
+    if (hdr.version != KVCACHE_VERSION) {
+        fprintf(stderr, "[kv_cache] peek: unsupported version %u in %s\n",
+                hdr.version, path.c_str());
+        ::close(fd); return false;
+    }
+    struct stat st{};
+    if (::fstat(fd, &st) != 0) { ::close(fd); return false; }
+    ::close(fd);
+
+    const size_t tokens_bytes = (size_t)hdr.used_tokens * sizeof(uint32_t);
+    const size_t expected = sizeof(hdr) + tokens_bytes + (size_t)hdr.body_bytes;
+    if ((size_t)st.st_size != expected) {
+        fprintf(stderr, "[kv_cache] peek: size mismatch on %s "
+                        "(disk=%ld expected=%zu)\n",
+                path.c_str(), (long)st.st_size, expected);
+        return false;
+    }
+    *out_hdr = hdr;
+    return true;
+}
+
 std::string default_kv_cache_dir() {
     const char* env = std::getenv("JLLM_KV_CACHE_DIR");
     if (env && *env) return std::string(env);

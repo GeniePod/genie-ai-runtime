@@ -179,6 +179,17 @@ public:
                       TokenCallback token_cb = nullptr);
     void stop();
 
+    // Path F4b (#45): if a saved KV cache exists for the given
+    // conversation_id and is compatible (matching model fingerprint,
+    // same n_layers / kv_heads / head_dim / max_context / kv_type_bytes,
+    // same KV quant mode), load it, find the longest common prefix
+    // between the cached tokens and the new prompt, scatter that
+    // matched portion into kv_cache_, and return the matched prefix
+    // length so the caller can skip prefill for [0, hydrated_len).
+    // Returns 0 (cold prefill) on any mismatch or missing file.
+    int try_hydrate_kv(const std::vector<int>& prompt_tokens,
+                       const std::string& conv_id);
+
     bool          is_loaded() const { return loaded_; }
     ModelConfig   config() const { return config_; }
     MemoryBudget  memory() const { return budget_; }

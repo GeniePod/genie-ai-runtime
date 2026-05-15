@@ -70,6 +70,12 @@ bool load_kv_from_file(const std::string& path,
                        void* host_kv,
                        size_t kv_capacity);
 
+// Peek-only: read and validate just the header. Used by callers that
+// need to size a body buffer before calling load_kv_from_file. Returns
+// false if the file doesn't exist, isn't a valid v2 KV cache, or has
+// an on-disk size that disagrees with what the header advertises.
+bool peek_kv_header(const std::string& path, KVCacheFileHeader* out_hdr);
+
 // FNV-1a-64 over (file_size as 8 bytes || first 256 B of file). The
 // first 256 B of a GGUF file covers magic + version + metadata count
 // + the start of the metadata KV pairs, which is sufficient to detect
