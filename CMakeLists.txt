@@ -139,3 +139,10 @@ add_test(NAME mma_smoke COMMAND test_mma_smoke)
 add_executable(test_mmq_q4k_tile tests/test_mmq_q4k_tile.cu)
 target_link_libraries(test_mmq_q4k_tile PRIVATE CUDA::cudart)
 add_test(NAME mmq_q4k_tile COMMAND test_mmq_q4k_tile)
+
+# Path E phase E3: full-size Q4_K MMQ GEMM kernel (arbitrary M / N / K).
+# Standalone, runs a small correctness check + a Qwen3-4B Wo shape
+# throughput benchmark. No engine integration yet — that lands in E3b.
+add_executable(test_mmq_q4k_gemm tests/test_mmq_q4k_gemm.cu)
+target_link_libraries(test_mmq_q4k_gemm PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_gemm COMMAND test_mmq_q4k_gemm)
