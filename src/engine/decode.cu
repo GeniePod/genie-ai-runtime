@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <cstdint>
 #include <unistd.h>
 #include <sys/mman.h>   // BUG #4 fix
 
@@ -324,7 +325,39 @@ void Engine::unload() {
     graph_captured_ = false;
 }
 
-static bool copy_weight_to_device(const void* src, size_t bytes, void** dst) {
+static bool mapped_weight_device_enabled();
+
+static void drop_mapped_source_pages(const void* mapping_base,
+                                     int64_t mapping_size,
+                                     const void* src,
+                                     size_t bytes) {
+    if (mapped_weight_device_enabled() || !mapping_base || !src ||
+        mapping_size <= 0 || bytes == 0) {
+        return;
+    }
+
+    const uintptr_t map_begin = (uintptr_t)mapping_base;
+    const uintptr_t map_end = map_begin + (uintptr_t)mapping_size;
+    const uintptr_t src_begin = (uintptr_t)src;
+    const uintptr_t src_end = src_begin + (uintptr_t)bytes;
+    if (src_begin < map_begin || src_begin >= map_end || src_end <= src_begin) {
+        return;
+    }
+
+    const long page = sysconf(_SC_PAGESIZE);
+    const uintptr_t mask = (uintptr_t)page - 1;
+    uintptr_t advise_begin = src_begin & ~mask;
+    uintptr_t advise_end = (src_end + mask) & ~mask;
+    if (advise_begin < map_begin) advise_begin = map_begin;
+    if (advise_end > map_end) advise_end = map_end;
+    if (advise_end <= advise_begin) return;
+
+    (void)madvise((void*)advise_begin, advise_end - advise_begin, MADV_DONTNEED);
+}
+
+static bool copy_weight_to_device(const void* src, size_t bytes, void** dst,
+                                  const void* mapping_base = nullptr,
+                                  int64_t mapping_size = 0) {
     if (!src || bytes == 0) return false;
     void* p = nullptr;
     cudaError_t err = cudaMalloc(&p, bytes);
@@ -341,12 +374,15 @@ static bool copy_weight_to_device(const void* src, size_t bytes, void** dst) {
         return false;
     }
     *dst = p;
+    drop_mapped_source_pages(mapping_base, mapping_size, src, bytes);
     return true;
 }
 
 static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
                                      int head_dim,
-                                     std::vector<void*>& owned) {
+                                     std::vector<void*>& owned,
+                                     const void* mapping_base,
+                                     int64_t mapping_size) {
     const size_t norm_bytes = (size_t)hidden_dim * sizeof(float);
     const size_t qk_norm_bytes = (size_t)head_dim * sizeof(float);
 
@@ -359,8 +395,10 @@ static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
 
         void* attn = nullptr;
         void* ffn = nullptr;
-        if (!copy_weight_to_device(lw.rms_attn, norm_bytes, &attn)) return false;
-        if (!copy_weight_to_device(lw.rms_ffn, norm_bytes, &ffn)) {
+        if (!copy_weight_to_device(lw.rms_attn, norm_bytes, &attn,
+                                   mapping_base, mapping_size)) return false;
+        if (!copy_weight_to_device(lw.rms_ffn, norm_bytes, &ffn,
+                                   mapping_base, mapping_size)) {
             cudaFree(attn);
             return false;
         }
@@ -376,8 +414,10 @@ static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
             }
             void* qn = nullptr;
             void* kn = nullptr;
-            if (!copy_weight_to_device(lw.q_norm, qk_norm_bytes, &qn)) return false;
-            if (!copy_weight_to_device(lw.k_norm, qk_norm_bytes, &kn)) {
+            if (!copy_weight_to_device(lw.q_norm, qk_norm_bytes, &qn,
+                                       mapping_base, mapping_size)) return false;
+            if (!copy_weight_to_device(lw.k_norm, qk_norm_bytes, &kn,
+                                       mapping_base, mapping_size)) {
                 cudaFree(qn);
                 return false;
             }
@@ -389,7 +429,8 @@ static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
     }
 
     void* out_norm = nullptr;
-    if (!copy_weight_to_device(mw.output_norm, norm_bytes, &out_norm)) return false;
+    if (!copy_weight_to_device(mw.output_norm, norm_bytes, &out_norm,
+                               mapping_base, mapping_size)) return false;
     owned.push_back(out_norm);
     mw.output_norm = out_norm;
     fprintf(stderr, "[model] Materialized up to %d RMSNorm tensors on device\n",
@@ -459,7 +500,9 @@ static size_t kquant_tensor_bytes(int ggml_type, int rows, int cols) {
 
 static size_t materialize_output_weight(ModelWeights& mw, const ModelConfig& cfg,
                                         const MemoryBudget& budget,
-                                        std::vector<void*>& owned) {
+                                        std::vector<void*>& owned,
+                                        const void* mapping_base,
+                                        int64_t mapping_size) {
     if (!device_output_enabled() || !fast_gemv_enabled_for_device_weights() ||
         !mw.output) {
         return 0;
@@ -495,6 +538,7 @@ static size_t materialize_output_weight(ModelWeights& mw, const ModelConfig& cfg
         cudaFree(output_device);
         return 0;
     }
+    drop_mapped_source_pages(mapping_base, mapping_size, mw.output, bytes);
 
     owned.push_back(output_device);
     const bool tied_output = (mw.output == mw.tok_embd);
@@ -528,7 +572,9 @@ static size_t layer_quant_weight_bytes(const LayerWeights& lw,
 
 static bool copy_layer_quant_weights_to_device(LayerWeights& lw,
                                                const ModelConfig& cfg,
-                                               std::vector<void*>& owned) {
+                                               std::vector<void*>& owned,
+                                               const void* mapping_base,
+                                               int64_t mapping_size) {
     const int H = cfg.hidden_dim;
     const int Q = cfg.n_heads * cfg.head_dim;
     const int KV = cfg.n_kv_heads * cfg.head_dim;
@@ -557,7 +603,9 @@ static bool copy_layer_quant_weights_to_device(LayerWeights& lw,
         const size_t bytes = kquant_tensor_bytes(specs[i].type,
                                                  specs[i].rows,
                                                  specs[i].cols);
-        if (bytes == 0 || !copy_weight_to_device(specs[i].src, bytes, &copied[i])) {
+        if (bytes == 0 ||
+            !copy_weight_to_device(specs[i].src, bytes, &copied[i],
+                                   mapping_base, mapping_size)) {
             for (void* p : copied) {
                 if (p) cudaFree(p);
             }
@@ -575,7 +623,9 @@ static bool copy_layer_quant_weights_to_device(LayerWeights& lw,
 static size_t materialize_layer_weights(ModelWeights& mw,
                                         const ModelConfig& cfg,
                                         const MemoryBudget& budget,
-                                        std::vector<void*>& owned) {
+                                        std::vector<void*>& owned,
+                                        const void* mapping_base,
+                                        int64_t mapping_size) {
     if (!fast_gemv_enabled_for_device_weights()) return 0;
 
     const int requested_layers = device_layer_limit();
@@ -598,7 +648,8 @@ static size_t materialize_layer_weights(ModelWeights& mw,
             (int64_t)((bytes + 1024 * 1024 - 1) / (1024 * 1024));
         if (free_mb < mb + reserve_mb) break;
 
-        if (!copy_layer_quant_weights_to_device(lw, cfg, owned)) break;
+        if (!copy_layer_quant_weights_to_device(lw, cfg, owned,
+                                                mapping_base, mapping_size)) break;
 
         free_mb -= mb;
         total_bytes += bytes;
@@ -631,7 +682,8 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
     }
     if (!materialize_norm_weights(model_weights_, config_.hidden_dim,
                                   config_.head_dim,
-                                  device_weight_copies_)) {
+                                  device_weight_copies_,
+                                  weights_, weights_size_)) {
         fprintf(stderr, "[engine] Failed to materialize norm weights\n");
         return false;
     }
@@ -694,12 +746,14 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
 
     const size_t output_device_bytes =
         materialize_output_weight(model_weights_, config_, budget_,
-                                  device_weight_copies_);
+                                  device_weight_copies_,
+                                  weights_, weights_size_);
     budget_.model_mb += output_device_bytes / (1024 * 1024);
 
     const size_t layer_device_bytes =
         materialize_layer_weights(model_weights_, config_, budget_,
-                                  device_weight_copies_);
+                                  device_weight_copies_,
+                                  weights_, weights_size_);
     budget_.model_mb += layer_device_bytes / (1024 * 1024);
 
     if (!mapped_weight_device_enabled() && weights_) {
