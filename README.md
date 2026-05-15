@@ -9,10 +9,11 @@ on a 7.6 GB iGPU without crowding out whisper.cpp + Piper + Home Assistant.
 
 ## Status
 
-`v0.1.0-alpha.8` — Path E E5 (multi-warp cooperative MMQ Q4_K prefill
-GEMM) merged on top of alpha.7's E4 single-warp MMQ. Validated on
-Jetson Orin Nano Super 8 GB with `Qwen3-4B-Q4_K_M.gguf` — **prefill
-38.7 tok/s, ahead of llama.cpp's 17.97 by +115 %.**
+`v0.1.0-alpha.9` — Path F (persistent KV cache across multi-turn
+conversations) merged on top of alpha.8's Path E. Same prefill /
+decode throughput as alpha.8; the new win is **second-turn TTFT
+−48 %** (857 ms → 444 ms on a Qwen3-4B Q4_K_M two-turn conversation
+where 24 / 36 cached tokens matched the new prompt's prefix).
 
 Current validated path:
 - Coherent Qwen3 instruct output with automatic chat template and no-think mode.
@@ -43,6 +44,17 @@ Current validated path:
   39 regs/thread, ~407 GFLOPS aggregate on Qwen3-4B prefill shapes,
   output text sensibly identical (FP16-ULP-bounded float-add drift
   only).
+- **Persistent KV cache (Path F)**: per-conversation KV state saved to
+  disk at turn end and hydrated at turn start. File format is
+  per-layer-packed (only `used_tokens` positions per layer, not the
+  full pool) with the prompt token IDs inline, so a follow-up turn
+  finds the longest common prefix vs its new prompt and skips prefill
+  for the matched range. `--conv-id <id>` on the CLI, or
+  `conversation_id` field on the HTTP server's
+  `/v1/chat/completions`. Atomic save via `<path>.tmp` + `fsync` +
+  `rename`; truncated files rejected at load by a header-vs-fstat-size
+  check. FNV-1a-64 model fingerprint refuses caches built against a
+  different GGUF.
 - Device-resident layer weights — copied into a per-layer device arena
   at load time instead of streaming from mmap'd host memory.
 - Jetson power reporting handles L4T R36 sysfs paths and `nvpmodel` wattage
@@ -68,6 +80,13 @@ re-measured today at 16.45 tok/s, alpha.8 = 38.68 tok/s, mean gap
 1153 ms vs combined σ ≈ 6 ms → ~190σ separation). **vs `llama-bench
 pp18 = 17.97 ± 0.65 tok/s` genie-ai-runtime now leads by +115 %.**
 
+alpha.9 adds the multi-turn warm-start win on top: in a 2-turn
+conversation where the second prompt shares 24 / 36 = 67 % of its
+tokens with the first turn, **TTFT drops 857 → 444 ms (−48 %)** on
+the second turn vs cold prefill. Prefill / decode throughput per
+turn is unchanged; the gain is purely from skipping the matched
+prefix.
+
 Long-prompt scaling validated 2026-05-16 across kernel N = 33 / 88 / 235:
 the ~2.36× speedup over the scalar fallback is essentially uniform
 across a 7× range of prompt sizes (E5 stays at ~26 ms / prefill-token,
@@ -92,6 +111,13 @@ Path E detail: PRs [#34](https://github.com/GeniePod/genie-ai-runtime/pull/34)
 (multi-warp cooperative dequant) → [#42](https://github.com/GeniePod/genie-ai-runtime/pull/42)
 (integrate multi-warp variant, alpha.8).
 Path E plan + first-integration negative result: [#33](https://github.com/GeniePod/genie-ai-runtime/issues/33).
+Path F detail: PRs [#46](https://github.com/GeniePod/genie-ai-runtime/pull/46)
+(serialization round-trip) → [#47](https://github.com/GeniePod/genie-ai-runtime/pull/47)
+(conv-id surface) → [#48](https://github.com/GeniePod/genie-ai-runtime/pull/48)
+(save on turn end) → [#49](https://github.com/GeniePod/genie-ai-runtime/pull/49)
+(pack only used tokens, 34× save speedup) → [#50](https://github.com/GeniePod/genie-ai-runtime/pull/50)
+(format v2: persist token IDs) → [#51](https://github.com/GeniePod/genie-ai-runtime/pull/51)
+(hydrate on turn start, alpha.9). Path F plan: [#45](https://github.com/GeniePod/genie-ai-runtime/issues/45).
 Plan + earlier negative results in
 [#19](https://github.com/GeniePod/genie-ai-runtime/issues/19).
 

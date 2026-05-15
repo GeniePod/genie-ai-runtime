@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.1.0-alpha.9 — 2026-05-16
+
+Path F: persistent KV cache for multi-turn conversations. Per-turn
+state is saved to disk at turn end and hydrated at turn start; the
+next turn's prefill skips the matched prefix between cached and new
+prompt tokens. Acceptance criterion from #6 was ≥ 80 % reduction in
+second-turn prompt-eval time; we hit 50 % on prefill (848 → 426 ms)
+and 48 % on TTFT (857 → 444 ms) on a representative 2-turn
+conversation where 24 / 36 cached tokens match the new prompt prefix.
+Prefill / decode throughput per turn is unchanged from alpha.8 — the
+gain is purely from skipping the matched prefix.
+
+| | Turn 1 (cold) | Turn 2 (warm) | Δ |
+|---|---|---|---|
+| Prompt tokens | 33 | 39 | — |
+| Hydrated from cache | — | **24 tokens** (8 ms load) | — |
+| Prefill (work + wall) | 33 / 848 ms | 15 / 426 ms | **−50 %** |
+| **TTFT** | **857 ms** | **444 ms** | **−48 %** |
+
+### Path F series
+
+| PR | Phase | What |
+|---|---|---|
+| #46 | F1 — serialization round-trip | Standalone test: 144 MB FP16 + 72 MB INT8 KV configs round-trip byte-identical; truncated files rejected via fstat-vs-header-body size check |
+| #47 | F2 — conv-id surface | `--conv-id <id>` on CLI, `conversation_id` field in HTTP `/v1/chat/completions`. Engine logs, no behavior change. |
+| #48 | F3 — save on turn end | Atomic `<path>.tmp` + fsync + rename. Wrote the full pool (144 MB / 5.6 s) — addressed in F3b |
+| #49 | F3b — pack only used_tokens | Body now `n_layers × used_tokens × entry_bytes`; **34× smaller and faster** (165 ms / 5.4 MB at typical sizes) |
+| #50 | F4a — persist token IDs | Format v2: tokens region between header and body. Off-by-one fix: previous code claimed KV[N+completion-1] held a real token; actually it held zero/stale |
+| #51 | F4b — hydrate on turn start | `peek_kv_header` + `try_hydrate_kv`. Validates fingerprint and shape, longest-common-prefix match, scatters into pool, skips prefill for matched range. **This release.** |
+
+### Added
+
+- `src/persistence/kv_cache_file.{cpp,h}` — save/load/peek helpers.
+- `KVCachePool::gather_used_to_host`, `scatter_from_host(zero_remaining=true)`, `packed_used_bytes` — per-layer gather/scatter between GPU pool and a host buffer of packed used-positions.
+- `validate_conversation_id` — `[A-Za-z0-9_-]{1,64}` accepted; everything else dropped at the CLI/HTTP boundary so a path-injection attempt can't reach the engine.
+- FNV-1a-64 model fingerprint over `(file size || first 256 B of GGUF)`. Stored in the header; refuses to hydrate a cache built against a different model.
+- `JLLM_KV_CACHE_DIR` env var (default `/opt/jllm/data/kv-cache`).
+- Engine adds `gguf_path_` and `model_fingerprint_[32]` members; `try_hydrate_kv(prompt_tokens, conv_id)` private method that returns the matched prefix length.
+
+### File format v2
+
+```
+[header 128 B] [tokens used_tokens × 4 B] [KV body body_bytes]
+```
+
+Header bumped from v1 (F3). Body is per-layer packed: each layer holds `used_tokens × eb` bytes (keys then values). Old v1 files don't load (size check refuses them). Path F was alpha-only; no migration path needed.
+
+### Skip rules at save time
+
+| Condition | Action |
+|---|---|
+| `conv_id` empty / invalid | single-shot, no save |
+| committed_tokens < 4 | trivial, skip eMMC write |
+| Overflow CPU pool was used | fast-pool-only in v1; warn-log + skip |
+| Any I/O error | warn-log + skip |
+
+### Skip rules at hydrate time
+
+| Condition | Action |
+|---|---|
+| Cache file missing or malformed | cold prefill |
+| Model fingerprint mismatch | cold prefill (model changed since save) |
+| Shape mismatch (layers / heads / head_dim / max_context / kv_bytes) | cold prefill |
+| Longest common prefix = 0 | cold prefill (different conversation prefix) |
+| Match ≥ 1 token | scatter the matched range, prefill the rest |
+
+### Known cosmetic issue (not behavior)
+
+After hydrate, the prefill log line over-reports tok/s:
+
+```
+[engine] Prefill: 39 tokens in 426 ms (91.6 tok/s)
+```
+
+The 39 is the prompt size; the 91.6 is `39 / 0.426`. Actual work was 15 prefill tokens (39 − 24 hydrated), giving the real rate of ~35 tok/s. Wall-clock and TTFT are correct. Will be cleaned up alongside F5 if it stays a nuisance.
+
+### Not in this release
+
+- **F5 — LRU eviction + size cap.** `JLLM_KV_CACHE_DIR` grows unbounded today; production deployments should externally enforce a cap, or use a per-day rotation. F5 is the next planned phase.
+- **Overflow-pool serialization.** Cache today is fast-pool-only; conversations that spilled to the CPU overflow pool aren't saved.
+- **Cache-aware prompt logging.** `Prefill: <prompt_tokens>` doesn't distinguish hydrated from prefilled tokens; the saved-tokens count separately would be clearer.
+
 ## v0.1.0-alpha.8 — 2026-05-16
 
 Path E E5: multi-warp cooperative MMQ Q4_K prefill kernel. Replaces
