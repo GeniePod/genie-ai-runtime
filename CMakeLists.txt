@@ -125,3 +125,10 @@ add_test(NAME kernels COMMAND test_kernels)
 add_executable(test_model_load tests/test_model_load.cpp)
 target_link_libraries(test_model_load PRIVATE jetson_llm_core)
 # Run with: ./build/test_model_load model.gguf
+
+# Path E phase E1 smoke test: validate `mma.sync.m16n8k16` on SM 8.7.
+# Standalone — does not link jetson_llm_core, intentionally so the smoke
+# test can compile and run even if the runtime is broken.
+add_executable(test_mma_smoke tests/test_mma_smoke.cu)
+target_link_libraries(test_mma_smoke PRIVATE CUDA::cudart)
+add_test(NAME mma_smoke COMMAND test_mma_smoke)
