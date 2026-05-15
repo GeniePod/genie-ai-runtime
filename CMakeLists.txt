@@ -146,3 +146,13 @@ add_test(NAME mmq_q4k_tile COMMAND test_mmq_q4k_tile)
 add_executable(test_mmq_q4k_gemm tests/test_mmq_q4k_gemm.cu)
 target_link_libraries(test_mmq_q4k_gemm PRIVATE CUDA::cudart)
 add_test(NAME mmq_q4k_gemm COMMAND test_mmq_q4k_gemm)
+
+# Path E phase E4: MMQ Q4_K kernel with per-(row, sb) scale precompute
+# and the `#pragma unroll` removed from the dequant row loop. Targets
+# register pressure (139 → ~50–60) and per-lane redundant arithmetic
+# (32× → 1× for scale recomputes). Benchmarks the full set of Qwen3-4B
+# prefill GEMM shapes (Wo, gate/up, down, QKV) so we can see whether
+# the speedup holds across the integrated mix, not just on Wo.
+add_executable(test_mmq_q4k_precompute tests/test_mmq_q4k_precompute.cu)
+target_link_libraries(test_mmq_q4k_precompute PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_precompute COMMAND test_mmq_q4k_precompute)
