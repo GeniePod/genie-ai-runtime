@@ -212,6 +212,23 @@ static void dequant_q6k_row(float* out, const void* data, int token_id, int hidd
     }
 }
 
+static bool pointer_is_device_allocation(const void* p) {
+    if (!p) return false;
+
+    cudaPointerAttributes attr{};
+    cudaError_t err = cudaPointerGetAttributes(&attr, p);
+    if (err != cudaSuccess) {
+        cudaGetLastError();  // ordinary host mmap pointers land here
+        return false;
+    }
+
+#if CUDART_VERSION >= 10000
+    return attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged;
+#else
+    return attr.memoryType == cudaMemoryTypeDevice;
+#endif
+}
+
 static void dequant_embedding(half* dst, const void* embd_data, int token_id,
                                int hidden_dim, int embd_type, cudaStream_t stream) {
     if (fast_embedding_enabled() && (embd_type == 12 || embd_type == 14) &&
@@ -230,6 +247,15 @@ static void dequant_embedding(half* dst, const void* embd_data, int token_id,
             fprintf(stderr, "\n");
         }
         first = false;
+        return;
+    }
+
+    if ((embd_type == 12 || embd_type == 14) &&
+        pointer_is_device_allocation(embd_data)) {
+        fprintf(stderr,
+                "[embd] FATAL: GPU embedding dequant failed for a device-resident "
+                "embedding table; CPU fallback cannot read this pointer\n");
+        cudaMemsetAsync(dst, 0, (size_t)hidden_dim * sizeof(half), stream);
         return;
     }
 
@@ -364,12 +390,14 @@ static bool copy_weight_to_device(const void* src, size_t bytes, void** dst,
     if (err != cudaSuccess) {
         fprintf(stderr, "[model] cudaMalloc weight copy (%zu bytes) failed: %s\n",
                 bytes, cudaGetErrorString(err));
+        cudaGetLastError();
         return false;
     }
     err = cudaMemcpy(p, src, bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         fprintf(stderr, "[model] cudaMemcpy weight copy (%zu bytes) failed: %s\n",
                 bytes, cudaGetErrorString(err));
+        cudaGetLastError();
         cudaFree(p);
         return false;
     }
@@ -527,6 +555,7 @@ static size_t materialize_output_weight(ModelWeights& mw, const ModelConfig& cfg
         fprintf(stderr,
                 "[model] device output copy skipped (%zu MB): %s\n",
                 bytes / (1024 * 1024), cudaGetErrorString(err));
+        cudaGetLastError();
         return 0;
     }
 
@@ -535,6 +564,7 @@ static size_t materialize_output_weight(ModelWeights& mw, const ModelConfig& cfg
         fprintf(stderr,
                 "[model] device output copy failed (%zu MB): %s\n",
                 bytes / (1024 * 1024), cudaGetErrorString(err));
+        cudaGetLastError();
         cudaFree(output_device);
         return 0;
     }
@@ -620,48 +650,85 @@ static bool copy_layer_quant_weights_to_device(LayerWeights& lw,
     return true;
 }
 
-static size_t materialize_layer_weights(ModelWeights& mw,
+struct LayerMaterializationResult {
+    size_t bytes = 0;
+    int requested_layers = 0;
+    int layer_cap = 0;
+    int copied_layers = 0;
+    bool complete = true;
+};
+
+static int64_t cuda_free_memory_mb() {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    cudaError_t err = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return -1;
+    }
+    (void)total_bytes;
+    return (int64_t)(free_bytes / (1024 * 1024));
+}
+
+static LayerMaterializationResult materialize_layer_weights(
+                                        ModelWeights& mw,
                                         const ModelConfig& cfg,
                                         const MemoryBudget& budget,
                                         std::vector<void*>& owned,
                                         const void* mapping_base,
                                         int64_t mapping_size) {
-    if (!fast_gemv_enabled_for_device_weights()) return 0;
+    LayerMaterializationResult result = {};
+    if (!fast_gemv_enabled_for_device_weights()) return result;
 
     const int requested_layers = device_layer_limit();
-    if (requested_layers == 0) return 0;
+    result.requested_layers = requested_layers;
+    if (requested_layers == 0) return result;
 
     const int layer_cap = requested_layers < 0
         ? mw.n_layers
         : std::min(requested_layers, mw.n_layers);
+    result.layer_cap = layer_cap;
     const int64_t reserve_mb = 128;
     int64_t free_mb = budget.free_mb();
-    size_t total_bytes = 0;
-    int copied_layers = 0;
 
     for (int l = 0; l < layer_cap; l++) {
         auto& lw = mw.layers[l];
         const size_t bytes = layer_quant_weight_bytes(lw, cfg);
-        if (bytes == 0) break;
+        if (bytes == 0) {
+            result.complete = false;
+            break;
+        }
 
         const int64_t mb =
             (int64_t)((bytes + 1024 * 1024 - 1) / (1024 * 1024));
-        if (free_mb < mb + reserve_mb) break;
+        const int64_t cuda_free_mb = cuda_free_memory_mb();
+        const int64_t available_mb = cuda_free_mb >= 0
+            ? std::min(free_mb, cuda_free_mb)
+            : free_mb;
+        if (available_mb < mb + reserve_mb) {
+            result.complete = false;
+            break;
+        }
 
         if (!copy_layer_quant_weights_to_device(lw, cfg, owned,
-                                                mapping_base, mapping_size)) break;
+                                                mapping_base, mapping_size)) {
+            result.complete = false;
+            break;
+        }
 
         free_mb -= mb;
-        total_bytes += bytes;
-        copied_layers++;
+        result.bytes += bytes;
+        result.copied_layers++;
     }
 
-    if (copied_layers > 0) {
+    result.complete = result.complete && (result.copied_layers == result.layer_cap);
+
+    if (result.copied_layers > 0) {
         fprintf(stderr,
                 "[model] Materialized %d transformer layers on device (%zu MB)\n",
-                copied_layers, total_bytes / (1024 * 1024));
+                result.copied_layers, result.bytes / (1024 * 1024));
     }
-    return total_bytes;
+    return result;
 }
 
 bool Engine::load(const std::string& gguf_path, const GenParams& params) {
@@ -690,6 +757,20 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
     budget_.model_mb = mapped_weight_device_enabled()
         ? weights_size_ / (1024 * 1024)
         : 0;
+
+    if (!mapped_weight_device_enabled()) {
+        const int requested_layers = device_layer_limit();
+        if (requested_layers >= 0 && requested_layers < config_.n_layers) {
+            fprintf(stderr,
+                    "[model] FATAL: JLLM_MAPPED_WEIGHTS=0 cannot be combined "
+                    "with partial JLLM_DEVICE_LAYERS=%d. Uncopied layers would "
+                    "have no CUDA-visible weight path. Leave JLLM_MAPPED_WEIGHTS "
+                    "unset for partial layer tests, or set JLLM_DEVICE_LAYERS=%d "
+                    "for an all-device attempt.\n",
+                    requested_layers, config_.n_layers);
+            return false;
+        }
+    }
 
     int kv_bytes = params.kv_int8 ? 1 : 2;
     int auto_ctx = budget_.max_context(config_.n_layers, config_.n_kv_heads, config_.head_dim, kv_bytes);
@@ -750,11 +831,32 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
                                   weights_, weights_size_);
     budget_.model_mb += output_device_bytes / (1024 * 1024);
 
-    const size_t layer_device_bytes =
+    if (!mapped_weight_device_enabled() && output_device_bytes == 0) {
+        fprintf(stderr,
+                "[model] FATAL: JLLM_MAPPED_WEIGHTS=0 requires the tied "
+                "embedding/output projection to be device-resident. Leave "
+                "mapped weights enabled or free memory before retrying.\n");
+        return false;
+    }
+
+    const LayerMaterializationResult layer_device =
         materialize_layer_weights(model_weights_, config_, budget_,
                                   device_weight_copies_,
                                   weights_, weights_size_);
-    budget_.model_mb += layer_device_bytes / (1024 * 1024);
+    budget_.model_mb += layer_device.bytes / (1024 * 1024);
+
+    if (!mapped_weight_device_enabled() &&
+        (!layer_device.complete || layer_device.copied_layers < config_.n_layers)) {
+        fprintf(stderr,
+                "[model] FATAL: JLLM_MAPPED_WEIGHTS=0 requires all %d "
+                "transformer layers on device; copied %d/%d. The remaining "
+                "layers would have no CUDA-visible weight path. Leave mapped "
+                "weights enabled for hybrid tests, reduce context/memory use, "
+                "or use a smaller model/quant.\n",
+                config_.n_layers, layer_device.copied_layers,
+                layer_device.layer_cap);
+        return false;
+    }
 
     if (!mapped_weight_device_enabled() && weights_) {
         madvise(weights_, weights_size_, MADV_DONTNEED);
