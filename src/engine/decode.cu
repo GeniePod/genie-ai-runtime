@@ -49,6 +49,14 @@ static bool fast_embedding_enabled() {
     return enabled;
 }
 
+static bool fused_decode_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_FUSED_DECODE");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 // ── Vector add kernel (for residual connections) ─────────────────────────
 // BUG #2 fix: need explicit residual add between stages
 
@@ -810,6 +818,60 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
     transformer_layer_ffn_block(layer, x2, swiglu_out, x);
 }
 
+void Engine::transformer_layer_decode_normed(int layer, int pos,
+                                             half* x,
+                                             half* normed,
+                                             half* next_normed) {
+    const auto& lw = model_weights_.layers[layer];
+    const int H = config_.hidden_dim;
+    const int Q_DIM = config_.n_heads * config_.head_dim;
+    const int KV_DIM = config_.n_kv_heads * config_.head_dim;
+    const int I = config_.intermediate_dim;
+    const bool norm_fp32 = (lw.rms_type == 0);
+
+    half* q_buf = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* k_buf = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* v_buf = (half*)scratch_.get(KV_DIM * sizeof(half));
+
+    gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
+                      k_buf, lw.wk, lw.type_wk, KV_DIM,
+                      v_buf, lw.wv, lw.type_wv, KV_DIM,
+                      normed, H, stream_);
+
+    half* attn_out  = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* attn_proj = (half*)scratch_.get(H * sizeof(half));
+    transformer_layer_attn_compute(layer, pos, q_buf, k_buf, v_buf,
+                                   attn_out, /*qk_norm_already=*/false);
+    gemv_quant(attn_proj, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
+
+    half* x2      = (half*)scratch_.get(H * sizeof(half));
+    half* normed2 = (half*)scratch_.get(H * sizeof(half));
+    fused_rmsnorm_residual_store(x2, normed2, x, attn_proj,
+                                 lw.rms_ffn, 1, H, config_.rms_eps,
+                                 norm_fp32, stream_);
+
+    half* gate_buf   = (half*)scratch_.get(I * sizeof(half));
+    half* up_buf     = (half*)scratch_.get(I * sizeof(half));
+    half* swiglu_out = (half*)scratch_.get(I * sizeof(half));
+    gemv_quant_pair(gate_buf, lw.w_gate, lw.type_w_gate, I,
+                    up_buf,   lw.w_up,   lw.type_w_up,   I,
+                    normed2, H, stream_);
+    fused_swiglu(swiglu_out, gate_buf, up_buf, 1, I, stream_);
+
+    half* ffn_out = (half*)scratch_.get(H * sizeof(half));
+    gemv_quant(ffn_out, lw.w_down, lw.type_w_down, swiglu_out, H, I, stream_);
+
+    if (next_normed && layer + 1 < config_.n_layers) {
+        const auto& next_lw = model_weights_.layers[layer + 1];
+        fused_rmsnorm_residual_store(x, next_normed, x2, ffn_out,
+                                     next_lw.rms_attn, 1, H,
+                                     config_.rms_eps,
+                                     next_lw.rms_type == 0, stream_);
+    } else {
+        vec_add(x, x2, ffn_out, H, stream_);
+    }
+}
+
 void Engine::transformer_layer_attn_compute(int layer, int pos,
                                             half* q_buf, half* k_buf, half* v_buf,
                                             half* attn_out, bool qk_norm_already) {
@@ -1055,9 +1117,37 @@ int Engine::decode_step(int pos) {
         prof_t = now;
     }
 
-    // All transformer layers
-    for (int l = 0; l < config_.n_layers; l++) {
-        transformer_layer(l, pos, x);
+    // All transformer layers. The decode path uses an inter-layer fused
+    // residual+RMSNorm schedule by default: layer N writes the residual sum
+    // for layer N+1 and its pre-attention norm in the same kernel. This
+    // removes a vec_add plus RMSNorm launch per layer boundary without
+    // changing GEMV/attention math. Set JLLM_FUSED_DECODE=0 to compare
+    // against the original per-layer schedule.
+    if (fused_decode_enabled() && config_.n_layers > 0) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] Fused decode residual/RMSNorm path enabled (JLLM_FUSED_DECODE=1)\n");
+            logged = true;
+        }
+
+        half* normed = (half*)scratch_.get(H * sizeof(half));
+        half* next_normed = (half*)scratch_.get(H * sizeof(half));
+        const auto& first_lw = model_weights_.layers[0];
+        fused_rmsnorm_residual(normed, x, nullptr, first_lw.rms_attn,
+                               1, H, config_.rms_eps,
+                               first_lw.rms_type == 0, stream_);
+
+        for (int l = 0; l < config_.n_layers; l++) {
+            half* next = (l + 1 < config_.n_layers) ? next_normed : nullptr;
+            transformer_layer_decode_normed(l, pos, x, normed, next);
+            if (next) {
+                std::swap(normed, next_normed);
+            }
+        }
+    } else {
+        for (int l = 0; l < config_.n_layers; l++) {
+            transformer_layer(l, pos, x);
+        }
     }
     if (profile) {
         cudaStreamSynchronize(stream_);

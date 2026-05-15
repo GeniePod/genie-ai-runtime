@@ -168,6 +168,26 @@ void fused_rmsnorm_residual(
     cudaStream_t   stream
 );
 
+// Fused residual add plus RMSNorm while preserving the residual sum.
+//
+// residual_out = x + residual
+// norm_out     = RMSNorm(residual_out) * weight
+//
+// The sum is rounded to FP16 before normalization, matching the previous
+// vec_add() -> fused_rmsnorm_residual() sequence used in decode.
+void fused_rmsnorm_residual_store(
+    half*          residual_out,
+    half*          norm_out,
+    const half*    x,
+    const half*    residual,
+    const void*    weight,
+    int            rows,
+    int            hidden_dim,
+    float          eps,
+    bool           weight_fp32,
+    cudaStream_t   stream
+);
+
 // ── Fused SwiGLU ─────────────────────────────────────────────────────────
 // output = silu(gate) * up
 // gate and up are computed from the same input via two GEMV calls,

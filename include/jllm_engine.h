@@ -196,6 +196,14 @@ private:
     int             host_logits_capacity_ = 0;
 
     void transformer_layer(int layer, int pos, half* x);
+    // Decode-only layer path. The caller provides this layer's already
+    // computed pre-attention norm and, when not on the final layer, receives
+    // the next layer's pre-attention norm. This fuses residual adds with the
+    // following RMSNorms and removes tiny per-token kernels.
+    void transformer_layer_decode_normed(int layer, int pos,
+                                         half* x,
+                                         half* normed,
+                                         half* next_normed);
     // Single-token attention pre-Wo: QK-norm (if not already done by the
     // caller), RoPE, KV store, attention. Writes attention output (head
     // mix) to `attn_out` [Q_DIM]. No projection, no residual — caller is

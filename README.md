@@ -130,6 +130,7 @@ JLLM_FAST_EMBD=0  # use CPU reference token embedding dequantization
 JLLM_FAST_NORM=0  # use CPU reference RMSNorm
 JLLM_FAST_ATTN=0  # use CPU reference decode attention (also disables chunked-prefill attention)
 JLLM_FAST_SAMPLE=0  # use full-vocab reference sampling path
+JLLM_FUSED_DECODE=0  # disable fused decode residual/RMSNorm schedule
 JLLM_DEVICE_OUTPUT=0  # disable automatic output projection device copy
 JLLM_DEVICE_LAYERS=36  # opt into layer weight device copies; set N to cap copied layers
 JLLM_MAPPED_WEIGHTS=0  # experimental: skip mapped-host CUDA weights and prefer device copies
