@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.1.0-alpha.10 — 2026-05-16
+
+Path F5: production hardening for the persistent KV cache. Caps the
+per-process cache directory at a configurable budget (1 GB default),
+evicts oldest *.bin files by mtime when over budget, and cleans up
+stale *.tmp files left behind by crashed prior saves. Throughput,
+TTFT, and hydrate behavior identical to alpha.9 — this is purely
+operational safety so production deployments don't grow the cache
+dir until eMMC fills.
+
+### Defaults work without any env vars set
+
+| Var | Default | Effect |
+|---|---|---|
+| `JLLM_KV_CACHE_MAX_MB` | 1024 | Total *.bin budget in MB. 0 disables eviction. |
+| `JLLM_KV_CACHE_STALE_TMP_S` | 60 | Age (s) past which *.tmp files get unlinked. 0 keeps everything. |
+
+### Added
+
+- `default_kv_cache_max_mb()`, `default_kv_cache_stale_tmp_s()` — env reads with sensible defaults.
+- `enforce_kv_cache_budget(dir, max_bytes, keep_path)` — scandir, sum sizes, sort by mtime ASC, unlink oldest until under budget. Never deletes `keep_path` (the just-saved file).
+- `cleanup_stale_tmp_files(dir, max_age_seconds)` — scandir for *.tmp, unlink any older than threshold.
+- Engine::generate hooks both at end of save (after rename), in that order. ~5–10 ms overhead at typical cache sizes.
+
+### Verified on Jetson
+
+| Test | Result |
+|---|---|
+| Defaults, 5 MB file | Save silent, no eviction. |
+| `MAX_MB=8`, 3 × 3.7 MB saves | conv-1 + conv-2 saved silent; conv-3 triggers eviction of conv-1 (oldest mtime). 7.3 MB ≤ 8 MB after. |
+| `old.tmp` aged 5 min, threshold 60 s | `cleaned stale tmp .../old.tmp (age 302s)` then file gone from disk. |
+
+### Not in this release
+
+- Multi-process flock around scandir/eviction. Single-process today; add if a multi-threaded server lands.
+- Cache index file. Walking the dir on every save is < 10 ms at our sizes; becomes worth it only at 10k+ conversations.
+- Cosmetic prefill-log fix (still over-reports tok/s after a hydrate by counting hydrated tokens in the prefill-tokens denominator). Deferred to a focused fix in a future cycle.
+
 ## v0.1.0-alpha.9 — 2026-05-16
 
 Path F: persistent KV cache for multi-turn conversations. Per-turn

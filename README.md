@@ -9,11 +9,12 @@ on a 7.6 GB iGPU without crowding out whisper.cpp + Piper + Home Assistant.
 
 ## Status
 
-`v0.1.0-alpha.9` — Path F (persistent KV cache across multi-turn
-conversations) merged on top of alpha.8's Path E. Same prefill /
-decode throughput as alpha.8; the new win is **second-turn TTFT
-−48 %** (857 ms → 444 ms on a Qwen3-4B Q4_K_M two-turn conversation
-where 24 / 36 cached tokens matched the new prompt's prefix).
+`v0.1.0-alpha.10` — Path F5 (LRU eviction + size cap + stale-tmp
+cleanup) layered on top of alpha.9's Path F. Same throughput and
+warm-turn TTFT win as alpha.9; this release makes the persistent KV
+cache **production-safe** — the cache directory now self-caps at
+1 GB by default, evicting oldest conversations by mtime instead of
+growing without bound.
 
 Current validated path:
 - Coherent Qwen3 instruct output with automatic chat template and no-think mode.
@@ -54,7 +55,9 @@ Current validated path:
   `/v1/chat/completions`. Atomic save via `<path>.tmp` + `fsync` +
   `rename`; truncated files rejected at load by a header-vs-fstat-size
   check. FNV-1a-64 model fingerprint refuses caches built against a
-  different GGUF.
+  different GGUF. **F5 (alpha.10)**: per-process cache budget (default
+  1 GB) with oldest-by-mtime eviction; stale `*.tmp` files (default
+  > 60 s) cleaned at next save.
 - Device-resident layer weights — copied into a per-layer device arena
   at load time instead of streaming from mmap'd host memory.
 - Jetson power reporting handles L4T R36 sysfs paths and `nvpmodel` wattage
@@ -117,7 +120,9 @@ Path F detail: PRs [#46](https://github.com/GeniePod/genie-ai-runtime/pull/46)
 (save on turn end) → [#49](https://github.com/GeniePod/genie-ai-runtime/pull/49)
 (pack only used tokens, 34× save speedup) → [#50](https://github.com/GeniePod/genie-ai-runtime/pull/50)
 (format v2: persist token IDs) → [#51](https://github.com/GeniePod/genie-ai-runtime/pull/51)
-(hydrate on turn start, alpha.9). Path F plan: [#45](https://github.com/GeniePod/genie-ai-runtime/issues/45).
+(hydrate on turn start, alpha.9) → [#53](https://github.com/GeniePod/genie-ai-runtime/pull/53)
+(LRU eviction + stale-tmp cleanup, alpha.10).
+Path F plan: [#45](https://github.com/GeniePod/genie-ai-runtime/issues/45).
 Plan + earlier negative results in
 [#19](https://github.com/GeniePod/genie-ai-runtime/issues/19).
 
