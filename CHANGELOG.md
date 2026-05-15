@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.1.0-alpha.6 — 2026-05-15
+
+Path D: right-size the prefill GEMM token-unroll constant so the
+`#pragma unroll`-ed inner loop stops burning issue slots on
+predicated-off iterations at the prompt lengths we actually serve.
+Validated on Jetson Orin Nano Super 8 GB, Qwen3-4B Q4_K_M, 25 W MAXN
+SUPER, GPU locked 918 MHz, 5 samples each branch (same-day re-baseline).
+
+| | alpha.5 baseline | alpha.6 (Path D) | Δ |
+|---|---|---|---|
+| Prefill | 14.64 ± 0.07 tok/s | **15.68 ± 0.05 tok/s** | **+7.1% (1.07×)** |
+| Prefill wall (33 tok) | 2253.8 ± 10.9 ms | **2104.0 ± 6.7 ms** | **−149.8 ms** |
+| Decode | unchanged | unchanged | — |
+| Output | reference | bit-identical | ✓ |
+
+Mean gap ≈ 150 ms vs combined σ ≈ 13 ms → ~12σ separation, not noise.
+vs `llama-bench pp18 = 17.97 ± 0.65 tok/s` Path D closes ~1/3 of the gap
+from a one-line constexpr change.
+
+### Changed (Path D — PR #31)
+
+- `GEMM_MAX_BATCH` constant in `src/kernels/gemv_q4.cu` lowered from
+  32 to 20. The Q4_K, Q5_K, and Q6_K batched prefill GEMM kernels all
+  use the same per-thread `acc[GEMM_MAX_BATCH]` register array and the
+  same `#pragma unroll for (t = 0; t < GEMM_MAX_BATCH; t++) if (t < N)`
+  inner loop, so all three benefit. The existing host dispatcher
+  chunks `N > GEMM_MAX_BATCH` into multiple kernel launches; for the
+  typical Qwen3 chat-wrapped single-turn prompt the chunker now runs
+  20+13 instead of 32+1, lifting second-launch issue-slot utilization
+  from 3 % to 65 %.
+
+### Why not lower than 20?
+
+20 is sized just above the typical N=18–20 we see after Qwen3
+chat-template wrapping of a single user turn. Going below 20 starts
+chunking single-turn prompts into 3+ launches; going to 24 or 32
+re-introduces predicated-off waste. 20 was the cheap local optimum;
+templated-on-N specialization is the next direction if/when this
+becomes a bottleneck again.
+
+### Not in this release
+
+- Tensor-core MMQ kernel (the actual path to llama.cpp parity at 18+
+  tok/s prefill). Multi-week rewrite, tracked separately.
+- Q6_K uint32 weight loads — still blocked on the 210-byte block
+  alignment problem from PR #29.
+
 ## v0.1.0-alpha.5 — 2026-05-15
 
 Path C: vectorized weight loads for the Q4_K decode GEMV family, plus

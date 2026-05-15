@@ -9,9 +9,10 @@ on a 7.6 GB iGPU without crowding out whisper.cpp + Piper + Home Assistant.
 
 ## Status
 
-`v0.1.0-alpha.5` — Path C (Q4_K uint32 weight loads) merged and
-default-on, stacked on top of Path B's batched prefill. Validated on
-Jetson Orin Nano Super 8 GB with `Qwen3-4B-Q4_K_M.gguf`.
+`v0.1.0-alpha.6` — Path D (right-sized prefill GEMM unroll) merged on
+top of alpha.5's Path C (Q4_K uint32 weight loads) and Path B's batched
+prefill. Validated on Jetson Orin Nano Super 8 GB with
+`Qwen3-4B-Q4_K_M.gguf`.
 
 Current validated path:
 - Coherent Qwen3 instruct output with automatic chat template and no-think mode.
@@ -26,20 +27,30 @@ Current validated path:
   byte-by-byte inner loop on the hot decode kernels (Wo, gate/up pair,
   QKV triple). Folds the residual add into the gemv itself. Q6_K still
   on the byte path (block layout doesn't satisfy 4-byte alignment).
+- **Right-sized prefill unroll (Path D)**: drops `GEMM_MAX_BATCH` from
+  32 to 20 so the `#pragma unroll`-ed token loop stops burning issue
+  slots on predicated-off iterations. At the typical chat-wrapped
+  N≈33 the host dispatcher chunks 32+1 → 20+13, raising second-launch
+  utilization from 3 % to 65 %. +7.1 % prefill, byte-identical output.
 - Device-resident layer weights — copied into a per-layer device arena
   at load time instead of streaming from mmap'd host memory.
 - Jetson power reporting handles L4T R36 sysfs paths and `nvpmodel` wattage
   strings such as `NV Power Mode: 25W`.
 
 Latest on-device measurement: Qwen3-4B Q4_K_M, 25 W MAXN SUPER, GPU
-locked at 918 MHz, 18-token prompt.
+locked at 918 MHz, 18-token user prompt (kernel sees N≈33 after Qwen3
+chat-template wrap).
 
-| | alpha.2 (per-token) | alpha.3 (Path B) | alpha.5 (+ Path C) | Cumulative Δ |
-|---|---|---|---|---|
-| Prefill | 8.2 tok/s | **15.4 tok/s** | 15.2 tok/s | **+85%** |
-| TTFT | 2200 ms | **1181 ms** | ~1180 ms | **−46%** |
-| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | **+21%** |
-| Output | reference | bit-identical | bit-identical | ✓ |
+| | alpha.2 (per-token) | alpha.3 (Path B) | alpha.5 (+ Path C) | alpha.6 (+ Path D) | Cumulative Δ |
+|---|---|---|---|---|---|
+| Prefill | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | **15.68 ± 0.05 tok/s** | **+91%** |
+| TTFT | 2200 ms | 1181 ms | ~1180 ms | **~1170 ms** | **−47%** |
+| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | **+21%** |
+| Output | reference | bit-identical | bit-identical | bit-identical | ✓ |
+
+Same-day re-baseline used for alpha.5 → alpha.6 Δ (alpha.5 = 14.64 ± 0.07,
+alpha.6 = 15.68 ± 0.05, ~12σ separation). vs `llama-bench pp18 = 17.97 ±
+0.65 tok/s` Path D closes ~1/3 of the gap.
 
 Path B detail: PRs [#13](https://github.com/GeniePod/genie-ai-runtime/pull/13)
 → [#17](https://github.com/GeniePod/genie-ai-runtime/pull/17), default
@@ -48,6 +59,7 @@ Path C detail: PRs [#25](https://github.com/GeniePod/genie-ai-runtime/pull/25)
 (Wo) → [#26](https://github.com/GeniePod/genie-ai-runtime/pull/26)
 (gate/up) → [#27](https://github.com/GeniePod/genie-ai-runtime/pull/27)
 (QKV triple) → default flip [#28](https://github.com/GeniePod/genie-ai-runtime/pull/28).
+Path D detail: PR [#31](https://github.com/GeniePod/genie-ai-runtime/pull/31).
 Plan + negative results in
 [#19](https://github.com/GeniePod/genie-ai-runtime/issues/19).
 

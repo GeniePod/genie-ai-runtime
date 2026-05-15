@@ -22,21 +22,22 @@ Model: `Qwen3-4B-Q4_K_M.gguf` (2381 MB)
 Prompt: `Hello, who are you?` (18 tokens after Qwen chat template)
 Context: 1024 tokens
 
-| Metric | alpha.5 (Path B + Path C default-on) |
+| Metric | alpha.6 (Path B + Path C + Path D, all default-on) |
 |--------|---|
 | Prompt tokens | 18 |
-| Prefill | 1153 ms, **15.6 tok/s** |
+| Prefill | ~1100 ms, **15.68 ± 0.05 tok/s** (5-sample, longer Path-D-validation prompt) |
 | Decode tokens | 47 |
 | Decode | 5184 ms, **9.1 tok/s** |
-| **TTFT** | **1194 ms** |
+| **TTFT** | **~1170 ms** |
 | Peak memory | ~3550 MB |
 | Peak temperature | ~53°C |
 | Output | `Hello! I'm Qwen, a large-scale language model developed by Alibaba Group. I can help with a variety of tasks, including answering questions, writing articles, creating stories, and more. How can I assist you today?` |
 
-Bit-identical to the alpha.2 byte-path output. Across every Path B and Path C
-PR the generated text matched the baseline exactly on this prompt — float-add
-associativity is broken in principle by the batched and uint32 paths, but
-rounding to FP16 erases the difference for the standard prompt.
+Bit-identical to the alpha.2 byte-path output. Across every Path B, Path C, and
+Path D PR the generated text matched the baseline exactly on this prompt —
+float-add associativity is broken in principle by the batched, uint32, and
+right-sized-unroll paths, but rounding to FP16 erases the difference for the
+standard prompt.
 
 Validated fast paths are all default:
 
@@ -44,6 +45,7 @@ Validated fast paths are all default:
 |------|---------------------------|
 | Layer-major batched prefill (Path B) | `JLLM_BATCHED_PREFILL=0` |
 | Q4_K uint32 decode weight loads (Path C) | `JLLM_Q4K_UINT32_LOADS=0` |
+| Right-sized prefill GEMM unroll (Path D) | (compile-time constant, no env switch) |
 | K-quant GEMV / GEMM | `JLLM_FAST_GEMV=0` |
 | Token embedding dequantization | `JLLM_FAST_EMBD=0` |
 | RMSNorm | `JLLM_FAST_NORM=0` |
@@ -193,6 +195,81 @@ showed 93% of decode in five K-quant GEMV kernels. Path C
 vectorized four of them. The new bottleneck distribution is unknown
 until someone reruns `nsys` against alpha.5 — that profile is the
 next prerequisite for any further decode optimization.
+
+## Path D — Right-sized Prefill GEMM Unroll (2026-05-15)
+
+Series: PR #31 (single-line constexpr change).
+
+Same hardware as alpha.5. Validation prompt was longer than the
+standard `Hello, who are you?` (33 kernel tokens after chat-wrap vs
+the standard 18), chosen because Path D's mechanism only fires when
+the chunker has to split the work.
+
+| | alpha.5 baseline | alpha.6 (Path D) | Δ |
+|---|---|---|---|
+| Prefill wall (33 tok) | 2253.8 ± 10.9 ms | **2104.0 ± 6.7 ms** | **−149.8 ms** |
+| Prefill | 14.64 ± 0.07 tok/s | **15.68 ± 0.05 tok/s** | **+7.1%** |
+| Decode | unchanged (different kernels) | unchanged | — |
+| Output | reference | bit-identical | ✓ |
+
+5 samples each branch, same-day same-machine. Mean gap ≈ 150 ms vs
+combined σ ≈ 13 ms → ~12σ separation, not noise.
+
+### The mechanism
+
+`gemm_quant_batched_q{4,5,6}k_kernel` each maintain a per-thread
+`acc[GEMM_MAX_BATCH]` register array and use a
+`#pragma unroll for (t = 0; t < GEMM_MAX_BATCH; t++) if (t < N)`
+inner loop. The unroll is necessary so the compiler keeps `acc[]`
+in registers — a runtime-bounded loop with dynamic indexing forces
+a spill to local memory and erases the bandwidth win. But every
+unrolled iteration past `N` still consumes issue slots as predicated
+FMA writes.
+
+At `GEMM_MAX_BATCH = 32` with the typical chat-wrapped single-turn
+prompt (N ≈ 33 → host dispatcher chunks into 32 + 1):
+
+- First launch: 32/32 = 100 % useful issue slots
+- Second launch: 1/32 ≈ 3 % useful → 97 % waste
+
+Dropping `GEMM_MAX_BATCH` to 20 → chunks into 20 + 13:
+
+- First launch: 20/20 = 100 % useful
+- Second launch: 13/20 = 65 % useful
+
+The actual win comes from second-chunk repacking plus a smaller
+first-chunk unroll for any prompt that fits in one launch. Decode
+kernels (`gemv_*` family) are untouched.
+
+### Why 20 specifically
+
+20 sits just above the typical N=18–20 we see after Qwen3
+chat-template wrapping a single user turn. Below 20, single-turn
+prompts get chunked into three or more launches and the per-launch
+fixed cost dominates. At 24 or 32 the predicated-off tail returns.
+20 is the cheap local optimum.
+
+A future templated-on-N specialization (compile two or three N
+specializations, dispatch at runtime) could close more of the gap to
+llama.cpp by hitting 100 % utilization at every common prompt length
+— tracked as a follow-up to Path D.
+
+### vs llama.cpp
+
+`llama-bench` on the same Jetson with the same model and `-ngl 22`:
+
+| | Prefill (pp18) | Decode (tg64) |
+|---|---|---|
+| llama.cpp | 17.97 ± 0.65 tok/s | 6.33 ± 0.25 tok/s |
+| genie-ai-runtime alpha.5 | 14.64 (same prompt) | 9.1 |
+| genie-ai-runtime alpha.6 | **15.68** | 9.1 |
+| Δ vs llama.cpp | **−2.3 tok/s** (alpha.6) | **+2.8 tok/s** |
+
+Path D closed ~1/3 of the prefill gap from a one-line change.
+Closing the rest needs the tensor-core MMQ kernel — llama.cpp's
+prefill path uses `mma.sync.aligned.m16n8k16` on SM 8.7, where we
+still run scalar FMAs on CUDA cores at ~12 % theoretical compute
+utilization. Multi-week rewrite; tracked separately.
 
 ## Why LLM Decode is Bandwidth-Bound
 
