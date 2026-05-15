@@ -473,6 +473,24 @@ already delivers.
 | **genie-ai-runtime alpha.8** | **38.68** | 9.1 |
 | Δ vs llama.cpp (alpha.8) | **+20.7 tok/s (+115 %)** | **+2.8 tok/s (+44 %)** |
 
+### Long-prompt scaling (2026-05-16)
+
+The numbers above are all at N=33 (kernel tokens after Qwen3 chat-wrap of an 18-token user prompt). Production serving traffic spans a much wider N range, so we re-tested alpha.8 against the scalar fallback (`JLLM_MMQ_Q4K=0`) at three prompt lengths.
+
+| Prompt | Kernel N | E5 default | Scalar fallback | Speedup | E5 ms/token | Scalar ms/token |
+|---|---|---|---|---|---|---|
+| SHORT | 33 | **38.8 ± 0.1 tok/s** | 16.4 ± 0.05 | **2.36×** | 25.8 | 60.8 |
+| MED   | 88 | **37.7 ± 0.06 tok/s** | 16.1 | **2.34×** | 26.5 | 62.2 |
+| LONG  | 235 | **37.3 ± 0.2 tok/s** | 15.8 | **2.36×** | 26.9 | 63.2 |
+
+**The ~2.36× speedup is essentially uniform across a 7× range of prompt sizes.** Both paths slow down ~5 % from N=33 → N=235 (attention work scales with KV state, not specific to MMQ). The Path D chunker (`GEMM_MAX_BATCH=20`) splits N>20 prompts into multiple MMQ calls — that handoff doesn't introduce any visible regression. Generated text is coherent at every length:
+
+- **N=33:** *"The Jetson Orin Nano is ideal for local LLM inference due to its high performance, low power consumption, and advanced AI capabilities, making it suitable for edge computing and real-time applications."*
+- **N=88:** *"In the **GGUF** format, quantization is used to reduce the memory footprint of large language models like Llama 3 and Qwen 3, making them more feasible to run on devices with limited memory, such as the **Jetson Orin Nano**. Two ..."*
+- **N=235:** *"When evaluating LLM runtimes for an **edge inference deployment on a Jetson Orin Nano Super 8 GB** module, the choice of runtime is critical due to the **tight memory constraints** (8 GB), the **real-time latency requirements** for voice interactions, and the **power budget** ..."*
+
+Decode also stays consistent across context sizes: 10.0 / 9.7 / 9.3 tok/s for SHORT / MED / LONG with 40–60 decoded tokens — the small drop comes from the attention compute scaling with KV state, not from the quantized GEMV kernels.
+
 ## Why LLM Decode is Bandwidth-Bound
 
 LLM autoregressive decode generates one token at a time. Each token requires reading the **entire** weight matrix from DRAM:

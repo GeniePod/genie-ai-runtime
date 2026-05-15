@@ -68,6 +68,13 @@ re-measured today at 16.45 tok/s, alpha.8 = 38.68 tok/s, mean gap
 1153 ms vs combined σ ≈ 6 ms → ~190σ separation). **vs `llama-bench
 pp18 = 17.97 ± 0.65 tok/s` genie-ai-runtime now leads by +115 %.**
 
+Long-prompt scaling validated 2026-05-16 across kernel N = 33 / 88 / 235:
+the ~2.36× speedup over the scalar fallback is essentially uniform
+across a 7× range of prompt sizes (E5 stays at ~26 ms / prefill-token,
+scalar at ~62 ms / token). Generated text remains coherent at every
+length. See [`docs/performance.md`](docs/performance.md) for the
+detailed scaling table.
+
 Path B detail: PRs [#13](https://github.com/GeniePod/genie-ai-runtime/pull/13)
 → [#17](https://github.com/GeniePod/genie-ai-runtime/pull/17), default
 flip in [#18](https://github.com/GeniePod/genie-ai-runtime/pull/18).
