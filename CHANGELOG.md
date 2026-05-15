@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.1.0-alpha.7 — 2026-05-16
+
+Path E: tensor-core MMQ Q4_K prefill GEMM. Replaces the scalar
+`gemm_quant_batched_q4k_kernel`'s CUDA-core FMAs with
+`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` on SM 8.7.
+Validated on Jetson Orin Nano Super 8 GB, Qwen3-4B Q4_K_M, 25 W MAXN
+SUPER, GPU locked 918 MHz, 5 samples each branch (same-day
+re-baseline).
+
+| | alpha.6 baseline | alpha.7 (Path E) | Δ |
+|---|---|---|---|
+| Prefill | 16.6 tok/s (1993 ± 2 ms) | **28.3 tok/s (1166 ± 2 ms)** | **+70.8 % (1.71×)** |
+| TTFT | 2000 ms | **1179 ms** | **−41 %** |
+| Decode | 10.0 tok/s | 10.0 tok/s | unchanged |
+| Output | reference | sensibly-identical | ✓ |
+
+Mean gap ≈ 827 ms vs combined σ ≈ 2 ms → ≫100σ separation.
+**vs `llama-bench pp18 = 17.97 ± 0.65 tok/s`: genie-ai-runtime now
+leads by +57 %**.
+
+### Path E series
+
+| PR | Phase | Status | What |
+|---|---|---|---|
+| #34 | E1 — smoke test | merged | Validate `mma.sync.m16n8k16` compiles + runs on SM 8.7 |
+| #35 | E2 — single-tile skeleton | merged | Q4_K → FP16 shared-mem dequant + 1 MMA tile, M=N=16, K=256 |
+| #36 | E3 — full GEMM standalone | merged | Arbitrary M/N/K; 74 GFLOPS on Wo; correctness PASS |
+| #37 | E3b — integration attempt | **closed, negative result** | Naive kernel regressed prefill 27 %. 139 regs/thread, 32× redundant per-(row, sb) scale work across lanes. |
+| #38 | E4 — kernel rework | merged | Per-(row, sb) scale precompute + drop dequant unroll. 96 regs, ≥ 210 GFLOPS on all six prefill shapes, ~245 aggregate. |
+| #39 | E4b — integration | **merged** | This release. +70.8 % end-to-end prefill, output sensibly identical. |
+
+### Added (Path E)
+
+- `gemm_mmq_q4k_kernel` in `src/kernels/gemv_q4.cu` — one warp per
+  CUDA block computes a 16 × 8 output tile via 16 m16n8k16 MMAs per
+  Q4_K block. Shared memory holds (1024 B) the FP16 staging tile and
+  (1024 B) the per-(row, sub-block) (d, dm) scale table.
+- `JLLM_MMQ_Q4K` env var, default on. Set to `0` to opt back into the
+  scalar `gemm_quant_batched_q4k_kernel` for A/B or in case a future
+  model trips an MMA-specific assumption.
+- Dispatcher hook in `gemm_quant_batched_gpu` routing Q4_K through the
+  MMQ kernel when the flag is set. Falls back to the scalar kernel on
+  `cudaError` (same defensive pattern as Path C).
+- Stderr announcement once per process so an A/B run plainly shows
+  which path is active.
+
+### Why the win
+
+1. **Compute-throughput.** Tensor-core FP16 peak on SM 8.7 is
+   ~15 TFLOPS vs ~2 TFLOPS for CUDA-core FP16. The Q4_K prefill
+   GEMM kernels were running at ~12 % CUDA-core utilization
+   (nsys at alpha.5). Tensor cores unlocked a ~7.5× compute ceiling
+   that we converted to ~2× kernel speedup in practice.
+2. **Memory-traffic shape.** Activations land naturally as col-major
+   B fragments for `.row.col` MMA, no shuffle needed. Q4_K weights
+   reach the tensor cores via a once-per-sub-block shared-memory
+   dequant tile (16 × 32 FP16 = 1024 B) — pays the dequant cost once
+   per 256 multiply-accumulates.
+
+### Not in this release
+
+- **Q5_K / Q6_K MMQ.** Still on the scalar batched kernels. Q6_K
+  blocks remain blocked on the 210-byte alignment problem from #29
+  for any vectorized inner load. Future direction: Q5_K MMQ may be
+  worth doing (different alignment); Q6_K likely needs a separate
+  dequant strategy.
+- **Multi-warp MMQ blocks (E5).** Current kernel is one warp per
+  CUDA block at ~33 % SM occupancy. A multi-warp cooperative
+  variant (N warps share one dequanted A-tile across multiple
+  N-stripes) could close more of the gap to tensor-core peak. Will
+  do if/when the workload demands it.
+- **Tuning above SM 8.7.** Path E targets Orin Nano Super; no
+  testing on Orin NX, AGX, or any non-Jetson SM 8.6/8.9 part yet.
+
 ## v0.1.0-alpha.6 — 2026-05-15
 
 Path D: right-size the prefill GEMM token-unroll constant so the

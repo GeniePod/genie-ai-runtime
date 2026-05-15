@@ -63,12 +63,15 @@ static bool q4k_uint32_loads_enabled() {
 //     GFLOPS aggregate — about 2× the scalar baseline. This PR
 //     integrates E4's kernel.
 //
-// Opt-in via JLLM_MMQ_Q4K=1 while we A/B vs alpha.6; flips to default
-// once integrated prefill tok/s is verified ahead.
+// Default-on after #39 shipped +70.8 % prefill (16.6 → 28.3 tok/s) on
+// Jetson Orin Nano Super 8 GB with sensibly-identical output text vs
+// alpha.6 scalar path. Set JLLM_MMQ_Q4K=0 to opt back into the scalar
+// batched Q4_K kernel (same grammar as JLLM_BATCHED_PREFILL and
+// JLLM_Q4K_UINT32_LOADS).
 static bool mmq_q4k_enabled() {
     static const bool enabled = [] {
         const char* v = getenv("JLLM_MMQ_Q4K");
-        return v && strcmp(v, "0") != 0;
+        return !v || strcmp(v, "0") != 0;
     }();
     return enabled;
 }
@@ -1588,17 +1591,18 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
     const int block = rows_per_block * 32;
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
-    // Path E E4b: Q4_K only, opt-in via JLLM_MMQ_Q4K=1. Falls through
-    // to the scalar batched kernel on any cudaError (mirrors the Path C
-    // fallback after the #29 Q6_K crash). Q5_K / Q6_K continue through
-    // the existing scalar batched kernels.
+    // Path E E4b: Q4_K only, default on after #39. Set JLLM_MMQ_Q4K=0
+    // to opt back into the scalar batched Q4_K kernel below. Falls
+    // through to the scalar kernel on any cudaError (mirrors the
+    // Path C fallback after the #29 Q6_K crash). Q5_K / Q6_K continue
+    // through the existing scalar batched kernels.
     if (ggml_type == 12 && mmq_q4k_enabled()) {
         static bool announced = false;
         if (!announced) {
             announced = true;
             fprintf(stderr,
-                    "[GEMM] Path E MMQ Q4_K tensor-core kernel enabled "
-                    "(JLLM_MMQ_Q4K=1, E4 precompute variant)\n");
+                    "[GEMM] Path E MMQ Q4_K tensor-core kernel active "
+                    "(default on; set JLLM_MMQ_Q4K=0 to disable)\n");
         }
         dim3 mmq_grid((N + MMQ_Q4K_TILE_N - 1) / MMQ_Q4K_TILE_N,
                       (M + MMQ_Q4K_TILE_M - 1) / MMQ_Q4K_TILE_M, 1);
