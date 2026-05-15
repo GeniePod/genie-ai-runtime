@@ -1955,6 +1955,18 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                             (unsigned long)hdr.body_bytes,
                             (size_t)committed_tokens, tokens_bytes,
                             path.c_str(), committed_tokens, save_ms);
+
+                    // Path F5: enforce per-process cache budget + clean
+                    // up any stale .tmp left by a previous crashed run.
+                    // Defaults: 1 GB budget, 60-s stale-tmp threshold.
+                    // Set JLLM_KV_CACHE_MAX_MB=0 to disable eviction;
+                    // set JLLM_KV_CACHE_STALE_TMP_S=0 to keep .tmp files.
+                    cleanup_stale_tmp_files(dir,
+                                            default_kv_cache_stale_tmp_s());
+                    enforce_kv_cache_budget(
+                        dir,
+                        default_kv_cache_max_mb() * (int64_t)(1024 * 1024),
+                        path);
                 } else {
                     fprintf(stderr,
                             "[kv_cache] Save failed for %s (see prior "

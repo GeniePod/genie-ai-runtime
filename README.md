@@ -207,6 +207,9 @@ for debugging:
 JLLM_BATCHED_PREFILL=0   # disable Path B (layer-major batched prefill); default: on
 JLLM_Q4K_UINT32_LOADS=0  # disable Path C (Q4_K uint32 weight loads on decode); default: on
 JLLM_MMQ_Q4K=0           # disable Path E (tensor-core MMQ Q4_K prefill GEMM); default: on
+JLLM_KV_CACHE_DIR=...    # Path F: location for persistent KV files; default: /opt/jllm/data/kv-cache
+JLLM_KV_CACHE_MAX_MB=N   # Path F5: total *.bin budget in MB (oldest LRU-evicted); default: 1024, 0 disables
+JLLM_KV_CACHE_STALE_TMP_S=N  # Path F5: age (s) past which leftover *.tmp files get cleaned; default: 60
 JLLM_FAST_GEMV=0         # use CPU reference K-quant GEMV
 JLLM_FAST_EMBD=0         # use CPU reference token embedding dequantization
 JLLM_FAST_NORM=0         # use CPU reference RMSNorm

@@ -96,4 +96,25 @@ bool ensure_dir(const std::string& dir);
 // validated against jllm::validate_conversation_id().
 std::string path_for_conv_id(const std::string& dir, const std::string& conv_id);
 
+// Path F5: per-process budget for `dir`'s *.bin files, in MB. Reads
+// JLLM_KV_CACHE_MAX_MB; defaults to 1024 (1 GB). 0 disables eviction.
+int64_t default_kv_cache_max_mb();
+
+// Path F5: age threshold for stale .tmp cleanup, in seconds. Reads
+// JLLM_KV_CACHE_STALE_TMP_S; defaults to 60.
+int default_kv_cache_stale_tmp_s();
+
+// Path F5: walk `dir`, delete oldest *.bin files by mtime until the
+// total size of remaining *.bin files is ≤ max_bytes. Never deletes
+// `keep_path` (the file we just saved). Logs each eviction. No-op if
+// max_bytes <= 0 (eviction disabled).
+void enforce_kv_cache_budget(const std::string& dir,
+                             int64_t max_bytes,
+                             const std::string& keep_path);
+
+// Path F5: unlink any *.tmp file in `dir` whose mtime is older than
+// `max_age_seconds`. Cleans up after a previous run that crashed
+// mid-save before the .tmp → final rename. No-op if max_age_seconds <= 0.
+void cleanup_stale_tmp_files(const std::string& dir, int max_age_seconds);
+
 }  // namespace jllm

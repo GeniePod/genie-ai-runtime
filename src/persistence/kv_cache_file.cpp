@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <vector>
 #include <filesystem>
+#include <algorithm>
+#include <ctime>
 
 namespace jllm {
 
@@ -296,6 +298,102 @@ std::string path_for_conv_id(const std::string& dir, const std::string& conv_id)
     if (dir.empty() || conv_id.empty()) return {};
     if (dir.back() == '/') return dir + conv_id + ".bin";
     return dir + "/" + conv_id + ".bin";
+}
+
+int64_t default_kv_cache_max_mb() {
+    const char* v = std::getenv("JLLM_KV_CACHE_MAX_MB");
+    if (!v || !*v) return 1024;
+    char* end = nullptr;
+    long long n = std::strtoll(v, &end, 10);
+    if (n < 0) return 0;
+    return (int64_t)n;
+}
+
+int default_kv_cache_stale_tmp_s() {
+    const char* v = std::getenv("JLLM_KV_CACHE_STALE_TMP_S");
+    if (!v || !*v) return 60;
+    char* end = nullptr;
+    long n = std::strtol(v, &end, 10);
+    if (n < 0) return 0;
+    return (int)n;
+}
+
+namespace {
+struct CacheEntry {
+    std::string path;
+    std::time_t mtime;
+    int64_t     size_bytes;
+};
+
+// Returns *.bin entries in `dir` with their mtimes and sizes.
+static std::vector<CacheEntry> list_kv_files(const std::string& dir,
+                                             const char* suffix)
+{
+    std::vector<CacheEntry> out;
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec) || ec) return out;
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!de.is_regular_file(ec) || ec) continue;
+        const auto& p = de.path();
+        if (p.extension() != suffix) continue;
+        struct stat st{};
+        if (::stat(p.c_str(), &st) != 0) continue;
+        out.push_back({p.string(), st.st_mtime, (int64_t)st.st_size});
+    }
+    return out;
+}
+}  // namespace
+
+void enforce_kv_cache_budget(const std::string& dir,
+                             int64_t max_bytes,
+                             const std::string& keep_path)
+{
+    if (max_bytes <= 0) return;   // 0 disables eviction
+    auto entries = list_kv_files(dir, ".bin");
+    int64_t total = 0;
+    for (const auto& e : entries) total += e.size_bytes;
+    if (total <= max_bytes) return;
+
+    // Oldest first, but skip keep_path even if it would otherwise be evicted.
+    std::sort(entries.begin(), entries.end(),
+              [](const CacheEntry& a, const CacheEntry& b) {
+                  return a.mtime < b.mtime;
+              });
+
+    int evicted = 0;
+    int64_t freed = 0;
+    for (const auto& e : entries) {
+        if (total <= max_bytes) break;
+        if (e.path == keep_path) continue;
+        if (::unlink(e.path.c_str()) == 0) {
+            total  -= e.size_bytes;
+            freed  += e.size_bytes;
+            evicted++;
+            fprintf(stderr, "[kv_cache] evicted %s (%ld B, mtime %ld)\n",
+                    e.path.c_str(), (long)e.size_bytes, (long)e.mtime);
+        }
+    }
+    if (evicted > 0) {
+        fprintf(stderr, "[kv_cache] eviction: %d file(s), %ld B freed, "
+                        "total now %ld B / %ld B budget\n",
+                evicted, (long)freed, (long)total, (long)max_bytes);
+    }
+}
+
+void cleanup_stale_tmp_files(const std::string& dir, int max_age_seconds) {
+    if (max_age_seconds <= 0) return;
+    auto entries = list_kv_files(dir, ".tmp");
+    if (entries.empty()) return;
+
+    const std::time_t now = std::time(nullptr);
+    for (const auto& e : entries) {
+        if ((now - e.mtime) < (std::time_t)max_age_seconds) continue;
+        if (::unlink(e.path.c_str()) == 0) {
+            fprintf(stderr, "[kv_cache] cleaned stale tmp %s (age %lds)\n",
+                    e.path.c_str(), (long)(now - e.mtime));
+        }
+    }
 }
 
 }  // namespace jllm
