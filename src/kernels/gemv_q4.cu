@@ -28,6 +28,18 @@ static bool fast_gemv_enabled() {
     return enabled;
 }
 
+// Path C: opt-in vectorized weight loads for the residual-fused Q4_K gemv.
+// Lane T reads four packed q-bytes (one uint32 from blk.qs) instead of one
+// byte, eliminating the il inner loop and folding scales into per-lane
+// constants. See dot_q4k_row_uint32 below for the new lane layout.
+static bool q4k_uint32_loads_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_Q4K_UINT32_LOADS");
+        return v && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 static const void* resolve_weight_device_ptr(const void* W) {
     if (const void* mapped = resolve_mapped_weight_device_ptr(W)) {
         return mapped;
@@ -156,6 +168,85 @@ __device__ __forceinline__ float dot_q4k_row(
 
             acc += w_lo * __half2float(x[k_lo]);
             acc += w_hi * __half2float(x[k_hi]);
+        }
+    }
+
+    return acc;
+}
+
+// uint32-load variant of dot_q4k_row.
+//
+// Lane partitioning (new):
+//   il       = lane >> 3           (which 32-byte qs sub-block: 0..3)
+//   sub_base = (lane & 7) << 2     (byte offset within il: 0,4,...,28)
+//   Each lane reads four contiguous q-bytes as one uint32 from
+//   blk.qs + 32*il + sub_base, eliminating the il inner loop. Eight
+//   FMAs per block per lane — same total as the byte-by-byte path,
+//   but issued as one ld.global.b32 + 8 ld.global.b16 instead of
+//   four ld.global.b8 + 8 ld.global.b16. Plus zero inner-loop control.
+//
+// Per warp instruction:
+//   weight: 32 lanes × 4 bytes = 128 bytes = 1 L1 line covering full qs
+//   x:      32 lanes × 2 halves × 4 sub-positions = 256 halves = 4 L1 lines
+//   compared to byte path (4 inner iters):
+//   weight: 4 × (32 × 1 byte) = 4 partial-line transactions
+//   x:      4 × (32 × 2 halves) = same 4 lines but issued 4x
+//
+// The cache-line accesses for weights drop from 4 → 1 per block (the
+// hypothesis behind #19's Q4_K-vs-Q6_K arithmetic-intensity gap).
+//
+// Float ordering: each lane's accumulator now sums 8 FMAs that touch
+// K-positions [64*il+sub_base, 64*il+sub_base+4) low + [+32, +36) high
+// instead of [lane, +32, +64, +96, +128, +160, +192, +224]. Reduction
+// across 32 lanes still covers the full block but the addition order
+// differs, so bit-equality with dot_q4k_row is not guaranteed (same
+// caveat as #24's split-K).
+__device__ __forceinline__ float dot_q4k_row_uint32(
+    const block_q4_K* __restrict__ row_blocks,
+    const half*       __restrict__ x,
+    int n_blocks,
+    int lane)
+{
+    const int il       = lane >> 3;
+    const int sub_base = (lane & 7) << 2;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_q4_K& blk = row_blocks[b];
+        const float dall = raw_fp16_to_float(blk.d_raw);
+        const float dmin = raw_fp16_to_float(blk.dmin_raw);
+        const int k_base = b * QK_K;
+
+        // Scales for this lane's il — constant across the 4 packed bytes.
+        const int is = 2 * il;
+        uint8_t sc1, m1, sc2, m2;
+        get_scale_min_k4(is + 0, blk.scales, sc1, m1);
+        get_scale_min_k4(is + 1, blk.scales, sc2, m2);
+
+        const float d1  = dall * sc1;
+        const float dm1 = dmin * m1;
+        const float d2  = dall * sc2;
+        const float dm2 = dmin * m2;
+
+        // One uint32 load: 4 packed q-bytes.
+        // blk.qs starts at byte 16 of block_q4_K (after d_raw + dmin_raw +
+        // scales[12]); 32*il is 32-aligned; sub_base is 4-aligned → the
+        // computed address is at least 4-aligned, so the uint32 access is
+        // legal even on strict-alignment ARM64.
+        const uint32_t qv32 =
+            *(const uint32_t*)(blk.qs + 32 * il + sub_base);
+
+        const int k_lo_base = k_base + 64 * il + sub_base;
+        // k_hi_base = k_lo_base + 32
+
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            const uint8_t qb = (uint8_t)(qv32 >> (s * 8));
+            const float w_lo = d1 * (qb & 0xF) - dm1;
+            const float w_hi = d2 * (qb >> 4)  - dm2;
+            acc += w_lo * __half2float(x[k_lo_base + s]);
+            acc += w_hi * __half2float(x[k_lo_base + s + 32]);
         }
     }
 
@@ -592,6 +683,32 @@ __global__ void gemv_quant_add_typed_kernel(
     }
 }
 
+// Q4_K-only variant of gemv_quant_add_typed_kernel using
+// dot_q4k_row_uint32 (uint32 weight loads, no il inner loop).
+// Same block shape and grid as the byte path, drop-in dispatch from
+// gemv_quant_add_gpu's case 12 when JLLM_Q4K_UINT32_LOADS is set.
+__global__ void gemv_quant_add_uint32_q4k_kernel(
+    half*             __restrict__ y,
+    const block_q4_K* __restrict__ W,
+    const half*       __restrict__ x,
+    const half*       __restrict__ residual,
+    int M, int K, int rows_per_block)
+{
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+
+    const int n_blocks = K / QK_K;
+    float acc = dot_q4k_row_uint32(
+        W + (int64_t)row * n_blocks, x, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        const half projected = __float2half(acc);
+        y[row] = __float2half(__half2float(projected) +
+                              __half2float(residual[row]));
+    }
+}
+
 template<int Type0, int Type1>
 __global__ void gemv_quant_pair_typed_kernel(
     half*        __restrict__ y0,
@@ -854,6 +971,24 @@ static bool gemv_quant_add_gpu(half* y, const void* W, int ggml_type,
     const int rows_per_block = gemv_rows_per_block();
     const int block = rows_per_block * 32;
     const int grid = (M + rows_per_block - 1) / rows_per_block;
+
+    // Q4_K only — uint32 weight loads, opt-in via JLLM_Q4K_UINT32_LOADS.
+    // On Q5_K / Q6_K the per-byte loop already runs at higher arithmetic
+    // intensity per byte; vectorizing those is a separate exercise.
+    if (ggml_type == 12 && q4k_uint32_loads_enabled()) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[GEMV] Q4_K uint32 weight-load path enabled\n");
+            logged = true;
+        }
+        gemv_quant_add_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
+            y, (const block_q4_K*)W_device, x, residual, M, K, rows_per_block);
+        cudaError_t err = cudaGetLastError();
+        if (err == cudaSuccess) return true;
+        fprintf(stderr, "[GEMV] Q4_K uint32 launch failed: %s; falling back\n",
+                cudaGetErrorString(err));
+        // Fall through to the byte-load typed kernel below.
+    }
 
     switch (ggml_type) {
         case 12:
