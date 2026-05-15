@@ -132,3 +132,10 @@ target_link_libraries(test_model_load PRIVATE jetson_llm_core)
 add_executable(test_mma_smoke tests/test_mma_smoke.cu)
 target_link_libraries(test_mma_smoke PRIVATE CUDA::cudart)
 add_test(NAME mma_smoke COMMAND test_mma_smoke)
+
+# Path E phase E2: minimal Q4_K dequant + tensor-core MMQ tile.
+# Standalone for the same reason as E1 — exercises the math + fragment
+# layout in isolation before integration into the prefill dispatcher.
+add_executable(test_mmq_q4k_tile tests/test_mmq_q4k_tile.cu)
+target_link_libraries(test_mmq_q4k_tile PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_tile COMMAND test_mmq_q4k_tile)
