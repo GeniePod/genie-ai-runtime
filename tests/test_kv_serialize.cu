@@ -56,7 +56,9 @@ struct KVCacheFileHeader {
     uint32_t used_tokens;
     uint64_t body_bytes;
     char     model_hash[32];
-    uint8_t  reserved[60];
+    uint8_t  reserved[56];   // pad to 128:
+                             //   8 × uint32 (32) + uint64 (8) + 32 (hash) = 72
+                             //   + reserved 56 = 128
 };
 #pragma pack(pop)
 static_assert(sizeof(KVCacheFileHeader) == 128, "header must be 128 bytes");
