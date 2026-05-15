@@ -28,14 +28,22 @@ static bool fast_gemv_enabled() {
     return enabled;
 }
 
-// Path C: opt-in vectorized weight loads for the residual-fused Q4_K gemv.
-// Lane T reads four packed q-bytes (one uint32 from blk.qs) instead of one
-// byte, eliminating the il inner loop and folding scales into per-lane
-// constants. See dot_q4k_row_uint32 below for the new lane layout.
+// Path C: vectorized weight loads for the Q4_K family of decode gemv
+// kernels (Wo / gate-up pair / QKV triple). Lane T reads four packed
+// q-bytes (one uint32 from blk.qs) instead of one byte, eliminating
+// the il inner loop and folding scales into per-lane constants. See
+// dot_q4k_row_uint32 below for the new lane layout.
+//
+// Default-on after #25 / #26 / #27 each shipped bit-identical output
+// against the byte path on Qwen3-4B and cumulatively pushed decode
+// from 7.5 → 8.9 tok/s (+18.7%) on Jetson Orin Nano Super. Set
+// JLLM_Q4K_UINT32_LOADS=0 to opt back into the byte-by-byte kernels
+// (e.g. for an A/B comparison or if a future model trips an
+// alignment assumption).
 static bool q4k_uint32_loads_enabled() {
     static const bool enabled = [] {
         const char* v = getenv("JLLM_Q4K_UINT32_LOADS");
-        return v && strcmp(v, "0") != 0;
+        return !v || strcmp(v, "0") != 0;
     }();
     return enabled;
 }
