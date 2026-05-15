@@ -1217,7 +1217,12 @@ static bool gemv_quant_add_gpu(half* y, const void* W, int ggml_type,
 // Each thread stores a fixed-size acc[MAX_BATCH] register array; the
 // host dispatcher chunks N > MAX_BATCH into multiple kernel launches.
 
-constexpr int GEMM_MAX_BATCH = 32;
+// Sized just above the typical chat-template-wrapped prompt length we serve
+// from GenieClaw (N ≈ 18 for a single user turn). The token-loop is
+// #pragma-unrolled, so every iteration past N is predicated-off but still
+// consumes issue slots — shrinking the unroll factor cuts that waste.
+// Longer prompts get chunked by the host dispatcher.
+constexpr int GEMM_MAX_BATCH = 20;
 
 // The token-loop inside the kernel is #pragma-unrolled so the compiler can
 // keep acc[] in registers — a runtime-bounded loop with dynamic indexing
