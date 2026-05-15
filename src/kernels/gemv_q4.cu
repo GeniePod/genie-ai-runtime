@@ -740,6 +740,42 @@ __global__ void gemv_quant_pair_typed_kernel(
     }
 }
 
+// Q4_K + Q4_K dual-output variant using dot_q4k_row_uint32 (the same
+// uint32-weight-load helper added for the Wo path in #25). Used for
+// decode gate/up, which is ~44% of decode wall-clock on Qwen3-4B per
+// #19. Both outputs use the same `x`, so the inner dot helper's work
+// is per-row and identical to the single-output case.
+__global__ void gemv_quant_pair_uint32_q4k_kernel(
+    half*             __restrict__ y0,
+    const block_q4_K* __restrict__ W0,
+    int M0,
+    half*             __restrict__ y1,
+    const block_q4_K* __restrict__ W1,
+    int M1,
+    const half*       __restrict__ x,
+    int K,
+    int rows_per_block)
+{
+    const int row     = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+    const int total_M = M0 + M1;
+    if (row >= total_M) return;
+
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_uint32(
+            W0 + (int64_t)row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else {
+        const int local_row = row - M0;
+        float acc = dot_q4k_row_uint32(
+            W1 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[local_row] = __float2half(acc);
+    }
+}
+
 template<int Type0, int Type1, int Type2>
 __global__ void gemv_quant_triple_typed_kernel(
     half*        __restrict__ y0,
@@ -898,6 +934,26 @@ static bool gemv_quant_pair_gpu(
     const int rows_per_block = gemv_rows_per_block();
     const int block = rows_per_block * 32;
     const int grid = (M0 + M1 + rows_per_block - 1) / rows_per_block;
+
+    if (type0 == 12 && type1 == 12 && q4k_uint32_loads_enabled()) {
+        // Q4_K + Q4_K uint32 weight-load path (decode gate/up). Same env
+        // var as the residual-fused Wo path so a single flag covers
+        // every uint32-accelerated Q4_K caller.
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[GEMV] Q4_K uint32 pair weight-load path enabled\n");
+            logged = true;
+        }
+        gemv_quant_pair_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
+            y0, (const block_q4_K*)W0_device, M0,
+            y1, (const block_q4_K*)W1_device, M1,
+            x, K, rows_per_block);
+        cudaError_t err_sk = cudaGetLastError();
+        if (err_sk == cudaSuccess) return true;
+        fprintf(stderr, "[GEMV] Q4_K uint32 pair launch failed: %s; falling back\n",
+                cudaGetErrorString(err_sk));
+        // Fall through to the typed byte-load kernel below.
+    }
 
     if (type0 == 12 && type1 == 12) {
         gemv_quant_pair_typed_kernel<12, 12><<<grid, block, 0, stream>>>(
