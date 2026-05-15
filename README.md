@@ -146,6 +146,7 @@ for debugging:
 ```
 JLLM_BATCHED_PREFILL=0   # disable Path B (layer-major batched prefill); default: on
 JLLM_Q4K_UINT32_LOADS=0  # disable Path C (Q4_K uint32 weight loads on decode); default: on
+JLLM_MMQ_Q4K=1           # opt into Path E (tensor-core MMQ Q4_K prefill GEMM, E4 variant); default: off (A/B vs alpha.6)
 JLLM_FAST_GEMV=0         # use CPU reference K-quant GEMV
 JLLM_FAST_EMBD=0         # use CPU reference token embedding dequantization
 JLLM_FAST_NORM=0         # use CPU reference RMSNorm
