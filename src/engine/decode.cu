@@ -821,7 +821,8 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
 void Engine::transformer_layer_decode_normed(int layer, int pos,
                                              half* x,
                                              half* normed,
-                                             half* next_normed) {
+                                             half* next_normed,
+                                             half* final_normed) {
     const auto& lw = model_weights_.layers[layer];
     const int H = config_.hidden_dim;
     const int Q_DIM = config_.n_heads * config_.head_dim;
@@ -867,6 +868,10 @@ void Engine::transformer_layer_decode_normed(int layer, int pos,
                                      next_lw.rms_attn, 1, H,
                                      config_.rms_eps,
                                      next_lw.rms_type == 0, stream_);
+    } else if (final_normed && layer + 1 == config_.n_layers) {
+        fused_rmsnorm_residual_store(x, final_normed, x2, ffn_out,
+                                     model_weights_.output_norm, 1, H,
+                                     config_.rms_eps, true, stream_);
     } else {
         vec_add(x, x2, ffn_out, H, stream_);
     }
@@ -1103,6 +1108,7 @@ int Engine::decode_step(int pos) {
     float prof_norm_ms = 0.0f;
     float prof_logits_ms = 0.0f;
     float prof_sample_ms = 0.0f;
+    half* precomputed_final_norm = nullptr;
 
     half* x = (half*)scratch_.get(H * sizeof(half));
 
@@ -1132,6 +1138,7 @@ int Engine::decode_step(int pos) {
 
         half* normed = (half*)scratch_.get(H * sizeof(half));
         half* next_normed = (half*)scratch_.get(H * sizeof(half));
+        precomputed_final_norm = (half*)scratch_.get(H * sizeof(half));
         const auto& first_lw = model_weights_.layers[0];
         fused_rmsnorm_residual(normed, x, nullptr, first_lw.rms_attn,
                                1, H, config_.rms_eps,
@@ -1139,7 +1146,11 @@ int Engine::decode_step(int pos) {
 
         for (int l = 0; l < config_.n_layers; l++) {
             half* next = (l + 1 < config_.n_layers) ? next_normed : nullptr;
-            transformer_layer_decode_normed(l, pos, x, normed, next);
+            half* final_norm = (l + 1 == config_.n_layers)
+                ? precomputed_final_norm
+                : nullptr;
+            transformer_layer_decode_normed(l, pos, x, normed, next,
+                                            final_norm);
             if (next) {
                 std::swap(normed, next_normed);
             }
@@ -1156,14 +1167,20 @@ int Engine::decode_step(int pos) {
         prof_t = now;
     }
 
-    // Final RMSNorm
-    half* normed = (half*)scratch_.get(H * sizeof(half));
-    fused_rmsnorm_residual(normed, x, nullptr, model_weights_.output_norm, 1, H, config_.rms_eps, true, stream_);
-    if (profile) {
-        cudaStreamSynchronize(stream_);
-        auto now = Clock::now();
-        prof_norm_ms = Ms(now - prof_t).count();
-        prof_t = now;
+    // Final RMSNorm. The fused decode schedule computes this as part of the
+    // final residual store, so only the original schedule needs a separate
+    // output_norm launch.
+    half* normed = precomputed_final_norm;
+    if (!normed) {
+        normed = (half*)scratch_.get(H * sizeof(half));
+        fused_rmsnorm_residual(normed, x, nullptr, model_weights_.output_norm,
+                               1, H, config_.rms_eps, true, stream_);
+        if (profile) {
+            cudaStreamSynchronize(stream_);
+            auto now = Clock::now();
+            prof_norm_ms = Ms(now - prof_t).count();
+            prof_t = now;
+        }
     }
 
     // Logits: write FP32 directly from the output projection. This avoids an

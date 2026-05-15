@@ -203,7 +203,8 @@ private:
     void transformer_layer_decode_normed(int layer, int pos,
                                          half* x,
                                          half* normed,
-                                         half* next_normed);
+                                         half* next_normed,
+                                         half* final_normed);
     // Single-token attention pre-Wo: QK-norm (if not already done by the
     // caller), RoPE, KV store, attention. Writes attention output (head
     // mix) to `attn_out` [Q_DIM]. No projection, no residual — caller is
