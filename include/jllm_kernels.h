@@ -13,6 +13,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstddef>
 #include <cstdint>
 
 // Orin SM 8.7 constants (duplicated here to avoid circular include with jllm.h)
@@ -150,6 +151,83 @@ void gemv_quant_f32(
     const void*    W,
     int            ggml_type,
     const half*    x,
+    int            M,
+    int            K,
+    cudaStream_t   stream
+);
+
+// Decode MMVQ path inspired by llama.cpp's CUDA backend:
+//   1. quantize the one-token FP16 activation to Q8_1 in scratch
+//   2. dot Q8_1 activations against GGUF K-quant weights with CUDA DP4A
+//
+// This is opt-in from the engine while we validate quality and throughput on
+// Jetson unified memory. The functions return false when a tensor type or
+// pointer layout is not supported so callers can fall back to gemv_quant.
+size_t q8_1_scratch_bytes(int K);
+
+bool gemv_quant_mmvq(
+    half*          y,
+    const void*    W,
+    int            ggml_type,
+    const half*    x,
+    void*          q8_scratch,
+    int            M,
+    int            K,
+    cudaStream_t   stream
+);
+
+bool gemv_quant_add_mmvq(
+    half*          y,
+    const void*    W,
+    int            ggml_type,
+    const half*    x,
+    const half*    residual,
+    void*          q8_scratch,
+    int            M,
+    int            K,
+    cudaStream_t   stream
+);
+
+bool gemv_quant_pair_mmvq(
+    half*          y0,
+    const void*    W0,
+    int            ggml_type0,
+    int            M0,
+    half*          y1,
+    const void*    W1,
+    int            ggml_type1,
+    int            M1,
+    const half*    x,
+    void*          q8_scratch,
+    int            K,
+    cudaStream_t   stream
+);
+
+bool gemv_quant_triple_mmvq(
+    half*          y0,
+    const void*    W0,
+    int            ggml_type0,
+    int            M0,
+    half*          y1,
+    const void*    W1,
+    int            ggml_type1,
+    int            M1,
+    half*          y2,
+    const void*    W2,
+    int            ggml_type2,
+    int            M2,
+    const half*    x,
+    void*          q8_scratch,
+    int            K,
+    cudaStream_t   stream
+);
+
+bool gemv_quant_f32_mmvq(
+    float*         y,
+    const void*    W,
+    int            ggml_type,
+    const half*    x,
+    void*          q8_scratch,
     int            M,
     int            K,
     cudaStream_t   stream
