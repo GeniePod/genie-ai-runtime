@@ -49,12 +49,30 @@ static bool fast_embedding_enabled() {
     return enabled;
 }
 
-static bool mmvq_decode_enabled() {
-    static const bool enabled = [] {
+enum class MmvqDecodeMode {
+    Off,
+    Logits,
+    All,
+};
+
+static MmvqDecodeMode mmvq_decode_mode() {
+    static const MmvqDecodeMode mode = [] {
         const char* v = getenv("JLLM_MMVQ");
-        return v && strcmp(v, "0") != 0;
+        if (!v || strcmp(v, "0") == 0) return MmvqDecodeMode::Off;
+        if (strcmp(v, "all") == 0 || strcmp(v, "layers") == 0) {
+            return MmvqDecodeMode::All;
+        }
+        return MmvqDecodeMode::Logits;
     }();
-    return enabled;
+    return mode;
+}
+
+static bool mmvq_logits_enabled() {
+    return mmvq_decode_mode() != MmvqDecodeMode::Off;
+}
+
+static bool mmvq_layers_enabled() {
+    return mmvq_decode_mode() == MmvqDecodeMode::All;
 }
 
 // ── Vector add kernel (for residual connections) ─────────────────────────
@@ -791,7 +809,7 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
 
     // 2. QKV projections. These share the same input vector, so dispatch as
     // one combined GEMV launch when the fast K-quant path is available.
-    if (mmvq_decode_enabled()) {
+    if (mmvq_layers_enabled()) {
         void* q8 = scratch_.get((int64_t)q8_1_scratch_bytes(H));
         if (!gemv_quant_triple_mmvq(q_buf, lw.wq, lw.type_wq, Q_DIM,
                                     k_buf, lw.wk, lw.type_wk, KV_DIM,
@@ -822,7 +840,7 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
     half* swiglu_out = (half*)scratch_.get(I * sizeof(half));
 
     fused_rmsnorm_residual(normed2, x2, nullptr, lw.rms_ffn, 1, H, config_.rms_eps, norm_fp32, stream_);
-    if (mmvq_decode_enabled()) {
+    if (mmvq_layers_enabled()) {
         void* q8 = scratch_.get((int64_t)q8_1_scratch_bytes(H));
         if (!gemv_quant_pair_mmvq(gate_buf, lw.w_gate, lw.type_w_gate, I,
                                   up_buf,   lw.w_up,   lw.type_w_up,   I,
@@ -898,7 +916,7 @@ void Engine::transformer_layer_attn_block(int layer, int pos, half* x_in,
 
     transformer_layer_attn_compute(layer, pos, q_buf, k_buf, v_buf,
                                    attn_out, qk_norm_already);
-    if (mmvq_decode_enabled()) {
+    if (mmvq_layers_enabled()) {
         void* q8 = scratch_.get((int64_t)q8_1_scratch_bytes(Q_DIM));
         if (!gemv_quant_add_mmvq(x_attn_out, lw.wo, lw.type_wo,
                                  attn_out, x_in, q8, H, Q_DIM, stream_)) {
@@ -917,7 +935,7 @@ void Engine::transformer_layer_ffn_block(int layer, half* x_attn, half* swiglu_i
     int H = config_.hidden_dim;
     int I = config_.intermediate_dim;
 
-    if (mmvq_decode_enabled()) {
+    if (mmvq_layers_enabled()) {
         void* q8 = scratch_.get((int64_t)q8_1_scratch_bytes(I));
         if (!gemv_quant_add_mmvq(x_out, lw.w_down, lw.type_w_down,
                                  swiglu_in, x_attn, q8, H, I, stream_)) {
@@ -1133,7 +1151,7 @@ int Engine::decode_step(int pos) {
         return tokenizer_.eos_id;
     }
 
-    if (mmvq_decode_enabled()) {
+    if (mmvq_logits_enabled()) {
         void* q8 = scratch_.get((int64_t)q8_1_scratch_bytes(H));
         if (!gemv_quant_f32_mmvq(logits_fp32, model_weights_.output,
                                  model_weights_.output_type,
@@ -1236,7 +1254,7 @@ void Engine::build_cuda_graph(int pos) {
 
     // Capture logit projection without an intermediate FP16 logits pass.
     float* g_logits_fp32 = (float*)scratch_.get(config_.vocab_size * sizeof(float));
-    if (mmvq_decode_enabled()) {
+    if (mmvq_logits_enabled()) {
         void* q8 = scratch_.get((int64_t)q8_1_scratch_bytes(H));
         if (!gemv_quant_f32_mmvq(g_logits_fp32, model_weights_.output,
                                  model_weights_.output_type,
@@ -1332,11 +1350,18 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     half* last_prefill_x = nullptr;
     int H = config_.hidden_dim;
     const int N = (int)prompt_tokens.size();
-    if (mmvq_decode_enabled()) {
+    if (mmvq_logits_enabled()) {
         static bool logged = false;
         if (!logged) {
-            fprintf(stderr,
-                    "[engine] Decode MMVQ Q8/DP4A path enabled (JLLM_MMVQ=1)\n");
+            if (mmvq_layers_enabled()) {
+                fprintf(stderr,
+                        "[engine] Decode MMVQ Q8/DP4A layer+logits path enabled "
+                        "(JLLM_MMVQ=all; experimental)\n");
+            } else {
+                fprintf(stderr,
+                        "[engine] Decode MMVQ Q8/DP4A logits path enabled "
+                        "(JLLM_MMVQ=1)\n");
+            }
             logged = true;
         }
     }
@@ -1444,7 +1469,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             fused_rmsnorm_residual(normed, last_prefill_x, nullptr,
                                    model_weights_.output_norm,
                                    1, H, config_.rms_eps, true, stream_);
-            if (mmvq_decode_enabled()) {
+            if (mmvq_logits_enabled()) {
                 void* q8 = scratch_.get((int64_t)q8_1_scratch_bytes(H));
                 if (!gemv_quant_f32_mmvq(logits_fp32, model_weights_.output,
                                          model_weights_.output_type,

@@ -161,8 +161,10 @@ void gemv_quant_f32(
 //   2. dot Q8_1 activations against GGUF K-quant weights with CUDA DP4A
 //
 // This is opt-in from the engine while we validate quality and throughput on
-// Jetson unified memory. The functions return false when a tensor type or
-// pointer layout is not supported so callers can fall back to gemv_quant.
+// Jetson unified memory. Layer projections are still experimental because
+// Q8 activation error accumulates through the residual stream. The functions
+// return false when a tensor type or pointer layout is not supported so callers
+// can fall back to gemv_quant.
 size_t q8_1_scratch_bytes(int K);
 
 bool gemv_quant_mmvq(
