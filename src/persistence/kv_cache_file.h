@@ -9,11 +9,24 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace jllm {
 
 constexpr uint32_t KVCACHE_MAGIC   = 0x4D4C4C4Au;   // 'JLLM' LE
-constexpr uint32_t KVCACHE_VERSION = 1u;
+
+// Format versions:
+//   v1 — F3 / F3b. Layout: [header 128 B][KV body body_bytes]. KV body
+//        packed per layer (used_tokens × eb keys + values). No token IDs.
+//   v2 — F4a. Layout: [header 128 B][tokens used_tokens × 4 B]
+//        [KV body body_bytes]. Token IDs added so F4b can find the
+//        longest common prefix between a cached conversation and a
+//        new prompt, and skip prefill for the matched range.
+//
+// Old v1 files cannot be loaded by v2 readers; they fail the size check
+// (file size disagrees with sizeof(header) + tokens_bytes + body_bytes).
+// Path F is alpha-only so far, no migration path needed.
+constexpr uint32_t KVCACHE_VERSION = 2u;
 
 #pragma pack(push, 1)
 struct KVCacheFileHeader {
@@ -24,8 +37,8 @@ struct KVCacheFileHeader {
     uint32_t head_dim;
     uint32_t kv_type_bytes;       // 1 = INT8, 2 = FP16
     uint32_t max_context;
-    uint32_t used_tokens;
-    uint64_t body_bytes;          // defense against truncated writes
+    uint32_t used_tokens;         // also = number of token IDs in the tokens region
+    uint64_t body_bytes;          // KV portion only; tokens region is used_tokens × 4 B
     char     model_hash[32];      // FNV-1a-64 of (size + first 256 B of GGUF), zero-padded
     uint8_t  reserved[56];
 };
@@ -33,23 +46,29 @@ struct KVCacheFileHeader {
 static_assert(sizeof(KVCacheFileHeader) == 128, "header must be 128 bytes");
 
 // Atomic save: writes <path>.tmp, fsyncs, renames to <path>. Returns
-// false on any I/O failure. host_buffer must already contain the body
-// bytes the caller wants persisted (the persistence layer is purely
-// I/O — gather from device → host is the caller's responsibility,
-// typically via KVCachePool::gather_used_to_host).
+// false on any I/O failure. host_kv must already contain the KV body
+// bytes the caller wants persisted (gather from device → host is the
+// caller's responsibility, typically via KVCachePool::gather_used_to_host).
+// tokens points to hdr.used_tokens uint32 token IDs; the caller is
+// responsible for collecting these (engine has them in tokenizer.encode
+// output). Pass tokens=nullptr / n_tokens=0 only for tests that don't
+// need the v2 prefix-match logic — production should always pass them.
 bool save_kv_to_file(const std::string& path,
                      const KVCacheFileHeader& hdr,
-                     const void* host_buffer,
+                     const uint32_t* tokens,
+                     size_t n_tokens,
+                     const void* host_kv,
                      size_t body_bytes);
 
-// Load: validates magic, version, and fstat'd size vs hdr.body_bytes.
-// Refuses truncated files. Copies body into host_buffer (must be at
-// least hdr.body_bytes in capacity). Scattering to the device pool is
-// the caller's responsibility, typically via KVCachePool::scatter_from_host.
+// Load: validates magic, version, and fstat'd size vs
+// sizeof(header) + n_tokens * 4 + body_bytes. Refuses truncated files.
+// Reads token IDs into *out_tokens (resized to hdr.used_tokens) and KV
+// body into host_kv (must be at least hdr.body_bytes in capacity).
 bool load_kv_from_file(const std::string& path,
                        KVCacheFileHeader& hdr,
-                       void* host_buffer,
-                       size_t buffer_capacity);
+                       std::vector<uint32_t>* out_tokens,
+                       void* host_kv,
+                       size_t kv_capacity);
 
 // FNV-1a-64 over (file_size as 8 bytes || first 256 B of file). The
 // first 256 B of a GGUF file covers magic + version + metadata count

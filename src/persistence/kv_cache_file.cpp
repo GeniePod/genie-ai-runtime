@@ -19,15 +19,44 @@
 
 namespace jllm {
 
+static bool write_all(int fd, const void* buf, size_t bytes,
+                      const char* what, const std::string& path)
+{
+    const uint8_t* p = static_cast<const uint8_t*>(buf);
+    size_t written = 0;
+    while (written < bytes) {
+        ssize_t n = ::write(fd, p + written, bytes - written);
+        if (n <= 0) {
+            fprintf(stderr, "[kv_cache] save: %s write failed at %zu/%zu in %s\n",
+                    what, written, bytes, path.c_str());
+            return false;
+        }
+        written += (size_t)n;
+    }
+    return true;
+}
+
 bool save_kv_to_file(const std::string& path,
                      const KVCacheFileHeader& hdr,
-                     const void* host_buffer,
+                     const uint32_t* tokens,
+                     size_t n_tokens,
+                     const void* host_kv,
                      size_t body_bytes)
 {
     if (hdr.body_bytes != body_bytes) {
         fprintf(stderr, "[kv_cache] save: header.body_bytes (%lu) != "
                         "body_bytes (%lu)\n",
                 (unsigned long)hdr.body_bytes, (unsigned long)body_bytes);
+        return false;
+    }
+    if (hdr.used_tokens != n_tokens) {
+        fprintf(stderr, "[kv_cache] save: header.used_tokens (%u) != "
+                        "n_tokens (%zu)\n",
+                hdr.used_tokens, n_tokens);
+        return false;
+    }
+    if (n_tokens > 0 && tokens == nullptr) {
+        fprintf(stderr, "[kv_cache] save: n_tokens > 0 but tokens=null\n");
         return false;
     }
 
@@ -46,16 +75,14 @@ bool save_kv_to_file(const std::string& path,
         fprintf(stderr, "[kv_cache] save: header write short\n");
         ::close(fd); ::unlink(tmp_path.c_str()); return false;
     }
-    const uint8_t* src = static_cast<const uint8_t*>(host_buffer);
-    size_t written = 0;
-    while (written < body_bytes) {
-        ssize_t n = ::write(fd, src + written, body_bytes - written);
-        if (n <= 0) {
-            fprintf(stderr, "[kv_cache] save: body write failed at %zu/%zu\n",
-                    written, body_bytes);
+    if (n_tokens > 0) {
+        const size_t tokens_bytes = n_tokens * sizeof(uint32_t);
+        if (!write_all(fd, tokens, tokens_bytes, "tokens", tmp_path)) {
             ::close(fd); ::unlink(tmp_path.c_str()); return false;
         }
-        written += (size_t)n;
+    }
+    if (!write_all(fd, host_kv, body_bytes, "kv body", tmp_path)) {
+        ::close(fd); ::unlink(tmp_path.c_str()); return false;
     }
     if (::fsync(fd) != 0) {
         fprintf(stderr, "[kv_cache] save: fsync failed\n");
@@ -71,10 +98,28 @@ bool save_kv_to_file(const std::string& path,
     return true;
 }
 
+static bool read_all(int fd, void* buf, size_t bytes,
+                     const char* what, const std::string& path)
+{
+    uint8_t* p = static_cast<uint8_t*>(buf);
+    size_t got = 0;
+    while (got < bytes) {
+        ssize_t n = ::read(fd, p + got, bytes - got);
+        if (n <= 0) {
+            fprintf(stderr, "[kv_cache] load: %s read failed at %zu/%zu in %s\n",
+                    what, got, bytes, path.c_str());
+            return false;
+        }
+        got += (size_t)n;
+    }
+    return true;
+}
+
 bool load_kv_from_file(const std::string& path,
                        KVCacheFileHeader& hdr,
-                       void* host_buffer,
-                       size_t buffer_capacity)
+                       std::vector<uint32_t>* out_tokens,
+                       void* host_kv,
+                       size_t kv_capacity)
 {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
@@ -96,19 +141,21 @@ bool load_kv_from_file(const std::string& path,
                 hdr.version, path.c_str());
         ::close(fd); return false;
     }
-    if (hdr.body_bytes > buffer_capacity) {
+    if (hdr.body_bytes > kv_capacity) {
         fprintf(stderr, "[kv_cache] load: body_bytes (%lu) > "
-                        "buffer_capacity (%zu) in %s\n",
-                (unsigned long)hdr.body_bytes, buffer_capacity, path.c_str());
+                        "kv_capacity (%zu) in %s\n",
+                (unsigned long)hdr.body_bytes, kv_capacity, path.c_str());
         ::close(fd); return false;
     }
+
+    const size_t tokens_bytes = (size_t)hdr.used_tokens * sizeof(uint32_t);
 
     struct stat st{};
     if (::fstat(fd, &st) != 0) {
         fprintf(stderr, "[kv_cache] load: fstat failed on %s\n", path.c_str());
         ::close(fd); return false;
     }
-    size_t expected = sizeof(hdr) + (size_t)hdr.body_bytes;
+    size_t expected = sizeof(hdr) + tokens_bytes + (size_t)hdr.body_bytes;
     if ((size_t)st.st_size != expected) {
         fprintf(stderr, "[kv_cache] load: size mismatch on %s: "
                         "disk=%ld expected=%zu (truncated write?)\n",
@@ -116,16 +163,21 @@ bool load_kv_from_file(const std::string& path,
         ::close(fd); return false;
     }
 
-    uint8_t* dst = static_cast<uint8_t*>(host_buffer);
-    size_t read = 0;
-    while (read < hdr.body_bytes) {
-        ssize_t n = ::read(fd, dst + read, hdr.body_bytes - read);
-        if (n <= 0) {
-            fprintf(stderr, "[kv_cache] load: body read failed at %zu/%lu\n",
-                    read, (unsigned long)hdr.body_bytes);
+    if (out_tokens) {
+        out_tokens->resize(hdr.used_tokens);
+        if (hdr.used_tokens > 0 &&
+            !read_all(fd, out_tokens->data(), tokens_bytes, "tokens", path))
+        {
             ::close(fd); return false;
         }
-        read += (size_t)n;
+    } else if (tokens_bytes > 0) {
+        if (::lseek(fd, (off_t)tokens_bytes, SEEK_CUR) == (off_t)-1) {
+            ::close(fd); return false;
+        }
+    }
+
+    if (!read_all(fd, host_kv, (size_t)hdr.body_bytes, "kv body", path)) {
+        ::close(fd); return false;
     }
     ::close(fd);
     return true;

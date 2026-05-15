@@ -1489,6 +1489,19 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     if (prompt_tokens.empty()) {
         prompt_tokens.push_back(tokenizer_.bos_id);
     }
+
+    // Path F4a (#45): track the tokens whose K/V state is committed to
+    // the cache, in order, so we can persist them alongside the KV bytes
+    // and F4b can find the longest common prefix between a cached
+    // conversation and a new prompt. Starts with prompt_tokens (those
+    // are written by prefill); grows by one in the decode loop right
+    // before each decode_step writes the next position. The LAST
+    // sampled token of a turn lives in last_token_ but never makes it
+    // to KV (the loop exits before another decode_step commits it), so
+    // we deliberately don't push it.
+    std::vector<uint32_t> kv_tokens;
+    kv_tokens.reserve(prompt_tokens.size() + params.max_tokens);
+    for (int t : prompt_tokens) kv_tokens.push_back((uint32_t)t);
     if (debug_kernels_enabled()) {
         fprintf(stderr, "[tokenizer] prompt tokens:");
         for (int i = 0; i < (int)prompt_tokens.size() && i < 16; i++) {
@@ -1680,6 +1693,15 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         }
 
         scratch_.reset();
+        // F4a token tracking: decode_step(pos) is about to write KV[pos] =
+        // last_token_, then sample a new token. If `pos` extends the
+        // committed prefix, record what's being written. (Fallback path's
+        // first iteration overwrites KV[N-1] in place — `pos == N-1` and
+        // kv_tokens.size() == N already, so the condition skips and we
+        // don't double-count.)
+        if ((int)kv_tokens.size() == pos) {
+            kv_tokens.push_back((uint32_t)last_token_);
+        }
         int token = decode_step(pos);
         pos++;
 
@@ -1736,14 +1758,19 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         validate_conversation_id(params.conversation_id))
     {
         constexpr int MIN_TOKENS_TO_SAVE = 4;
-        const int total_tokens = stats.prompt_tokens + stats.completion_tokens;
+        // F4a: committed_tokens is the number of KV positions actually
+        // written. Equals prompt_tokens + completion_tokens - 1 in the
+        // typical Path A case (the last sampled token lives in
+        // last_token_ but isn't in KV) and matches the kv_tokens vector
+        // we've been tracking through the decode loop.
+        const int committed_tokens = (int)kv_tokens.size();
         const auto& kv_cfg = kv_cache_.config();
-        const bool overflow_used = total_tokens > kv_cfg.max_context;
+        const bool overflow_used = committed_tokens > kv_cfg.max_context;
 
-        if (total_tokens < MIN_TOKENS_TO_SAVE) {
+        if (committed_tokens < MIN_TOKENS_TO_SAVE) {
             fprintf(stderr, "[kv_cache] skip save (only %d tokens, "
                             "min=%d)\n",
-                    total_tokens, MIN_TOKENS_TO_SAVE);
+                    committed_tokens, MIN_TOKENS_TO_SAVE);
         } else if (overflow_used) {
             fprintf(stderr, "[kv_cache] skip save (overflow pool used, "
                             "v1 fast-pool-only)\n");
@@ -1754,12 +1781,8 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             if (!ensure_dir(dir)) {
                 fprintf(stderr, "[kv_cache] skip save (dir unavailable)\n");
             } else {
-                // F3b: packed body — n_layers × used_tokens × entry_bytes.
-                // For Qwen3-4B with used_tokens=37 / max_context=1024:
-                // body shrinks from 144 MB → ~5.4 MB → ~200 ms save vs
-                // F3's 5.6 s.
                 const int64_t packed_bytes =
-                    kv_cache_.packed_used_bytes(total_tokens);
+                    kv_cache_.packed_used_bytes(committed_tokens);
 
                 KVCacheFileHeader hdr{};
                 hdr.magic         = KVCACHE_MAGIC;
@@ -1769,7 +1792,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                 hdr.head_dim      = (uint32_t)kv_cfg.head_dim;
                 hdr.kv_type_bytes = (uint32_t)kv_cfg.kv_type_bytes;
                 hdr.max_context   = (uint32_t)kv_cfg.max_context;
-                hdr.used_tokens   = (uint32_t)total_tokens;
+                hdr.used_tokens   = (uint32_t)committed_tokens;
                 hdr.body_bytes    = (uint64_t)packed_bytes;
                 std::memcpy(hdr.model_hash, model_fingerprint_,
                             sizeof(hdr.model_hash));
@@ -1777,19 +1800,25 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                 auto t_save0 = Clock::now();
                 std::vector<uint8_t> staging((size_t)packed_bytes);
                 bool ok = kv_cache_.gather_used_to_host(staging.data(),
-                                                       total_tokens);
+                                                       committed_tokens);
                 if (ok) {
-                    ok = save_kv_to_file(path, hdr, staging.data(),
+                    ok = save_kv_to_file(path, hdr,
+                                         kv_tokens.data(),
+                                         (size_t)committed_tokens,
+                                         staging.data(),
                                          (size_t)packed_bytes);
                 }
                 auto t_save1 = Clock::now();
                 float save_ms = Ms(t_save1 - t_save0).count();
                 if (ok) {
+                    const size_t tokens_bytes =
+                        (size_t)committed_tokens * sizeof(uint32_t);
                     fprintf(stderr,
-                            "[kv_cache] Saved %lu bytes to %s "
-                            "(%d tokens packed, %.0f ms)\n",
-                            (unsigned long)hdr.body_bytes, path.c_str(),
-                            total_tokens, save_ms);
+                            "[kv_cache] Saved %lu KV bytes + %zu tokens "
+                            "(%zu B) to %s (%d tokens committed, %.0f ms)\n",
+                            (unsigned long)hdr.body_bytes,
+                            (size_t)committed_tokens, tokens_bytes,
+                            path.c_str(), committed_tokens, save_ms);
                 } else {
                     fprintf(stderr,
                             "[kv_cache] Save failed for %s (see prior "
