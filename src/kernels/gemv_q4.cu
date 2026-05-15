@@ -1441,27 +1441,37 @@ __global__ void gemm_quant_batched_q6k_kernel(
     }
 }
 
-// Path E E4: tensor-core MMQ Q4_K kernel. Same kernel that ran
-// standalone at 210 GFLOPS on Wo / 276 GFLOPS on gate+up in #38.
-// Per-(row, sub-block) scale precompute into shared memory + 16x32
-// FP16 staging tile + 2 m16n8k16 MMAs per sub-block. One warp per
-// CUDA block; grid (ceil(N/8), ceil(M/16), 1).
+// Path E E5: multi-warp cooperative MMQ Q4_K kernel. Replaces the E4
+// single-warp variant. 4 warps per CUDA block share a single
+// dequanted 16×32 FP16 A-tile across 4 contiguous N-stripes (8 tokens
+// each). Dequant amortized 4× vs E4; register count 96 → 39; all
+// Qwen3-4B prefill shapes uniform around ~407 GFLOPS (vs E4's 210–276).
+//
+// Validated standalone in #41 (test_mmq_q4k_multiwarp.cu).
+// Grid: (ceil(N / MMQ_Q4K_BLOCK_N), ceil(M / MMQ_Q4K_TILE_M), 1).
+// Block: 4 warps × 32 threads = 128 threads.
 
-constexpr int MMQ_Q4K_TILE_M = 16;
-constexpr int MMQ_Q4K_TILE_N = 8;
+constexpr int MMQ_Q4K_TILE_M  = 16;
+constexpr int MMQ_Q4K_TILE_N  = 8;
+constexpr int MMQ_Q4K_N_WARPS = 4;
+constexpr int MMQ_Q4K_BLOCK_N = MMQ_Q4K_TILE_N * MMQ_Q4K_N_WARPS;   // 32
 
 __global__ void gemm_mmq_q4k_kernel(half*             __restrict__ y,
                                     const block_q4_K* __restrict__ W,
                                     const half*       __restrict__ x,
                                     int M, int N, int K)
 {
-    const int row_base = blockIdx.y * MMQ_Q4K_TILE_M;
-    const int tok_base = blockIdx.x * MMQ_Q4K_TILE_N;
+    const int row_base     = blockIdx.y * MMQ_Q4K_TILE_M;
+    const int blk_tok_base = blockIdx.x * MMQ_Q4K_BLOCK_N;
     if (row_base >= M) return;
 
-    const int lane    = threadIdx.x & 31;
+    const int t_id    = threadIdx.x;          // 0..127
+    const int warp_id = t_id >> 5;            // 0..3
+    const int lane    = t_id & 31;
     const int groupID = lane >> 2;
     const int tinG    = lane &  3;
+
+    const int tok_base = blk_tok_base + warp_id * MMQ_Q4K_TILE_N;
 
     const int n_blocks = K / QK_K;
 
@@ -1472,13 +1482,10 @@ __global__ void gemm_mmq_q4k_kernel(half*             __restrict__ y,
     __shared__ float per_dm[MMQ_Q4K_TILE_M][8];
 
     for (int b = 0; b < n_blocks; b++) {
-        // Step 1: 16×8 = 128 (d, dm) pairs precomputed once per block,
-        // distributed 4 entries per lane across the 32-lane warp.
-        #pragma unroll
-        for (int slot = 0; slot < 4; slot++) {
-            const int idx = lane * 4 + slot;
-            const int row = idx >> 3;
-            const int sb  = idx &  7;
+        // Step 1: 128 (d, dm) pairs across 128 threads, 1 entry each.
+        {
+            const int row = t_id >> 3;        // 0..15
+            const int sb  = t_id &  7;        // 0..7
             const int g_row = row_base + row;
             float d = 0.0f, dm = 0.0f;
             if (g_row < M) {
@@ -1493,31 +1500,42 @@ __global__ void gemm_mmq_q4k_kernel(half*             __restrict__ y,
             per_d [row][sb] = d;
             per_dm[row][sb] = dm;
         }
-        __syncwarp();
+        __syncthreads();
 
-        // Step 2: 8 sub-blocks × {dequant 16×32 staging tile, 2 MMAs}.
+        // Step 2: 8 sub-blocks × {cooperative dequant, 4 MMAs}.
         for (int sb = 0; sb < 8; sb++) {
             const int il     = sb >> 1;
             const int parity = sb &  1;
-            const int col    = lane;
 
-            // No `#pragma unroll` — keeps register pressure down.
-            for (int row = 0; row < MMQ_Q4K_TILE_M; row++) {
-                const int g_row = row_base + row;
+            // Cooperative dequant: 128 threads × 4 elements = 512 = 16×32.
+            // Thread t covers row = t/8, cols (t&7)*4 + [0..3] — keeps
+            // each thread on one row across its 4 cols.
+            {
+                const int row    = t_id >> 3;
+                const int col_4  = (t_id & 7) << 2;
+                const int g_row  = row_base + row;
+                float d = 0.0f, dm = 0.0f;
+                const block_q4_K* blk_ptr = nullptr;
                 if (g_row < M) {
-                    const block_q4_K& blk = W[(int64_t)g_row * n_blocks + b];
-                    const uint8_t qb = blk.qs[32 * il + col];
-                    const float d  = per_d [row][sb];
-                    const float dm = per_dm[row][sb];
-                    const float val = parity
-                        ? (d * (qb >> 4)  - dm)
-                        : (d * (qb & 0xF) - dm);
-                    A_tile[row][col] = __float2half(val);
-                } else {
-                    A_tile[row][col] = __float2half(0.0f);
+                    blk_ptr = &W[(int64_t)g_row * n_blocks + b];
+                    d  = per_d [row][sb];
+                    dm = per_dm[row][sb];
+                }
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    const int col = col_4 + s;
+                    if (g_row < M) {
+                        const uint8_t qb = blk_ptr->qs[32 * il + col];
+                        const float val  = parity
+                            ? (d * (qb >> 4)  - dm)
+                            : (d * (qb & 0xF) - dm);
+                        A_tile[row][col] = __float2half(val);
+                    } else {
+                        A_tile[row][col] = __float2half(0.0f);
+                    }
                 }
             }
-            __syncwarp();
+            __syncthreads();
 
             const int k_block_base = b * QK_K + sb * 32;
 
@@ -1560,7 +1578,7 @@ __global__ void gemm_mmq_q4k_kernel(half*             __restrict__ y,
                       "r"(b0), "r"(b1)
                 );
             }
-            __syncwarp();
+            __syncthreads();
         }
     }
 
@@ -1591,22 +1609,25 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
     const int block = rows_per_block * 32;
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
-    // Path E E4b: Q4_K only, default on after #39. Set JLLM_MMQ_Q4K=0
-    // to opt back into the scalar batched Q4_K kernel below. Falls
-    // through to the scalar kernel on any cudaError (mirrors the
-    // Path C fallback after the #29 Q6_K crash). Q5_K / Q6_K continue
-    // through the existing scalar batched kernels.
+    // Path E E5: Q4_K only, default on. Multi-warp cooperative
+    // variant — 4 warps share one dequanted A-tile across 4 N-stripes.
+    // Set JLLM_MMQ_Q4K=0 to opt back into the scalar batched Q4_K
+    // kernel below. Falls through to the scalar kernel on any
+    // cudaError (mirrors the Path C fallback after the #29 Q6_K
+    // crash). Q5_K / Q6_K continue through the existing scalar
+    // batched kernels.
     if (ggml_type == 12 && mmq_q4k_enabled()) {
         static bool announced = false;
         if (!announced) {
             announced = true;
             fprintf(stderr,
                     "[GEMM] Path E MMQ Q4_K tensor-core kernel active "
-                    "(default on; set JLLM_MMQ_Q4K=0 to disable)\n");
+                    "(multi-warp, default on; set JLLM_MMQ_Q4K=0 to "
+                    "disable)\n");
         }
-        dim3 mmq_grid((N + MMQ_Q4K_TILE_N - 1) / MMQ_Q4K_TILE_N,
-                      (M + MMQ_Q4K_TILE_M - 1) / MMQ_Q4K_TILE_M, 1);
-        gemm_mmq_q4k_kernel<<<mmq_grid, 32, 0, stream>>>(
+        dim3 mmq_grid((N + MMQ_Q4K_BLOCK_N - 1) / MMQ_Q4K_BLOCK_N,
+                      (M + MMQ_Q4K_TILE_M  - 1) / MMQ_Q4K_TILE_M,  1);
+        gemm_mmq_q4k_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
             y, (const block_q4_K*)W_device, x, M, N, K);
         cudaError_t err = cudaGetLastError();
         if (err == cudaSuccess) {
