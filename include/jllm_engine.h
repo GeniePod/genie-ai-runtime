@@ -194,6 +194,13 @@ private:
     KVCachePool   kv_cache_;
     ScratchPool   scratch_;
 
+    // Path F (#45): GGUF path + cheap fingerprint, set at load() time.
+    // F3 writes the fingerprint into each KV cache file header; F4
+    // will refuse to hydrate from a cache file whose hash doesn't
+    // match the currently-loaded model.
+    std::string   gguf_path_;
+    char          model_fingerprint_[32] = {};
+
     void*         weights_ = nullptr;
     int64_t       weights_size_ = 0;
     void*         mapped_output_host_base_ = nullptr;

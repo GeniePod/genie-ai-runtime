@@ -12,6 +12,7 @@
 //   #7 — FP32 logit output via host-side conversion after FP16 GEMV
 
 #include "jllm_engine.h"
+#include "../persistence/kv_cache_file.h"
 #include <chrono>
 #include <algorithm>
 #include <cstring>
@@ -794,6 +795,13 @@ static size_t materialize_layer_weights(ModelWeights& mw,
 bool Engine::load(const std::string& gguf_path, const GenParams& params) {
     gen_params_ = params;
     budget_ = probe_system_memory();
+    gguf_path_ = gguf_path;
+
+    // Path F: cheap content fingerprint for KV cache validation. Failure
+    // here is non-fatal — we just don't write/match KV cache files.
+    if (!compute_model_fingerprint(gguf_path, model_fingerprint_)) {
+        std::memset(model_fingerprint_, 0, sizeof(model_fingerprint_));
+    }
 
     config_ = load_gguf_config(gguf_path);
     fprintf(stderr, "[engine] %s: %d layers, %d heads (%d KV), dim=%d, head_dim=%d, vocab=%d, rms_eps=%g, rope=%s\n",
@@ -1711,6 +1719,74 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     if (stats.ttft_ms > 0) {
         fprintf(stderr, "[engine] TTFT (first token): %.0f ms\n", stats.ttft_ms);
     }
+
+    // Path F (#45) F3: save the GPU-resident KV state at turn end if
+    // the caller tagged the request with a valid conversation_id.
+    // F4 will add the corresponding hydrate-on-start hook so the next
+    // turn skips prefill for the matching prefix.
+    //
+    // Skip rules:
+    //   - conv_id empty / invalid → single-shot mode, no save
+    //   - total tokens < MIN_TOKENS_TO_SAVE → trivial request, not
+    //     worth the eMMC write
+    //   - overflow pool was used → fast pool no longer represents the
+    //     full state; v1 deliberately can't recover those conversations
+    if (!params.conversation_id.empty() &&
+        validate_conversation_id(params.conversation_id))
+    {
+        constexpr int MIN_TOKENS_TO_SAVE = 4;
+        const int total_tokens = stats.prompt_tokens + stats.completion_tokens;
+        const auto& kv_cfg = kv_cache_.config();
+        const bool overflow_used = total_tokens > kv_cfg.max_context;
+
+        if (total_tokens < MIN_TOKENS_TO_SAVE) {
+            fprintf(stderr, "[kv_cache] skip save (only %d tokens, "
+                            "min=%d)\n",
+                    total_tokens, MIN_TOKENS_TO_SAVE);
+        } else if (overflow_used) {
+            fprintf(stderr, "[kv_cache] skip save (overflow pool used, "
+                            "v1 fast-pool-only)\n");
+        } else {
+            const std::string dir  = default_kv_cache_dir();
+            const std::string path = path_for_conv_id(dir, params.conversation_id);
+
+            if (!ensure_dir(dir)) {
+                fprintf(stderr, "[kv_cache] skip save (dir unavailable)\n");
+            } else {
+                KVCacheFileHeader hdr{};
+                hdr.magic         = KVCACHE_MAGIC;
+                hdr.version       = KVCACHE_VERSION;
+                hdr.n_layers      = (uint32_t)kv_cfg.n_layers;
+                hdr.n_kv_heads    = (uint32_t)kv_cfg.n_kv_heads;
+                hdr.head_dim      = (uint32_t)kv_cfg.head_dim;
+                hdr.kv_type_bytes = (uint32_t)kv_cfg.kv_type_bytes;
+                hdr.max_context   = (uint32_t)kv_cfg.max_context;
+                hdr.used_tokens   = (uint32_t)total_tokens;
+                hdr.body_bytes    = (uint64_t)kv_cache_.gpu_pool_bytes();
+                std::memcpy(hdr.model_hash, model_fingerprint_,
+                            sizeof(hdr.model_hash));
+
+                auto t_save0 = Clock::now();
+                bool ok = save_kv_to_file(path, hdr,
+                                          kv_cache_.gpu_pool_ptr(),
+                                          (size_t)hdr.body_bytes);
+                auto t_save1 = Clock::now();
+                float save_ms = Ms(t_save1 - t_save0).count();
+                if (ok) {
+                    fprintf(stderr,
+                            "[kv_cache] Saved %lu bytes to %s "
+                            "(%d tokens, %.0f ms)\n",
+                            (unsigned long)hdr.body_bytes, path.c_str(),
+                            total_tokens, save_ms);
+                } else {
+                    fprintf(stderr,
+                            "[kv_cache] Save failed for %s (see prior "
+                            "error)\n", path.c_str());
+                }
+            }
+        }
+    }
+
     return stats;
 }
 

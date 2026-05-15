@@ -132,6 +132,16 @@ public:
     // Reset for new conversation
     void clear();
 
+    // Path F (#45) accessors for serialization of the GPU-resident
+    // fast pool. The overflow CPU pool is intentionally excluded —
+    // conversations that have spilled past the fast pool cap won't
+    // be saved in v1; that's a deliberate scope cut. F5 may revisit.
+    const Config& config()         const { return cfg_; }
+    void*         gpu_pool_ptr()   const { return gpu_pool_; }
+    int64_t       gpu_pool_bytes() const {
+        return (int64_t)cfg_.n_layers * cfg_.max_context * entry_bytes();
+    }
+
 private:
     Config cfg_ = {};
     void*  gpu_pool_ = nullptr;   // cudaMalloc — GPU-visible fast pool

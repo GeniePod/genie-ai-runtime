@@ -79,13 +79,19 @@ set(ENGINE_SRC
     src/engine/tokenizer.cpp
 )
 
+# Path F (#45): persistent KV cache I/O. On-disk format from PR #46;
+# F3 hooks save into Engine::generate() turn-end; F4 will add load.
+set(PERSISTENCE_SRC
+    src/persistence/kv_cache_file.cpp
+)
+
 set(SERVER_SRC
     src/server/http_server.cpp
 )
 
 # ── Library ──────────────────────────────────────────────────────────────
 add_library(jetson_llm_core STATIC
-    ${MEMORY_SRC} ${JETSON_SRC} ${KERNEL_SRC} ${ENGINE_SRC}
+    ${MEMORY_SRC} ${JETSON_SRC} ${KERNEL_SRC} ${ENGINE_SRC} ${PERSISTENCE_SRC}
 )
 target_include_directories(jetson_llm_core PUBLIC include)
 target_link_libraries(jetson_llm_core PUBLIC
