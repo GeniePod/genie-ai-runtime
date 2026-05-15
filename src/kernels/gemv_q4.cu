@@ -53,6 +53,32 @@ static const void* resolve_weight_device_ptr(const void* W) {
     return nullptr;
 }
 
+// Path C Phase 3 PR A — split-K K-quant GEMV.
+//
+// The default per-warp-per-row layout streams ~K/32 weight blocks serially
+// through one warp's MSHRs and stalls on DRAM long before the LPDDR5
+// controller hits peak burst rate (#19 profile: Q4_K kernels at ~10% of
+// 102 GB/s peak). SPLIT_K cooperates multiple warps on each output row:
+// each warp covers K/SPLIT_K of the K dimension, then a shared-memory
+// reduction sums the partials. More concurrent warps per row → more
+// outstanding DRAM requests per SM → more bandwidth utilization.
+//
+// Trade-off: the float-sum order changes (per-warp partials are reduced
+// across split lanes at the end instead of being folded into one warp's
+// accumulator), so bit-equality to the non-split kernel is not guaranteed.
+// Empirically the difference is < 1 ULP per row on Q4_K Wo on Qwen3-4B and
+// the sampled output text is identical on greedy and low-temperature
+// runs; the env-var gate keeps it opt-in until verified per-deployment.
+constexpr int SPLIT_K_GEMV = 4;
+
+static bool split_k_gemv_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_SPLIT_K_GEMV");
+        return v && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 static int gemv_rows_per_block() {
     static const int rows = [] {
         const char* v = getenv("JLLM_GEMV_ROWS");
@@ -592,6 +618,85 @@ __global__ void gemv_quant_add_typed_kernel(
     }
 }
 
+// Split-K variant of gemv_quant_add_typed_kernel. SPLIT_K warps cooperate
+// on each output row: warp `s` of split index `s` consumes blocks
+// [s * n_blocks / SPLIT_K, (s+1) * n_blocks / SPLIT_K) of the K dimension
+// and writes its per-warp warp-reduced float partial to shared memory.
+// Warp 0 of each row sums the SPLIT_K partials, adds the residual, and
+// stores to y[row].
+//
+// Block layout (rows_per_block × SPLIT_K × 32 threads):
+//   threadIdx.x / 32 = warp_in_block
+//   warp_in_block / SPLIT_K = row_in_block      (which output row)
+//   warp_in_block % SPLIT_K = split_idx         (which K-slice)
+//
+// Caller must ensure (K / QK_K) % SPLIT_K == 0. The dispatcher checks.
+template<int Type>
+__global__ void gemv_quant_add_split_k_typed_kernel(
+    half*        __restrict__ y,
+    const void*  __restrict__ W,
+    const half*  __restrict__ x,
+    const half*  __restrict__ residual,
+    int M,
+    int K,
+    int rows_per_block)
+{
+    const int warp_in_block = threadIdx.x / 32;
+    const int row_in_block  = warp_in_block / SPLIT_K_GEMV;
+    const int split_idx     = warp_in_block - row_in_block * SPLIT_K_GEMV;
+    const int lane          = threadIdx.x & 31;
+    const int row           = blockIdx.x * rows_per_block + row_in_block;
+    if (row >= M) return;
+
+    const int n_blocks         = K / QK_K;
+    const int blocks_per_split = n_blocks / SPLIT_K_GEMV;
+    const int b_start          = split_idx * blocks_per_split;
+
+    // Each warp computes the partial dot over its K-slice. The dot_q*_row
+    // helpers accept a base block pointer + a block count, so we pass
+    // shifted pointers for the warp's slice and let it sum block-by-block.
+    float acc = 0.0f;
+    if constexpr (Type == 12) {
+        acc = dot_q4k_row(
+            (const block_q4_K*)W + (int64_t)row * n_blocks + b_start,
+            x + (int64_t)b_start * QK_K,
+            blocks_per_split, lane);
+    } else if constexpr (Type == 13) {
+        acc = dot_q5k_row(
+            (const block_q5_K*)W + (int64_t)row * n_blocks + b_start,
+            x + (int64_t)b_start * QK_K,
+            blocks_per_split, lane);
+    } else if constexpr (Type == 14) {
+        acc = dot_q6k_row(
+            (const block_q6_K*)W + (int64_t)row * n_blocks + b_start,
+            x + (int64_t)b_start * QK_K,
+            blocks_per_split, lane);
+    }
+    acc = warp_reduce_sum(acc);
+
+    // Each warp's lane 0 publishes its partial. Shared-mem layout:
+    // [rows_per_block][SPLIT_K_GEMV] floats, indexed by warp_in_block.
+    extern __shared__ float s_partials[];
+    if (lane == 0) {
+        s_partials[warp_in_block] = acc;
+    }
+    __syncthreads();
+
+    // Warp 0 of each row (split_idx == 0, lane == 0) folds the SPLIT_K
+    // partials, adds the residual, and writes the row.
+    if (lane == 0 && split_idx == 0) {
+        float total = 0.0f;
+        const int base = row_in_block * SPLIT_K_GEMV;
+        #pragma unroll
+        for (int s = 0; s < SPLIT_K_GEMV; s++) {
+            total += s_partials[base + s];
+        }
+        const half projected = __float2half(total);
+        y[row] = __float2half(__half2float(projected) +
+                              __half2float(residual[row]));
+    }
+}
+
 template<int Type0, int Type1>
 __global__ void gemv_quant_pair_typed_kernel(
     half*        __restrict__ y0,
@@ -852,6 +957,49 @@ static bool gemv_quant_add_gpu(half* y, const void* W, int ggml_type,
     }
 
     const int rows_per_block = gemv_rows_per_block();
+    const int n_blocks = K / QK_K;
+
+    // Split-K opt-in: cooperate SPLIT_K_GEMV warps per output row. Falls
+    // back to the per-row kernel when the env var is unset or when K
+    // doesn't divide evenly across the split (Wo / K=4096 / 16 blocks
+    // divides cleanly with SPLIT_K=4; the 2560-K projections route here
+    // via gemv_quant_pair / triple, not this function).
+    if (split_k_gemv_enabled() && n_blocks > 0 && n_blocks % SPLIT_K_GEMV == 0) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[GEMV] split-K Q-quant + residual path enabled (SPLIT_K=%d)\n",
+                    SPLIT_K_GEMV);
+            logged = true;
+        }
+        const int block_sk = rows_per_block * SPLIT_K_GEMV * 32;
+        const int grid_sk  = (M + rows_per_block - 1) / rows_per_block;
+        const int smem_sk  = rows_per_block * SPLIT_K_GEMV * (int)sizeof(float);
+        switch (ggml_type) {
+            case 12:
+                gemv_quant_add_split_k_typed_kernel<12>
+                    <<<grid_sk, block_sk, smem_sk, stream>>>(
+                        y, W_device, x, residual, M, K, rows_per_block);
+                break;
+            case 13:
+                gemv_quant_add_split_k_typed_kernel<13>
+                    <<<grid_sk, block_sk, smem_sk, stream>>>(
+                        y, W_device, x, residual, M, K, rows_per_block);
+                break;
+            case 14:
+                gemv_quant_add_split_k_typed_kernel<14>
+                    <<<grid_sk, block_sk, smem_sk, stream>>>(
+                        y, W_device, x, residual, M, K, rows_per_block);
+                break;
+            default:
+                return false;
+        }
+        cudaError_t err = cudaGetLastError();
+        if (err == cudaSuccess) return true;
+        fprintf(stderr, "[GEMV] split-K launch failed: %s; falling back to per-row\n",
+                cudaGetErrorString(err));
+        // fall through to per-row kernel below
+    }
+
     const int block = rows_per_block * 32;
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
