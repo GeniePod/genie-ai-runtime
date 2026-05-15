@@ -776,6 +776,99 @@ __global__ void gemv_quant_pair_uint32_q4k_kernel(
     }
 }
 
+// Q4_K + Q4_K + Q4_K triple-output uint32 kernel. Used by QKV when all
+// three matrices are Q4_K (some model configs). Same pattern as the
+// pair kernel: warp owns one row of W0/W1/W2 based on row range, all
+// three use dot_q4k_row_uint32.
+__global__ void gemv_quant_triple_uint32_q4k_kernel(
+    half*             __restrict__ y0,
+    const block_q4_K* __restrict__ W0,
+    int M0,
+    half*             __restrict__ y1,
+    const block_q4_K* __restrict__ W1,
+    int M1,
+    half*             __restrict__ y2,
+    const block_q4_K* __restrict__ W2,
+    int M2,
+    const half*       __restrict__ x,
+    int K,
+    int rows_per_block)
+{
+    const int row     = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+    const int total_M = M0 + M1 + M2;
+    if (row >= total_M) return;
+
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_uint32(
+            W0 + (int64_t)row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else if (row < M0 + M1) {
+        const int local_row = row - M0;
+        float acc = dot_q4k_row_uint32(
+            W1 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[local_row] = __float2half(acc);
+    } else {
+        const int local_row = row - M0 - M1;
+        float acc = dot_q4k_row_uint32(
+            W2 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y2[local_row] = __float2half(acc);
+    }
+}
+
+// Q4_K + Q4_K + Q6_K triple-output kernel. This is the Qwen3-4B case
+// (Wq, Wk are Q4_K; Wv is Q6_K). The Q4_K rows take the uint32 path;
+// the Q6_K rows still go through the byte-by-byte dot_q6k_row helper
+// because we haven't written a uint32 variant for Q6_K yet (Q6_K
+// already runs at 30-40% of peak — less room to win, different block
+// layout). The block of 32 rows is heterogeneous: some warps in a
+// block run dot_q4k_row_uint32 and others run dot_q6k_row. That's
+// fine — warps are independent and the lane mapping for each helper
+// is self-contained.
+__global__ void gemv_quant_triple_uint32_q4k_q4k_q6k_kernel(
+    half*             __restrict__ y0,
+    const block_q4_K* __restrict__ W0,
+    int M0,
+    half*             __restrict__ y1,
+    const block_q4_K* __restrict__ W1,
+    int M1,
+    half*             __restrict__ y2,
+    const block_q6_K* __restrict__ W2,
+    int M2,
+    const half*       __restrict__ x,
+    int K,
+    int rows_per_block)
+{
+    const int row     = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+    const int total_M = M0 + M1 + M2;
+    if (row >= total_M) return;
+
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_uint32(
+            W0 + (int64_t)row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else if (row < M0 + M1) {
+        const int local_row = row - M0;
+        float acc = dot_q4k_row_uint32(
+            W1 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[local_row] = __float2half(acc);
+    } else {
+        const int local_row = row - M0 - M1;
+        float acc = dot_q6k_row(
+            W2 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y2[local_row] = __float2half(acc);
+    }
+}
+
 template<int Type0, int Type1, int Type2>
 __global__ void gemv_quant_triple_typed_kernel(
     half*        __restrict__ y0,
@@ -991,6 +1084,37 @@ static bool gemv_quant_triple_gpu(
     const int rows_per_block = gemv_rows_per_block();
     const int block = rows_per_block * 32;
     const int grid = (M0 + M1 + M2 + rows_per_block - 1) / rows_per_block;
+
+    // Q4_K uint32 triple paths — same env-var family as #25 / #26.
+    if (q4k_uint32_loads_enabled() &&
+        type0 == 12 && type1 == 12 && (type2 == 12 || type2 == 14)) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr,
+                    "[GEMV] Q4_K uint32 triple weight-load path enabled (V=%s)\n",
+                    type2 == 14 ? "Q6_K (byte path)" : "Q4_K");
+            logged = true;
+        }
+        if (type2 == 12) {
+            gemv_quant_triple_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
+                y0, (const block_q4_K*)W0_device, M0,
+                y1, (const block_q4_K*)W1_device, M1,
+                y2, (const block_q4_K*)W2_device, M2,
+                x, K, rows_per_block);
+        } else { // type2 == 14
+            gemv_quant_triple_uint32_q4k_q4k_q6k_kernel<<<grid, block, 0, stream>>>(
+                y0, (const block_q4_K*)W0_device, M0,
+                y1, (const block_q4_K*)W1_device, M1,
+                y2, (const block_q6_K*)W2_device, M2,
+                x, K, rows_per_block);
+        }
+        cudaError_t err_uint32 = cudaGetLastError();
+        if (err_uint32 == cudaSuccess) return true;
+        fprintf(stderr,
+                "[GEMV] Q4_K uint32 triple launch failed: %s; falling back\n",
+                cudaGetErrorString(err_uint32));
+        // Fall through to the typed byte-load kernel below.
+    }
 
     if (type0 == 12 && type1 == 12 && type2 == 14) {
         gemv_quant_triple_typed_kernel<12, 12, 14><<<grid, block, 0, stream>>>(
