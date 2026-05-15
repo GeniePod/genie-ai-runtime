@@ -156,3 +156,12 @@ add_test(NAME mmq_q4k_gemm COMMAND test_mmq_q4k_gemm)
 add_executable(test_mmq_q4k_precompute tests/test_mmq_q4k_precompute.cu)
 target_link_libraries(test_mmq_q4k_precompute PRIVATE CUDA::cudart)
 add_test(NAME mmq_q4k_precompute COMMAND test_mmq_q4k_precompute)
+
+# Path E phase E5: multi-warp cooperative MMQ Q4_K kernel. 4 warps per
+# CUDA block share one dequanted 16x32 A-tile across 4 N-stripes. Per
+# the alpha.7 perf doc dequant is ~40 % of kernel time → 4× amortization
+# predicts a 1.43× kernel speedup. Standalone bench mirrors E4's so the
+# GFLOPS numbers are directly comparable.
+add_executable(test_mmq_q4k_multiwarp tests/test_mmq_q4k_multiwarp.cu)
+target_link_libraries(test_mmq_q4k_multiwarp PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_multiwarp COMMAND test_mmq_q4k_multiwarp)
