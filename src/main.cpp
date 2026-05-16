@@ -107,7 +107,7 @@ Args parse_args(int argc, char** argv) {
                 "  --raw      Do not auto-wrap Instruct/Chat models\n"
                 "  --think    Enable Qwen3 thinking output\n"
                 "  --no-think Disable Qwen3 thinking output (default)\n"
-                "  --int8-kv  Use INT8 KV cache (default since alpha.12; saves ~50%\n"
+                "  --int8-kv  Use INT8 KV cache (default since alpha.12; saves ~50%%\n"
                 "             of KV memory; quality drift FP16-ULP-bounded). Path I.\n"
                 "  --fp16-kv  Use FP16 KV cache (opt out of INT8 default).\n"
                 "  --conv-id ID  Path F: persistent-KV conversation id\n"
