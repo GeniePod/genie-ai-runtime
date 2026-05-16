@@ -57,6 +57,28 @@ bool KVCachePool::init(const Config& cfg) {
         }
     }
 
+    // Path I1: per-head INT8 scale storage. Only needed in INT8 mode;
+    // FP16 mode skips this allocation entirely.
+    if (cfg.kv_type_bytes == 1) {
+        const int64_t scales_bytes = kv_scales_bytes();
+        fprintf(stderr,
+                "[kv_cache] Allocating per-head INT8 scales: %ld KB "
+                "(%d layers × 2 K/V × %d ctx × %d kv_heads × 4 B)\n",
+                scales_bytes / 1024,
+                cfg.n_layers, cfg.max_context, cfg.n_kv_heads);
+        cudaError_t serr = cudaMalloc(&kv_scales_, (size_t)scales_bytes);
+        if (serr != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] WARNING: scales cudaMalloc failed (%s); "
+                            "INT8 KV will fall back to FP16 path\n",
+                    cudaGetErrorString(serr));
+            kv_scales_ = nullptr;
+            // Best-effort: don't fail init just because scales didn't fit.
+            // The engine should detect kv_scales_ == nullptr and not enable INT8.
+        } else {
+            cudaMemset(kv_scales_, 0, (size_t)scales_bytes);
+        }
+    }
+
     used_tokens_ = 0;
     gpu_tokens_ = 0;
     return true;
@@ -64,8 +86,9 @@ bool KVCachePool::init(const Config& cfg) {
 
 void KVCachePool::destroy() {
     // cudaFree pairs with cudaMalloc.
-    if (gpu_pool_) { cudaFree(gpu_pool_); gpu_pool_ = nullptr; }
-    if (cpu_pool_) { free(cpu_pool_); cpu_pool_ = nullptr; }
+    if (gpu_pool_)  { cudaFree(gpu_pool_);  gpu_pool_  = nullptr; }
+    if (cpu_pool_)  { free(cpu_pool_);      cpu_pool_  = nullptr; }
+    if (kv_scales_) { cudaFree(kv_scales_); kv_scales_ = nullptr; }   // Path I1
     used_tokens_ = 0;
     gpu_tokens_ = 0;
 }
@@ -227,6 +250,34 @@ bool KVCachePool::scatter_from_host(const void* src, int used_tokens,
     used_tokens_ = used_tokens;
     gpu_tokens_  = used_tokens;
     return true;
+}
+
+// Path I phase I1 (#62): per-head INT8 scale accessors.
+
+int64_t KVCachePool::kv_scales_bytes() const {
+    if (cfg_.kv_type_bytes != 1) return 0;
+    return 2LL * cfg_.n_layers
+              * cfg_.max_context
+              * cfg_.n_kv_heads
+              * (int64_t)sizeof(float);
+}
+
+float* KVCachePool::kv_scale_ptr(int layer, int pos, bool is_value) {
+    if (!kv_scales_) return nullptr;
+    if (cfg_.kv_type_bytes != 1) return nullptr;
+    if (layer < 0 || layer >= cfg_.n_layers) return nullptr;
+    if (pos   < 0 || pos   >= cfg_.max_context) return nullptr;
+
+    // Layout per layer: [K_scales (max_context × n_kv_heads)]
+    //                   [V_scales (max_context × n_kv_heads)]
+    const int64_t per_kv_region = (int64_t)cfg_.max_context * cfg_.n_kv_heads;
+    const int64_t per_layer     = 2 * per_kv_region;
+    const int64_t per_pos       = (int64_t)cfg_.n_kv_heads;
+
+    const int64_t offset_floats = (int64_t)layer * per_layer
+                                + (is_value ? per_kv_region : 0)
+                                + (int64_t)pos * per_pos;
+    return kv_scales_ + offset_floats;
 }
 
 }  // namespace jllm

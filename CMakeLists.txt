@@ -178,3 +178,9 @@ add_test(NAME mmq_q4k_multiwarp COMMAND test_mmq_q4k_multiwarp)
 add_executable(test_kv_serialize tests/test_kv_serialize.cu)
 target_link_libraries(test_kv_serialize PRIVATE CUDA::cudart)
 add_test(NAME kv_serialize COMMAND test_kv_serialize)
+
+# Path I phase I1 (#62): per-head INT8 scale storage in KVCachePool.
+# Allocation + accessor layout test. Engine wiring lands in I2/I3.
+add_executable(test_kv_scale_storage tests/test_kv_scale_storage.cu)
+target_link_libraries(test_kv_scale_storage PRIVATE jetson_llm_core)
+add_test(NAME kv_scale_storage COMMAND test_kv_scale_storage)
