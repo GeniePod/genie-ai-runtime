@@ -111,9 +111,37 @@ if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
     set_property(TARGET jetson-llm PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
+# ── Server-only third-party (issue #5 phase 1) ───────────────────────────
+# cpp-httplib + nlohmann/json — same stack llama.cpp's server uses.
+# Both header-only and MIT-licensed. Pulled at configure time via
+# FetchContent so we don't carry ~50 K lines of vendor code in this
+# repo; cached under build/_deps after first configure (subsequent
+# builds are offline). First-time configure needs network access on
+# the host doing the build.
+include(FetchContent)
+FetchContent_Declare(
+    httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG        v0.15.3
+    GIT_SHALLOW    TRUE
+)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+    GIT_SHALLOW    TRUE
+)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+set(JSON_Install    OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(httplib nlohmann_json)
+
 # ── Server binary ────────────────────────────────────────────────────────
 add_executable(jetson-llm-server src/main_server.cpp ${SERVER_SRC})
-target_link_libraries(jetson-llm-server PRIVATE jetson_llm_core)
+target_link_libraries(jetson-llm-server PRIVATE
+    jetson_llm_core
+    httplib::httplib
+    nlohmann_json::nlohmann_json
+)
 if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
     set_property(TARGET jetson-llm-server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
