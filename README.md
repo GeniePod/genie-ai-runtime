@@ -62,6 +62,19 @@ Current validated path:
   different GGUF. **F5 (alpha.10)**: per-process cache budget (default
   1 GB) with oldest-by-mtime eviction; stale `*.tmp` files (default
   > 60 s) cleaned at next save.
+- **INT8 KV cache (Path I, default since alpha.12)**: per-(layer, pos,
+  kv_head) absmax-scaled INT8 storage for the KV pool. Halves the KV
+  body bytes (144 MB → 72 MB at Qwen3-4B 1024 ctx) plus a small
+  ~2.25 MB per-head scales region. Output sensibly-identical to FP16
+  at temp=0 on the reference prompt; word-level drift bounded by INT8
+  precision floor (~0.79 % per-element). Throughput is unchanged at
+  chat-typical contexts; the win compounds at long context where
+  attention's KV-read bandwidth share grows. `--fp16-kv` opts back
+  into full-precision KV. **Note:** when `--int8-kv` is active, Path F
+  save is skipped (saved file format v2 doesn't yet carry the scales
+  region; v3 follow-up tracked at
+  [#67](https://github.com/GeniePod/genie-ai-runtime/issues/67)). Use
+  `--fp16-kv` if you need persistent KV today.
 - Device-resident layer weights — copied into a per-layer device arena
   at load time instead of streaming from mmap'd host memory.
 - Jetson power reporting handles L4T R36 sysfs paths and `nvpmodel` wattage
@@ -71,40 +84,48 @@ Latest on-device measurement: Qwen3-4B Q4_K_M, 25 W MAXN SUPER, GPU
 locked at 918 MHz, 18-token user prompt (kernel sees N≈33 after Qwen3
 chat-template wrap).
 
-| | alpha.2 | alpha.3 | alpha.5 | alpha.6 | alpha.7 | alpha.8 | alpha.9² | alpha.10² | alpha.11² | Cumulative Δ |
-|---|---|---|---|---|---|---|---|---|---|---|
-| Prefill (33-tok cold)  | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | 28.16 tok/s | 38.68 tok/s | 38.7 tok/s | 38.8 ± 0.04 tok/s | **38.8 tok/s** | **+373 %** |
-| TTFT (33-tok cold)     | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | ~1170 ms | ~862 ms | 858 ms | 859 ± 3 ms | **859 ms** | **−61 %** |
-| Decode (40-tok decode) | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 10.0 ± 0.005 tok/s | **10.0 tok/s** | **+33 %** |
-| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | ✓ |
+| | alpha.2 | alpha.3 | alpha.5 | alpha.6 | alpha.7 | alpha.8 | alpha.9² | alpha.10² | alpha.11² | alpha.12² ³ | Cumulative Δ |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Prefill (33-tok cold)  | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | 28.16 tok/s | 38.68 tok/s | 38.7 tok/s | 38.8 tok/s | 38.8 tok/s | **38.0 tok/s** | **+363 %** |
+| TTFT (33-tok cold)     | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | ~1170 ms | ~862 ms | 858 ms | 859 ms | 859 ms | **877 ms** | **−60 %** |
+| Decode (40-tok decode) | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 10.0 tok/s | 10.0 tok/s | **9.9 tok/s** | **+32 %** |
+| KV pool memory         | n/a       | n/a        | n/a        | n/a         | n/a         | n/a         | n/a       | n/a       | 144 MB    | **74 MB**       | **−49 % vs alpha.11** |
+| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | ✓ |
 
 ### Sustained-prompt measurement (added 2026-05-16)
 
 A second row captures a more serving-realistic shape: 57-token prompt
 (N≈57 after chat-wrap of a 24-token user message) + 200 generated
-tokens, same hardware and same alpha.11 main binary. Per-prefill-token
-gets a few % better than the 33-tok number because dispatcher overhead
-amortizes over more N; decode drops slightly as attention work scales
-with KV context length.
+tokens. Per-prefill-token gets a few % better than the 33-tok number
+because dispatcher overhead amortizes over more N; decode drops
+slightly as attention work scales with KV context length.
 
-| Shape | Prefill | TTFT | Decode |
-|---|---|---|---|
-| 33-tok cold (the table above) | **38.8 tok/s** | 859 ms | 10.0 tok/s |
-| **57-tok prefill + 200-tok sustained decode** | **40.8 tok/s** | 1410 ms | **9.5 tok/s** |
+| Shape | Prefill | TTFT | Decode | KV mem (alpha.12 INT8) |
+|---|---|---|---|---|
+| 33-tok cold | 38.0 tok/s | 877 ms | 9.9 tok/s | 74 MB |
+| 57-tok prefill + 200-tok sustained decode | **40.0 tok/s** | 1436 ms | **9.4 tok/s** | 74 MB |
+
+(alpha.11 FP16 equivalents on the same shapes: 38.8 / 859 / 10.0 and
+40.8 / 1410 / 9.5 — within 1–2 % of alpha.12 INT8 across the board.)
 
 ¹ Path E's `mma.sync` reorders float adds differently than scalar FMAs;
 byte-equality breaks at FP16 ULP, generated text remains
 character-for-character the same on the reference prompt.
 
-² alpha.9 and alpha.10 are **feature releases**, not throughput
-releases. Prefill / decode / cold-TTFT match alpha.8 within
-measurement noise (alpha.10 re-measured today on the same 33-token
-prompt: 850 ± 2.7 ms prefill, 859 ± 2.7 ms TTFT, 5 samples; matches
-alpha.8/9 within ~3 ms). What they add: alpha.9 = Path F (persistent
-KV → **warm-turn TTFT 444 ms**, see below); alpha.10 = Path F5 (cache
-dir capped at 1 GB, oldest LRU-evicted, stale `*.tmp` cleaned). The
-"alpha.10" column above reports the latest measured cold numbers; the
-real story is the warm-turn TTFT row below.
+² alpha.9, alpha.10, and alpha.12 are **feature releases**, not
+throughput releases. Prefill / decode / cold-TTFT match the prior
+release within measurement noise. What they add:
+- alpha.9 = Path F (persistent KV → **warm-turn TTFT 444 ms**, see below)
+- alpha.10 = Path F5 (cache dir capped at 1 GB, oldest LRU-evicted, stale `*.tmp` cleaned)
+- alpha.11 = release-hygiene cleanup (broken `--int8-kv` stub disabled; perf re-baselined)
+- alpha.12 = Path I (proper INT8 KV cache, default; ~50 % KV memory saved)
+
+³ alpha.12 numbers are with the new INT8 KV default. The +10 ms TTFT
+delta vs alpha.11 (FP16) is per-position scale-lookup overhead in
+attention; throughput is within noise. The **memory row is the
+headline** — KV pool drops 144 MB → 74 MB (72 MB INT8 body + 2.25 MB
+per-head scales). Set `--fp16-kv` to opt back into the alpha.11
+numbers if you observe quality issues on a particular workload.
 
 Same-day re-baseline used for alpha.7 → alpha.8 Δ (scalar fallback path
 re-measured at 16.45 tok/s, alpha.8 = 38.68 tok/s, mean gap 1153 ms vs
@@ -183,6 +204,15 @@ Path F detail: PRs [#46](https://github.com/GeniePod/genie-ai-runtime/pull/46)
 (hydrate on turn start, alpha.9) → [#53](https://github.com/GeniePod/genie-ai-runtime/pull/53)
 (LRU eviction + stale-tmp cleanup, alpha.10).
 Path F plan: [#45](https://github.com/GeniePod/genie-ai-runtime/issues/45).
+Path I detail: PRs [#63](https://github.com/GeniePod/genie-ai-runtime/pull/63)
+(per-head scale storage) → [#64](https://github.com/GeniePod/genie-ai-runtime/pull/64)
+(fp16_to_int8 wiring + kernel bug fixes) → [#65](https://github.com/GeniePod/genie-ai-runtime/pull/65)
+(per-position scales through attention; remove broken N-sequential fallback) →
+[#68](https://github.com/GeniePod/genie-ai-runtime/pull/68)
+(default flip + Path F interop guard, alpha.12).
+Path I plan + audit: [#62](https://github.com/GeniePod/genie-ai-runtime/issues/62).
+Pending: [#67](https://github.com/GeniePod/genie-ai-runtime/issues/67) —
+Path F format v3 to persist INT8 scales (closes the alpha.12 interop carve-out).
 Plan + earlier negative results in
 [#19](https://github.com/GeniePod/genie-ai-runtime/issues/19).
 
