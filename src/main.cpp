@@ -7,6 +7,7 @@
 #include <string>
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <signal.h>
 #include <unistd.h>
 
@@ -194,10 +195,16 @@ int main(int argc, char** argv) {
     }
 
     fprintf(stderr, "Loading model...\n");
+    auto t_load0 = std::chrono::steady_clock::now();
     if (!engine.load(args.model_path, params)) {
         fprintf(stderr, "Failed to load model.\n");
         return 1;
     }
+    double load_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_load0).count();
+    double mbps = load_ms > 0 ? (file_size_mb * 1000.0) / load_ms : 0.0;
+    fprintf(stderr, "[engine] Model loaded in %.0f ms (%.0f MB/s)\n",
+            load_ms, mbps);
 
     auto cfg = engine.config();
     fprintf(stderr, "Model: %s (%d layers, %d heads, %d KV heads, %d dim)\n",
