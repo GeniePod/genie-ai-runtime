@@ -38,7 +38,9 @@ __global__ void flash_attention_decode_kernel(
     const void*  __restrict__ k_cache,
     const void*  __restrict__ v_cache,
     int n_heads, int n_kv_heads, int head_dim, int seq_len,
-    float scale, bool kv_int8, const float* kv_scales)
+    float scale, bool kv_int8,
+    const float* __restrict__ k_scales,   // Path I3: [seq_len, n_kv_heads]
+    const float* __restrict__ v_scales)
 {
     const int head = blockIdx.x;
     const int kv_head = head / (n_heads / n_kv_heads);  // GQA
@@ -80,7 +82,8 @@ __global__ void flash_attention_decode_kernel(
                 float k_val;
                 if (kv_int8) {
                     const int8_t* ki = (const int8_t*)k_cache;
-                    float ks = kv_scales ? kv_scales[kv_head] : 1.0f;
+                    // Path I3: per-position scale lookup.
+                    float ks = k_scales ? k_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
                     k_val = ki[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * ks;
                 } else {
                     const half* kf = (const half*)k_cache;
@@ -133,7 +136,8 @@ __global__ void flash_attention_decode_kernel(
                 float v_val;
                 if (kv_int8) {
                     const int8_t* vi = (const int8_t*)v_cache;
-                    float vs = kv_scales ? kv_scales[n_kv_heads + kv_head] : 1.0f;
+                    // Path I3: per-position scale lookup.
+                    float vs = v_scales ? v_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
                     v_val = vi[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * vs;
                 } else {
                     const half* vf = (const half*)v_cache;
@@ -166,7 +170,9 @@ __global__ void flash_attention_prefill_batched_kernel(
     const void*  __restrict__ v_cache,
     int n_heads, int n_kv_heads, int head_dim,
     int start_pos,
-    float scale, bool kv_int8, const float* kv_scales)
+    float scale, bool kv_int8,
+    const float* __restrict__ k_scales,   // Path I3
+    const float* __restrict__ v_scales)
 {
     const int head    = blockIdx.x;
     const int token   = blockIdx.y;
@@ -208,7 +214,7 @@ __global__ void flash_attention_prefill_batched_kernel(
                 float k_val;
                 if (kv_int8) {
                     const int8_t* ki = (const int8_t*)k_cache;
-                    float ks = kv_scales ? kv_scales[kv_head] : 1.0f;
+                    float ks = k_scales ? k_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
                     k_val = ki[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * ks;
                 } else {
                     const half* kf = (const half*)k_cache;
@@ -255,7 +261,7 @@ __global__ void flash_attention_prefill_batched_kernel(
                 float v_val;
                 if (kv_int8) {
                     const int8_t* vi = (const int8_t*)v_cache;
-                    float vs = kv_scales ? kv_scales[n_kv_heads + kv_head] : 1.0f;
+                    float vs = v_scales ? v_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
                     v_val = vi[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * vs;
                 } else {
                     const half* vf = (const half*)v_cache;
@@ -279,13 +285,14 @@ void flash_attention_prefill_batched(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim,
     int N, int start_pos,
-    float scale, bool kv_int8, const float* kv_scales, cudaStream_t stream)
+    float scale, bool kv_int8,
+    const float* k_scales, const float* v_scales, cudaStream_t stream)
 {
     if (N <= 0) return;
-    if (!fast_attention_enabled() || kv_int8) {
-        // No CUDA fast path for INT8 KV in the per-token kernel either —
-        // fall back to N sequential flash_attention_decode calls, which
-        // already have a CPU-reference fallback for INT8.
+    // Path I3 (#62): removed the `kv_int8 → N-sequential-decode` fallback
+    // that lived here. The batched kernel now handles INT8 via per-position
+    // k_scales / v_scales lookups; no reason to walk per-token anymore.
+    if (!fast_attention_enabled()) {
         const int q_dim = n_heads * head_dim;
         for (int t = 0; t < N; t++) {
             flash_attention_decode(
@@ -293,7 +300,7 @@ void flash_attention_prefill_batched(
                 q      + (int64_t)t * q_dim,
                 k_cache, v_cache,
                 n_heads, n_kv_heads, head_dim,
-                start_pos + t + 1, scale, kv_int8, kv_scales, stream);
+                start_pos + t + 1, scale, kv_int8, k_scales, v_scales, stream);
         }
         return;
     }
@@ -308,7 +315,7 @@ void flash_attention_prefill_batched(
     const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
     flash_attention_prefill_batched_kernel<<<grid, ATTN_BLOCK, smem, stream>>>(
         output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
-        start_pos, scale, kv_int8, kv_scales);
+        start_pos, scale, kv_int8, k_scales, v_scales);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -321,7 +328,7 @@ void flash_attention_prefill_batched(
                 q      + (int64_t)t * q_dim,
                 k_cache, v_cache,
                 n_heads, n_kv_heads, head_dim,
-                start_pos + t + 1, scale, kv_int8, kv_scales, stream);
+                start_pos + t + 1, scale, kv_int8, k_scales, v_scales, stream);
         }
     }
 }
@@ -329,7 +336,8 @@ void flash_attention_prefill_batched(
 void flash_attention_decode(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int seq_len,
-    float scale, bool kv_int8, const float* kv_scales, cudaStream_t stream)
+    float scale, bool kv_int8,
+    const float* k_scales, const float* v_scales, cudaStream_t stream)
 {
     if (fast_attention_enabled()) {
         static bool logged = false;
@@ -341,7 +349,7 @@ void flash_attention_decode(
         const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
         flash_attention_decode_kernel<<<n_heads, ATTN_BLOCK, smem, stream>>>(
             output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
-            seq_len, scale, kv_int8, kv_scales);
+            seq_len, scale, kv_int8, k_scales, v_scales);
 
         cudaError_t err = cudaGetLastError();
         if (err == cudaSuccess) {

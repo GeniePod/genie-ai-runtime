@@ -245,7 +245,11 @@ void flash_attention_decode(
     int            seq_len,    // current sequence length
     float          scale,      // 1/sqrt(head_dim)
     bool           kv_int8,    // true = INT8 KV cache
-    const float*   kv_scales,  // per-head scales if kv_int8 (else nullptr)
+    // Path I3 (#62): per-(pos, kv_head) scales — indexed as
+    // k_scales[kv_pos × n_kv_heads + kv_head] and similarly for v.
+    // nullptr in FP16 mode. Captured by KVCachePool::kv_scale_ptr(layer, ...).
+    const float*   k_scales,
+    const float*   v_scales,
     cudaStream_t   stream
 );
 
@@ -271,7 +275,10 @@ void flash_attention_prefill_batched(
     int            start_pos,  // absolute position of token 0 in the cache
     float          scale,
     bool           kv_int8,
-    const float*   kv_scales,
+    // Path I3 (#62): per-(pos, kv_head) layer scale regions; see decode
+    // signature above. nullptr in FP16 mode.
+    const float*   k_scales,
+    const float*   v_scales,
     cudaStream_t   stream
 );
 

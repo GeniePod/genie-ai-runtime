@@ -1080,10 +1080,15 @@ void Engine::transformer_layer_attn_compute(int layer, int pos,
     }
 
     float scale = 1.0f / sqrtf((float)config_.head_dim);
+    // Path I3 (#62): per-(pos, kv_head) scale regions for the current
+    // layer. nullptr in FP16 mode (matches the kernel's null-check).
+    float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, /*is_value=*/false) : nullptr;
+    float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, /*is_value=*/true)  : nullptr;
     flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(layer, 0),
                           kv_cache_.val_ptr(layer, 0),
                           config_.n_heads, config_.n_kv_heads, config_.head_dim,
-                          pos + 1, scale, gen_params_.kv_int8, nullptr, stream_);
+                          pos + 1, scale, gen_params_.kv_int8,
+                          k_scales, v_scales, stream_);
 }
 
 void Engine::transformer_layer_attn_block(int layer, int pos, half* x_in,
@@ -1219,12 +1224,15 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
     // ── Batched attention (NEW in PR #17): all N queries in one launch ──
     {
         const float scale = 1.0f / sqrtf((float)config_.head_dim);
+        // Path I3 (#62): per-(pos, kv_head) scale regions for the layer.
+        float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, /*is_value=*/false) : nullptr;
+        float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, /*is_value=*/true)  : nullptr;
         flash_attention_prefill_batched(
             attn_out_batch, q_batch,
             kv_cache_.key_ptr(layer, 0), kv_cache_.val_ptr(layer, 0),
             config_.n_heads, config_.n_kv_heads, config_.head_dim,
             N, start_pos, scale,
-            gen_params_.kv_int8, nullptr, stream_);
+            gen_params_.kv_int8, k_scales, v_scales, stream_);
     }
 
     // ── Batched Wo + batched residual #1 (NEW in PR #16) ──────────────
