@@ -292,8 +292,21 @@ cmake --build build -j$(nproc)
 
 Outputs:
 - `build/jetson-llm` — single-prompt / interactive CLI
-- `build/jetson-llm-server` — HTTP server (drop-in replacement target for
-  `llama-server`)
+
+The standalone HTTP server (`jetson-llm-server`) is **opt-in** —
+genie-ai-runtime ships as an embeddable engine and the web layer lives
+in [`genie-claw`](https://github.com/GeniePod/genie-claw), which links
+`jetson_llm_core` directly. To build the server target as well (for
+standalone REST deployments or A/B testing against `llama-server`):
+
+```
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DJLLM_BUILD_SERVER=ON
+cmake --build build -j$(nproc)
+```
+
+That additionally pulls `cpp-httplib` + `nlohmann/json` via CMake
+FetchContent on first configure (cached for subsequent builds), and
+produces `build/jetson-llm-server`.
 
 ## Run
 
@@ -349,11 +362,16 @@ Sure! To turn on the camera, follow these steps depending on your device:
 > quit
 ```
 
-### Server (HTTP, OpenAI-compatible)
+### Server (HTTP, OpenAI-compatible) — opt-in
 
 ```
+# Build with -DJLLM_BUILD_SERVER=ON first; see Build section above.
 ./build/jetson-llm-server -m /path/to/model.gguf -p 8080
 ```
+
+genie-claw is the intended consumer and links `jetson_llm_core`
+directly, so the server is **not** built by default. Reach for it when
+running standalone REST or A/B-testing against `llama-server`.
 
 ### Flag reference
 

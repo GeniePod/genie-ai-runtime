@@ -111,39 +111,54 @@ if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
     set_property(TARGET jetson-llm PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-# ── Server-only third-party (issue #5 phase 1) ───────────────────────────
-# cpp-httplib + nlohmann/json — same stack llama.cpp's server uses.
-# Both header-only and MIT-licensed. Pulled at configure time via
-# FetchContent so we don't carry ~50 K lines of vendor code in this
-# repo; cached under build/_deps after first configure (subsequent
-# builds are offline). First-time configure needs network access on
-# the host doing the build.
-include(FetchContent)
-FetchContent_Declare(
-    httplib
-    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
-    GIT_TAG        v0.15.3
-    GIT_SHALLOW    TRUE
-)
-FetchContent_Declare(
-    nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        v3.11.3
-    GIT_SHALLOW    TRUE
-)
-set(JSON_BuildTests OFF CACHE INTERNAL "")
-set(JSON_Install    OFF CACHE INTERNAL "")
-FetchContent_MakeAvailable(httplib nlohmann_json)
+# ── Optional server binary ───────────────────────────────────────────────
+# The standalone HTTP server is OFF by default. genie-ai-runtime ships as
+# an embeddable engine (jetson_llm_core + the CLI); the web/HTTP layer
+# lives in genie-claw, which links jetson_llm_core directly. Enable with
+# -DJLLM_BUILD_SERVER=ON for standalone REST deployments or A/B testing
+# against llama-server. Skipping it also skips the FetchContent network
+# pull, so the default build is offline once dependencies are vendored
+# by JetPack / apt.
+option(JLLM_BUILD_SERVER
+    "Build the standalone jetson-llm-server REST binary (default OFF — genie-claw embeds the engine directly; turn ON for standalone HTTP)"
+    OFF)
 
-# ── Server binary ────────────────────────────────────────────────────────
-add_executable(jetson-llm-server src/main_server.cpp ${SERVER_SRC})
-target_link_libraries(jetson-llm-server PRIVATE
-    jetson_llm_core
-    httplib::httplib
-    nlohmann_json::nlohmann_json
-)
-if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
-    set_property(TARGET jetson-llm-server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+if(JLLM_BUILD_SERVER)
+    # cpp-httplib + nlohmann/json — same stack llama.cpp's server uses.
+    # Both header-only and MIT-licensed. Pulled at configure time via
+    # FetchContent so we don't carry ~50 K lines of vendor code in this
+    # repo; cached under build/_deps after first configure (subsequent
+    # builds are offline). First-time configure needs network access on
+    # the host doing the build.
+    include(FetchContent)
+    FetchContent_Declare(
+        httplib
+        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+        GIT_TAG        v0.15.3
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.11.3
+        GIT_SHALLOW    TRUE
+    )
+    set(JSON_BuildTests OFF CACHE INTERNAL "")
+    set(JSON_Install    OFF CACHE INTERNAL "")
+    FetchContent_MakeAvailable(httplib nlohmann_json)
+
+    add_executable(jetson-llm-server src/main_server.cpp ${SERVER_SRC})
+    target_link_libraries(jetson-llm-server PRIVATE
+        jetson_llm_core
+        httplib::httplib
+        nlohmann_json::nlohmann_json
+    )
+    if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
+        set_property(TARGET jetson-llm-server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+    message(STATUS "jetson-llm-server: ENABLED (cpp-httplib + nlohmann/json via FetchContent)")
+else()
+    message(STATUS "jetson-llm-server: disabled (pass -DJLLM_BUILD_SERVER=ON to enable)")
 endif()
 
 # ── Tests ────────────────────────────────────────────────────────────────
