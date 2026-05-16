@@ -1,0 +1,51 @@
+[Unit]
+Description=jetson-llm-server — Jetson Orin LLM HTTP server (genie-ai-runtime)
+Documentation=https://github.com/GeniePod/genie-ai-runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# scripts/setup.sh rewrites `User=` to whoever ran the installer
+# (typically the JetPack login user, which is already in video/render).
+# A dedicated `jetson-llm` user works too as long as it's added to
+# the video + render groups before first start.
+User=aihpc
+
+# Settings live in an env file so MODEL_PATH / PORT changes don't
+# need to touch the unit. See /etc/jetson-llm/server.env.
+EnvironmentFile=/etc/jetson-llm/server.env
+
+# Fail fast if the model path is wrong — beats a 30-second cold-load
+# crash on every restart attempt.
+ExecStartPre=/bin/sh -c 'test -r "$MODEL_PATH" || { echo "MODEL_PATH=$MODEL_PATH is not readable"; exit 1; }'
+ExecStart=/opt/jetson-llm/bin/jetson-llm-server -m ${MODEL_PATH} -p ${PORT}
+
+# Restart on crash, but don't flap when the model file is gone.
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+# Cold load on a fresh boot is NVMe-bound — ~30 s for a 2.4 GB Qwen3-4B
+# at 79 MB/s on this hardware. Generous timeout avoids spurious failures.
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# CUDA pinned memory + large mmap of the GGUF file.
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+# Engine catches SIGTERM and stops generation cleanly.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Sandbox what we can without breaking CUDA. ProtectSystem=strict
+# blocks /dev/nvgpu* and the Tegra ioctl paths the driver needs —
+# leave system writes unrestricted on Jetson.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

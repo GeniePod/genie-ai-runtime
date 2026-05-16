@@ -1,169 +1,252 @@
 # HTTP Server
 
-## Overview
+OpenAI-compatible REST API for the genie-ai-runtime inference engine.
+Built on [cpp-httplib](https://github.com/yhirose/cpp-httplib) and
+[nlohmann/json](https://github.com/nlohmann/json) (the same building
+blocks llama.cpp's server uses), pulled at configure time via CMake
+`FetchContent`. Single Engine instance, mutex-guarded `generate()` so
+concurrent requests queue rather than corrupt KV state.
 
-OpenAI-compatible REST API using raw POSIX sockets — no external dependencies. Sequential request handling (one inference at a time, appropriate for single-GPU Jetson).
+> **Opt-in build.** genie-ai-runtime ships as an embeddable engine.
+> Build the standalone server with `-DJLLM_BUILD_SERVER=ON`:
+>
+> ```bash
+> cmake -B build -DCMAKE_BUILD_TYPE=Release -DJLLM_BUILD_SERVER=ON
+> cmake --build build -j$(nproc)
+> ```
+>
+> genie-claw consumes the engine via direct library link
+> (`jetson_llm_core.a`); the server is for standalone REST deployments
+> and A/B testing against `llama-server`.
 
-### Source: `src/server/http_server.cpp`, `src/main_server.cpp`
+Source: `src/main_server.cpp`, `src/server/http_server.cpp`.
 
-## Starting the Server
+## Run
 
 ```bash
-./build/jetson-llm-server -m models/model.gguf -p 8080
-
-# Options:
-#   -m PATH      GGUF model (required)
-#   -p PORT      HTTP port (default: 8080)
-#   -c INT       Context length (0 = auto)
-#   --fp16-kv    Use FP16 KV cache (default: INT8)
+./build/jetson-llm-server -m /path/to/model.gguf -p 8080
 ```
+
+| Flag           | Default | Notes |
+| -------------- | ------- | ----- |
+| `-m PATH`      | —       | GGUF model file (required) |
+| `-p PORT`      | 8080    | HTTP port |
+| `-c INT`       | auto    | Context length (0 = auto from memory budget) |
+| `--int8-kv`    | off     | Use INT8 KV cache. Server defaults to FP16 so Path F persistent KV save/load works — see [#67](https://github.com/GeniePod/genie-ai-runtime/issues/67) for the v3 format that will unify the two. |
+| `--fp16-kv`    | on      | FP16 KV (default for the server) |
 
 ## Endpoints
 
-### GET /health
+### `GET /health`
 
-Returns Jetson-specific system health.
+Jetson-specific snapshot (memory, thermal, power, GPU util).
 
 ```bash
-curl http://jetson:8080/health
+curl -s http://jetson:8080/health
 ```
 
-Response:
 ```json
 {
   "status": "ok",
-  "model": "TinyLlama-1.1B-Chat-v1.0",
-  "memory": {
-    "total_mb": 7633,
-    "free_mb": 4200,
-    "model_mb": 669,
-    "kv_mb": 45
-  },
-  "thermal": {
-    "gpu_c": 48.5,
-    "cpu_c": 47.0,
-    "throttling": false
-  },
-  "power": {
-    "mode": "25W",
-    "gpu_mhz": 1300
-  },
-  "gpu_util_pct": 75
+  "model": "Qwen3 4B Instruct Awq",
+  "memory":  {"total_mb": 7619, "free_mb": 1730, "model_mb": 2685, "kv_mb": 576},
+  "thermal": {"gpu_c": 58.5, "cpu_c": 56.0, "throttling": false},
+  "power":   {"watts": 25, "gpu_mhz": 918, "gpu_max_mhz": 918},
+  "gpu_util_pct": 72
 }
 ```
 
-### GET /v1/models
+### `GET /v1/models`
 
-Lists loaded model (OpenAI-compatible).
-
-```bash
-curl http://jetson:8080/v1/models
-```
-
-Response:
-```json
-{
-  "data": [
-    {
-      "id": "TinyLlama-1.1B-Chat-v1.0",
-      "object": "model"
-    }
-  ]
-}
-```
-
-### POST /v1/chat/completions
-
-OpenAI-compatible chat completion.
+OpenAI-compatible model list (always one entry — the loaded model).
 
 ```bash
-curl http://jetson:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "What is 2+2?"}
-    ],
-    "max_tokens": 64
-  }'
+curl -s http://jetson:8080/v1/models
 ```
 
-Response:
+```json
+{"object": "list",
+ "data":   [{"id": "Qwen3 4B Instruct Awq", "object": "model", "owned_by": "genie-ai-runtime"}]}
+```
+
+### `POST /v1/chat/completions`
+
+OpenAI-compatible chat. Walks the full `messages[]` array through the
+Qwen chat template; the rolling context determines the answer.
+
+**Request body fields:**
+
+| Field             | Type   | Default | Notes |
+| ----------------- | ------ | ------- | ----- |
+| `messages`        | array  | —       | Non-empty `[{role, content}]` (`role` ∈ `system` / `user` / `assistant`) |
+| `max_tokens`      | int    | 256     | Generation cap; engine still stops on EOS |
+| `temperature`     | float  | 0.7     | Sampling temperature |
+| `top_k`           | int    | 40      | Top-k sampling |
+| `top_p`           | float  | 0.9     | Top-p (nucleus) sampling |
+| `stream`          | bool   | false   | Emit `text/event-stream` chunks instead of one JSON body |
+| `think`           | bool   | false   | Allow Qwen3 thinking-mode output (`<think>...</think>` block) |
+| `conversation_id` | string | —       | Path F persistent KV id (`[A-Za-z0-9_-]{1,64}`); only effective under FP16 KV today |
+| `kv_int8`         | bool   | (load)  | Override KV format per-request. Defaults to whatever the server was loaded with; mismatch with load-time format produces garbage tokens. Don't surface to clients today — see [#67](https://github.com/GeniePod/genie-ai-runtime/issues/67). |
+
+**Non-streaming response** (typical):
+
+```bash
+curl -s http://jetson:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 2+2?"}],
+       "max_tokens":40}'
+```
+
 ```json
 {
-  "id": "jllm-1712345678",
+  "id": "jllm-1778916536",
   "object": "chat.completion",
-  "model": "TinyLlama-1.1B-Chat-v1.0",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": "2+2 equals 4."
-      },
-      "finish_reason": "stop"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 5,
-    "completion_tokens": 8,
-    "total_tokens": 13
-  },
+  "created": 1778916536,
+  "model": "Qwen3 4B Instruct Awq",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "2 + 2 equals 4."},
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 17, "completion_tokens": 7, "total_tokens": 24},
   "jetson": {
-    "decode_tok_s": 28.4,
-    "peak_mem_mb": 1823,
-    "peak_temp_c": 48.2
+    "decode_tok_s": 11.6, "prompt_tok_s": 37.6, "ttft_ms": 914,
+    "peak_mem_mb": 0, "peak_temp_c": 0.0
   }
 }
 ```
 
-Note: the `jetson` field is a non-standard extension with Jetson-specific performance metrics.
+The `jetson` block is a non-standard extension with Jetson-specific
+perf metrics. (`peak_mem_mb` / `peak_temp_c` currently report 0 on the
+server path — the decode-side live-stats watcher used by the CLI isn't
+attached yet. Cosmetic; tracked separately.)
 
-## Client Examples
+**Streaming** — set `"stream": true` and read `text/event-stream`:
 
-### Python
+```bash
+curl -N -s http://jetson:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"count to five"}],
+       "max_tokens":40, "stream":true}'
+```
+
+```
+data: {"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}],
+       "id":"jllm-...","object":"chat.completion.chunk","model":"..."}
+
+data: {"choices":[{"index":0,"delta":{"content":"1"},"finish_reason":null}], ...}
+data: {"choices":[{"index":0,"delta":{"content":", "},"finish_reason":null}], ...}
+data: {"choices":[{"index":0,"delta":{"content":"2"},"finish_reason":null}], ...}
+...
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}], ...}
+
+data: [DONE]
+```
+
+OpenAI-shape `chat.completion.chunk` envelopes — clients written
+against OpenAI's stream protocol work as-is.
+
+### Errors
+
+```json
+{"error": {"message": "messages: non-empty array required",
+           "type": "invalid_request_error", "code": 400}}
+```
+
+- `400 invalid_request_error` — malformed JSON or empty `messages`
+- `501 not_implemented` — reserved (no current 501 paths)
+
+## Client examples
+
+### Python — `requests` (non-streaming)
 
 ```python
 import requests
 
 r = requests.post("http://jetson:8080/v1/chat/completions", json={
     "messages": [{"role": "user", "content": "Hello"}],
-    "max_tokens": 64
+    "max_tokens": 64,
 })
 print(r.json()["choices"][0]["message"]["content"])
 ```
 
-### OpenAI SDK (compatible)
+### Python — `openai` SDK (streaming)
 
 ```python
 from openai import OpenAI
-
-client = OpenAI(base_url="http://jetson:8080/v1", api_key="unused")
-response = client.chat.completions.create(
-    model="tinyllama",
-    messages=[{"role": "user", "content": "Hello"}],
-    max_tokens=64
-)
-print(response.choices[0].message.content)
+c = OpenAI(base_url="http://jetson:8080/v1", api_key="unused")
+for ev in c.chat.completions.create(
+    model="qwen3-4b",
+    messages=[{"role": "user", "content": "count to 5"}],
+    max_tokens=40, stream=True,
+):
+    print(ev.choices[0].delta.content or "", end="", flush=True)
+print()
 ```
 
-### curl (monitoring)
+### curl — `/health` monitoring
 
 ```bash
-# Health check every 5 seconds
 watch -n5 'curl -s http://jetson:8080/health | python3 -m json.tool'
 ```
 
-## Implementation Notes
+## Running as a systemd service
 
-- **Single-threaded request handling** — one inference at a time. Jetson has one GPU; concurrent inference would compete for memory and bandwidth.
-- **Raw POSIX sockets** — no external HTTP library dependency. Handles the happy path for OpenAI-compatible clients.
-- **JSON output** — hand-built with `snprintf` (no JSON library dependency). Strings are escaped for quotes, backslashes, and control characters.
-- **CORS headers** — `Access-Control-Allow-Origin: *` enabled for browser clients.
-- **Sequential** — `accept()` → `handle_client()` → `close()` → `accept()`. No threading.
+Quick install after a successful `-DJLLM_BUILD_SERVER=ON` build:
 
-## Future Enhancements
+```bash
+sudo ./scripts/setup.sh
+# optional flags: --user pat --model /path.gguf --port 8080
+sudo systemctl enable --now jetson-llm-server
+sudo journalctl -u jetson-llm-server -f
+```
 
-- Streaming SSE (Server-Sent Events) for token-by-token output
-- Request timeout handling
-- Connection keep-alive
-- Request queue with busy response (503) when already inferring
+What it installs:
+
+| Path                                             | Notes |
+| ------------------------------------------------ | ----- |
+| `/opt/jetson-llm/bin/jetson-llm-server`          | The binary |
+| `/etc/systemd/system/jetson-llm-server.service`  | Unit (templated `User=`) |
+| `/etc/jetson-llm/server.env`                     | `MODEL_PATH`, `PORT` — edit + `systemctl restart` |
+
+Unit highlights:
+
+- `Restart=on-failure` with a 3-restart / 120 s burst cap (no flap when the model file is missing).
+- `TimeoutStartSec=120` — cold load is NVMe-bound (~30 s for a 2.4 GB GGUF on a fresh boot pagecache).
+- `LimitMEMLOCK=infinity` — CUDA pinned memory + large model mmap.
+- `KillSignal=SIGTERM` — the engine catches it and stops generation cleanly.
+- **No `ProtectSystem=strict`** — `/dev/nvgpu*` + Tegra ioctls would be blocked. `NoNewPrivileges=true` and `PrivateTmp=true` are on.
+- `User=` is rewritten by `setup.sh` to whoever ran the installer (`SUDO_USER` if available, else `id -un`).
+
+## Implementation notes
+
+- **One Engine, mutex-guarded `generate()`.** cpp-httplib runs handlers
+  on its worker-thread pool, so racing requests serialize at the
+  engine boundary — concurrent inference would corrupt the KV pool.
+  The mutex is taken inside the SSE chunked-content-provider lambda so
+  response headers + first chunk hit the wire before we block.
+
+- **Client-disconnect cancels generation.** `sink.write` returns false
+  on EOF; the streaming `token_cb` calls `engine.stop()` so the decode
+  loop exits at its next checkpoint instead of running to `max_tokens`
+  for a request nobody's reading.
+
+- **EOS marker filtered out.** The engine fires
+  `token_cb(text="<|im_end|>", is_eos=true)` for the EOS special
+  token; the callback drops it so user-visible content stops at the
+  last real token. The `finish_reason: "stop"` chunk conveys EOS.
+
+- **Timeouts** bumped from cpp-httplib's 5 s/5 s defaults to 30 s read
+  / 600 s write — long completions need it. LAN-only deployment so
+  slow-loris isn't in scope.
+
+## Roadmap
+
+- **#67** — Path F format v3, so INT8 KV + persistent KV interop.
+- **#5** acceptance items remaining: parallel-A/B vs `llama-server` once
+  systemd unit is verified under load (not on the genie-claw critical
+  path since the embedding API is the consumer that matters).
+- Streaming `usage` block (OpenAI added it to their stream protocol
+  recently) — easy add when a consumer needs it.
+- `peak_mem_mb` / `peak_temp_c` on the server path — attach the
+  decode-side live-stats watcher the CLI uses.
