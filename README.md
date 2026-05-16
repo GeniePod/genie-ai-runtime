@@ -97,6 +97,36 @@ scalar at ~62 ms / token). Generated text remains coherent at every
 length. See [`docs/performance.md`](docs/performance.md) for the
 detailed scaling table.
 
+### TTFT — cold vs warm
+
+Cold-turn TTFT is bounded by prefill physics: `TTFT ≈ N × ms/prefill-token
++ ~15 ms`. alpha.10's `ms/prefill-token` is ~27 ms (vs alpha.2's ~80 ms),
+so cold TTFT has dropped by ~65 % at every prompt length. It still
+*scales* linearly with N, though:
+
+| Prompt | Kernel N | Cold TTFT |
+|---|---|---|
+| Short (`"Write a one-sentence summary..."`)            | 33   | ~860 ms |
+| Medium (`"Explain in one short paragraph..."`)         | 45   | ~1250 ms |
+| Medium-long (`"Explain the difference between..."`)    | 88   | ~2330 ms |
+| Long (paragraph-form context)                          | 235  | ~6300 ms |
+
+For multi-turn conversation traffic, **warm-turn TTFT** is the
+relevant metric — Path F's hydrate skips prefill for the matched
+prefix between the cached and new prompts:
+
+| Scenario | TTFT |
+|---|---|
+| Cold (33-tok prompt, no cache) | 857 ms |
+| Warm (39-tok prompt, 24 hydrated, 15 prefilled) | **444 ms** (−48 %) |
+| Fully hydrated (prompt is exact prefix of cache) | < 200 ms — only one decode step |
+
+vs llama.cpp on the same shapes: cold TTFT is ~2× faster (we run
+prefill at 36 tok/s vs llama-bench's 18 tok/s) and warm TTFT has no
+llama.cpp equivalent (no persistent KV). Further cold-TTFT
+improvements (streaming, deeper kernel pipelining) tracked separately;
+see open issues.
+
 Path B detail: PRs [#13](https://github.com/GeniePod/genie-ai-runtime/pull/13)
 → [#17](https://github.com/GeniePod/genie-ai-runtime/pull/17), default
 flip in [#18](https://github.com/GeniePod/genie-ai-runtime/pull/18).
