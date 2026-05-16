@@ -184,3 +184,11 @@ add_test(NAME kv_serialize COMMAND test_kv_serialize)
 add_executable(test_kv_scale_storage tests/test_kv_scale_storage.cu)
 target_link_libraries(test_kv_scale_storage PRIVATE jetson_llm_core)
 add_test(NAME kv_scale_storage COMMAND test_kv_scale_storage)
+
+# Path I phase I2 (#62): FP16 → INT8 conversion + per-head scale
+# capture via KVCachePool::kv_scale_ptr. Validates kernel correctness
+# (uninit row_max + nullptr scale_out fixes) AND the engine-style
+# call shape (rows=n_kv_heads, cols=head_dim).
+add_executable(test_kv_int8_convert tests/test_kv_int8_convert.cu)
+target_link_libraries(test_kv_int8_convert PRIVATE jetson_llm_core)
+add_test(NAME kv_int8_convert COMMAND test_kv_int8_convert)

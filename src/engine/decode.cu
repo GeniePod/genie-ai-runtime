@@ -1059,8 +1059,19 @@ void Engine::transformer_layer_attn_compute(int layer, int pos,
     }
 
     if (gen_params_.kv_int8) {
-        fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), nullptr, k_buf, 1, KV_DIM, stream_);
-        fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), nullptr, v_buf, 1, KV_DIM, stream_);
+        // Path I phase I2 (#62): convert FP16 → INT8 with one absmax
+        // scale per kv_head (n_kv_heads rows × head_dim cols), and
+        // capture those scales into the per-(layer, pos) slot in
+        // KVCachePool. Attention dequant in I3 reads these scales.
+        // Pre-I2 the engine passed nullptr for scales and rows=1,
+        // which both lost the per-head info AND was undefined behavior
+        // in the kernel.
+        float* k_scales = kv_cache_.kv_scale_ptr(layer, pos, /*is_value=*/false);
+        float* v_scales = kv_cache_.kv_scale_ptr(layer, pos, /*is_value=*/true);
+        fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), k_scales,
+                     k_buf, config_.n_kv_heads, config_.head_dim, stream_);
+        fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), v_scales,
+                     v_buf, config_.n_kv_heads, config_.head_dim, stream_);
     } else if (!kv_cache_.is_fast_position(pos)) {
         cudaMemcpyAsync(kv_cache_.key_ptr(layer, pos), k_buf,
                         KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
@@ -1189,8 +1200,13 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
                          config_.head_dim, pos, config_.rope_theta,
                          config_.rope_neox, stream_);
             if (gen_params_.kv_int8) {
-                fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), nullptr, k_t, 1, KV_DIM, stream_);
-                fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), nullptr, v_t, 1, KV_DIM, stream_);
+                // Path I phase I2: same wiring as the decode-step path.
+                float* k_scales = kv_cache_.kv_scale_ptr(layer, pos, /*is_value=*/false);
+                float* v_scales = kv_cache_.kv_scale_ptr(layer, pos, /*is_value=*/true);
+                fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), k_scales,
+                             k_t, config_.n_kv_heads, config_.head_dim, stream_);
+                fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), v_scales,
+                             v_t, config_.n_kv_heads, config_.head_dim, stream_);
             } else {
                 cudaMemcpyAsync(kv_cache_.key_ptr(layer, pos), k_t,
                                 KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
