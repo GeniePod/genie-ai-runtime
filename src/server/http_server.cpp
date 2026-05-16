@@ -83,7 +83,10 @@ static std::string format_qwen_chat(const json& messages, bool think) {
 static json build_completion(Engine& engine, const std::string& prompt,
                               const GenParams& params) {
     std::string response;
-    auto stats = engine.generate(prompt, params, [&](const char* text, bool /*eos*/) {
+    auto stats = engine.generate(prompt, params, [&](const char* text, bool eos) {
+        // Skip the EOS marker's decoded text (`<|im_end|>` for Qwen) so it
+        // doesn't end up tail-glued to the user-visible content.
+        if (eos) return;
         response += text;
     });
 
@@ -182,8 +185,11 @@ static void stream_chat_completion(httplib::Response& res, Engine& engine,
             // decode loop exits at its next checkpoint instead of running
             // to max_tokens for a request nobody's reading.
             bool client_alive = true;
-            auto token_cb = [&](const char* text, bool /*eos*/) {
+            auto token_cb = [&](const char* text, bool eos) {
                 if (!client_alive) return;
+                // Don't stream the EOS marker's decoded text — the
+                // separate finish_reason:"stop" chunk below conveys it.
+                if (eos) return;
                 std::string chunk = sse_chunk(id, created, model_name,
                                                json{{"content", text}}, nullptr);
                 if (!sink.write(chunk.c_str(), chunk.size())) {
