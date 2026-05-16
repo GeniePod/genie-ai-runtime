@@ -123,6 +123,103 @@ static void send_error(httplib::Response& res, int code,
         "application/json");
 }
 
+// ── SSE streaming for chat completions ───────────────────────────────────
+
+// One "data: {chat.completion.chunk}\n\n" envelope.
+static std::string sse_chunk(const std::string& id, int64_t created,
+                              const std::string& model,
+                              const json& delta, const char* finish_reason) {
+    return "data: " + json{
+        {"id",      id},
+        {"object",  "chat.completion.chunk"},
+        {"created", created},
+        {"model",   model},
+        {"choices", json::array({json{
+            {"index", 0},
+            {"delta", delta},
+            {"finish_reason", finish_reason ? json(finish_reason) : json(nullptr)},
+        }})},
+    }.dump() + "\n\n";
+}
+
+// Streaming /v1/chat/completions. Holds the engine mutex for the whole
+// stream so concurrent SSE requests serialize on the single GPU.
+// cpp-httplib calls the content provider on its worker thread; we run
+// engine.generate() synchronously inside and push each token through
+// DataSink as soon as token_cb fires.
+//
+// `prompt`, `params`, `model_name` are captured by value so the lambda's
+// lifetime is independent of the outer handler scope (cpp-httplib may
+// dispatch the provider on a different thread / after the handler
+// returns, depending on version).
+static void stream_chat_completion(httplib::Response& res, Engine& engine,
+                                    const std::string& prompt,
+                                    const GenParams& params,
+                                    const std::string& model_name) {
+    res.set_header("Cache-Control",      "no-cache");
+    res.set_header("Connection",         "keep-alive");
+    res.set_header("X-Accel-Buffering",  "no");   // disable nginx buffering
+
+    res.set_chunked_content_provider("text/event-stream",
+        [&engine, prompt, params, model_name]
+        (size_t /*offset*/, httplib::DataSink& sink) -> bool {
+            std::lock_guard<std::mutex> lk(g_engine_mutex);
+
+            const std::string id      = "jllm-" + std::to_string(std::time(nullptr));
+            const int64_t     created = std::time(nullptr);
+
+            // Role-only opener. Mirrors OpenAI's own first chunk —
+            // python `openai` client needs the role delta first.
+            std::string open = sse_chunk(id, created, model_name,
+                                          json{{"role", "assistant"}}, nullptr);
+            if (!sink.write(open.c_str(), open.size())) {
+                sink.done();
+                return false;
+            }
+
+            // Per-token deltas. If client disconnects, sink.write returns
+            // false — we set client_alive and call engine.stop() so the
+            // decode loop exits at its next checkpoint instead of running
+            // to max_tokens for a request nobody's reading.
+            bool client_alive = true;
+            auto token_cb = [&](const char* text, bool /*eos*/) {
+                if (!client_alive) return;
+                std::string chunk = sse_chunk(id, created, model_name,
+                                               json{{"content", text}}, nullptr);
+                if (!sink.write(chunk.c_str(), chunk.size())) {
+                    client_alive = false;
+                    engine.stop();
+                }
+            };
+
+            bool errored = false;
+            try {
+                (void)engine.generate(prompt, params, token_cb);
+            } catch (const std::exception& e) {
+                errored = true;
+                if (client_alive) {
+                    std::string err = "data: " + json{{"error", json{
+                        {"message", e.what()},
+                        {"type",    "internal_error"}
+                    }}}.dump() + "\n\n";
+                    sink.write(err.c_str(), err.size());
+                }
+            }
+
+            if (client_alive) {
+                if (!errored) {
+                    std::string fin = sse_chunk(id, created, model_name,
+                                                 json::object(), "stop");
+                    sink.write(fin.c_str(), fin.size());
+                }
+                std::string done = "data: [DONE]\n\n";
+                sink.write(done.c_str(), done.size());
+            }
+            sink.done();
+            return false;   // single-pass: provider called once
+        });
+}
+
 // ── Server entry ─────────────────────────────────────────────────────────
 
 // `default_kv_int8` is the KV cache format the Engine was loaded with —
@@ -174,13 +271,6 @@ void run_server(Engine& engine, int port, bool default_kv_int8) {
             return;
         }
 
-        if (body.value("stream", false)) {
-            send_error(res, 501,
-                "stream:true not yet supported — tracked in issue #5 phase 3",
-                "not_implemented");
-            return;
-        }
-
         GenParams params;
         params.max_tokens  = body.value("max_tokens",  256);
         params.temperature = body.value("temperature", 0.7f);
@@ -207,6 +297,15 @@ void run_server(Engine& engine, int port, bool default_kv_int8) {
         const bool think = body.value("think", false);
         const std::string prompt = format_qwen_chat(messages, think);
 
+        if (body.value("stream", false)) {
+            // SSE path — mutex is taken inside the chunked-content
+            // provider so the response headers + first chunk go out
+            // immediately, before we block on engine.generate().
+            stream_chat_completion(res, engine, prompt, params,
+                                    engine.config().name);
+            return;
+        }
+
         std::lock_guard<std::mutex> lk(g_engine_mutex);
         res.set_content(build_completion(engine, prompt, params).dump(),
                         "application/json");
@@ -219,12 +318,20 @@ void run_server(Engine& engine, int port, bool default_kv_int8) {
         res.status = 204;
     });
 
+    // cpp-httplib defaults are 5 s read / 5 s write. Way too short — a
+    // 256-token completion at 10 tok/s is already 25 s. Bump both
+    // generously; LAN-only deployment so we don't worry about slow
+    // attacker hold-open.
+    svr.set_read_timeout(  30, 0);   // request body (small JSON)
+    svr.set_write_timeout(600, 0);   // response stream (long completions)
+    svr.set_idle_interval(  0, 100); // 100 ms keep-alive idle poll
+
     fprintf(stderr,
         "\n[server] listening on http://0.0.0.0:%d\n"
         "[server]   GET  /health\n"
         "[server]   GET  /v1/models\n"
-        "[server]   POST /v1/chat/completions   (non-streaming today; "
-        "SSE in #5 phase 3)\n\n", port);
+        "[server]   POST /v1/chat/completions   (stream:true → SSE)\n\n",
+        port);
 
     if (!svr.listen("0.0.0.0", port)) {
         fprintf(stderr, "[server] FATAL: failed to bind 0.0.0.0:%d\n", port);
