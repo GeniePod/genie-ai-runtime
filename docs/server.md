@@ -84,7 +84,7 @@ Qwen chat template; the rolling context determines the answer.
 | `top_k`           | int    | 40      | Top-k sampling |
 | `top_p`           | float  | 0.9     | Top-p (nucleus) sampling |
 | `stream`          | bool   | false   | Emit `text/event-stream` chunks instead of one JSON body |
-| `think`           | bool   | false   | Allow Qwen3 thinking-mode output (`<think>...</think>` block) |
+| `think`           | bool   | false   | Allow Qwen3 thinking-mode output. When `true`, the model may emit `<think>reasoning</think>final answer` — the server splits the two and returns them in separate fields (see "Reasoning output" below). When `false`, an empty think block is prefixed to suppress reasoning. |
 | `conversation_id` | string | —       | Path F persistent KV id (`[A-Za-z0-9_-]{1,64}`); only effective under FP16 KV today |
 | `kv_int8`         | bool   | (load)  | Override KV format per-request. Defaults to whatever the server was loaded with; mismatch with load-time format produces garbage tokens. Don't surface to clients today — see [#67](https://github.com/GeniePod/genie-ai-runtime/issues/67). |
 
@@ -145,6 +145,53 @@ data: [DONE]
 
 OpenAI-shape `chat.completion.chunk` envelopes — clients written
 against OpenAI's stream protocol work as-is.
+
+### Reasoning output (`think: true`)
+
+Qwen3 supports a thinking/reasoning mode. With `"think": true` in the
+request, the model may produce `<think>chain-of-thought</think>final
+answer`. The server splits the two and surfaces them in separate
+fields. Shape mirrors DeepSeek's reasoning API (`reasoning_content`),
+which most OpenAI-compatible clients tolerate.
+
+**Non-streaming:**
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "The answer is 4.",
+      "reasoning_content": "Let me add 2 and 2. 2 + 2 = 4. So the answer is 4."
+    },
+    "finish_reason": "stop"
+  }],
+  ...
+}
+```
+
+`reasoning_content` is omitted when empty (e.g. `think: false` requests,
+or `think: true` requests where the model chose to skip reasoning).
+
+**Streaming:** reasoning chunks and content chunks arrive as separate
+deltas, in order:
+
+```
+data: {"choices":[{"delta":{"role":"assistant"}, ...}]}
+data: {"choices":[{"delta":{"reasoning_content":"Let me"}, ...}]}
+data: {"choices":[{"delta":{"reasoning_content":" add"}, ...}]}
+...
+data: {"choices":[{"delta":{"content":"The"}, ...}]}
+data: {"choices":[{"delta":{"content":" answer"}, ...}]}
+...
+data: {"choices":[{"delta":{},"finish_reason":"stop"}, ...]}
+data: [DONE]
+```
+
+Currently Qwen3-specific (looks for literal `<think>` / `</think>`
+tokens). Other reasoning-model templates can dispatch on
+`engine.config().name` when added.
 
 ### Errors
 

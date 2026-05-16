@@ -78,17 +78,97 @@ static std::string format_qwen_chat(const json& messages, bool think) {
     return out;
 }
 
+// ── Qwen3 <think>...</think> splitter (issue #76) ────────────────────────
+//
+// When the request opts into thinking (`think: true`), Qwen3 may emit
+//   <think>chain-of-thought tokens</think>final answer tokens
+// We forward those two segments under different field names so clients
+// can render them separately (DeepSeek-API-shape `reasoning_content`).
+//
+// Streaming-safe: the engine fires `token_cb` per token. <think> /
+// </think> arrive as single tokens on the current Qwen3 tokenizer, but
+// we keep a small tail buffer in case a future tokenizer splits them.
+struct ThinkSplit {
+    enum Mode { INIT, THINKING, CONTENT };
+    Mode mode = INIT;
+    std::string buf;
+
+    template <typename Emit>
+    void feed(const char* chunk, Emit&& emit) {
+        buf += chunk;
+        for (;;) {
+            if (mode == INIT) {
+                static const std::string OPEN = "<think>";
+                if (buf.size() < OPEN.size() &&
+                    OPEN.compare(0, buf.size(), buf) == 0) {
+                    return;   // wait for more bytes to disambiguate
+                }
+                if (buf.compare(0, OPEN.size(), OPEN) == 0) {
+                    buf.erase(0, OPEN.size());
+                    mode = THINKING;
+                    continue;
+                }
+                mode = CONTENT;
+                continue;
+            }
+            if (mode == THINKING) {
+                static const std::string CLOSE = "</think>";
+                size_t pos = buf.find(CLOSE);
+                if (pos != std::string::npos) {
+                    if (pos > 0) emit("reasoning", buf.substr(0, pos));
+                    buf.erase(0, pos + CLOSE.size());
+                    while (!buf.empty() &&
+                           (buf[0] == '\n' || buf[0] == ' ')) {
+                        buf.erase(0, 1);   // eat conventional separator
+                    }
+                    mode = CONTENT;
+                    continue;
+                }
+                if (buf.size() > CLOSE.size()) {
+                    size_t safe = buf.size() - (CLOSE.size() - 1);
+                    emit("reasoning", buf.substr(0, safe));
+                    buf.erase(0, safe);
+                }
+                return;
+            }
+            // CONTENT
+            if (!buf.empty()) {
+                emit("content", buf);
+                buf.clear();
+            }
+            return;
+        }
+    }
+
+    template <typename Emit>
+    void flush(Emit&& emit) {
+        if (buf.empty()) return;
+        emit(mode == THINKING ? "reasoning" : "content", buf);
+        buf.clear();
+    }
+};
+
 // ── Chat completion (non-streaming) ──────────────────────────────────────
 
 static json build_completion(Engine& engine, const std::string& prompt,
                               const GenParams& params) {
-    std::string response;
+    std::string content;
+    std::string reasoning;
+    ThinkSplit  splitter;
+    auto absorb = [&](const char* kind, const std::string& seg) {
+        (kind[0] == 'r' ? reasoning : content) += seg;
+    };
+
     auto stats = engine.generate(prompt, params, [&](const char* text, bool eos) {
         // Skip the EOS marker's decoded text (`<|im_end|>` for Qwen) so it
         // doesn't end up tail-glued to the user-visible content.
         if (eos) return;
-        response += text;
+        splitter.feed(text, absorb);
     });
+    splitter.flush(absorb);
+
+    json message = {{"role", "assistant"}, {"content", content}};
+    if (!reasoning.empty()) message["reasoning_content"] = reasoning;
 
     return json{
         {"id",      "jllm-" + std::to_string(std::time(nullptr))},
@@ -98,7 +178,7 @@ static json build_completion(Engine& engine, const std::string& prompt,
         {"choices", json::array({
             json{
                 {"index", 0},
-                {"message", {{"role", "assistant"}, {"content", response}}},
+                {"message", message},
                 {"finish_reason", "stop"},
             }
         })},
@@ -185,22 +265,31 @@ static void stream_chat_completion(httplib::Response& res, Engine& engine,
             // decode loop exits at its next checkpoint instead of running
             // to max_tokens for a request nobody's reading.
             bool client_alive = true;
+            ThinkSplit splitter;
+            auto emit_segment = [&](const char* kind, const std::string& seg) {
+                if (!client_alive) return;
+                json delta = (kind[0] == 'r')
+                    ? json{{"reasoning_content", seg}}
+                    : json{{"content", seg}};
+                std::string out = sse_chunk(id, created, model_name,
+                                             delta, nullptr);
+                if (!sink.write(out.c_str(), out.size())) {
+                    client_alive = false;
+                    engine.stop();
+                }
+            };
             auto token_cb = [&](const char* text, bool eos) {
                 if (!client_alive) return;
                 // Don't stream the EOS marker's decoded text — the
                 // separate finish_reason:"stop" chunk below conveys it.
                 if (eos) return;
-                std::string chunk = sse_chunk(id, created, model_name,
-                                               json{{"content", text}}, nullptr);
-                if (!sink.write(chunk.c_str(), chunk.size())) {
-                    client_alive = false;
-                    engine.stop();
-                }
+                splitter.feed(text, emit_segment);
             };
 
             bool errored = false;
             try {
                 (void)engine.generate(prompt, params, token_cb);
+                splitter.flush(emit_segment);
             } catch (const std::exception& e) {
                 errored = true;
                 if (client_alive) {
