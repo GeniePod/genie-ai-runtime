@@ -108,6 +108,28 @@ slightly as attention work scales with KV context length.
 (alpha.11 FP16 equivalents on the same shapes: 38.8 / 859 / 10.0 and
 40.8 / 1410 / 9.5 — within 1–2 % of alpha.12 INT8 across the board.)
 
+### Cold vs warm model load (added 2026-05-16)
+
+Model-load wall time measured on the same Jetson with
+[`scripts/bench_load.sh`](scripts/bench_load.sh), which drops the OS
+pagecache (`echo 3 > /proc/sys/vm/drop_caches`) between runs. Qwen3-4B
+Q4_K_M, 2.4 GB GGUF on NVMe, 25 W MAXN SUPER:
+
+| | load_ms | effective MB/s |
+|---|---|---|
+| Cold (pagecache dropped, NVMe-bound) | 30258 | 79 |
+| Warm (pagecache hit) | 1325 | 1797 |
+
+Cold − warm = ~29 s on this hardware (cold is 22.8× slower). The cold
+number is bounded by NVMe sequential read; once the GGUF is resident in
+the page cache the model comes up in ~1.3 s, which is what makes
+interactive re-launches feel instant. Any normal CLI run now prints the
+number it observed:
+
+```
+[engine] Model loaded in 1325 ms (1797 MB/s)
+```
+
 ¹ Path E's `mma.sync` reorders float adds differently than scalar FMAs;
 byte-equality breaks at FP16 ULP, generated text remains
 character-for-character the same on the reference prompt.
@@ -275,23 +297,72 @@ Outputs:
 
 ## Run
 
+### Single prompt
+
 ```
-# CLI (single prompt)
 ./build/jetson-llm -m /path/to/model.gguf -p "Hello"
+```
 
-# CLI (interactive chat loop)
-./build/jetson-llm -m /path/to/model.gguf -i
+### Interactive chat
 
-# Server (HTTP, OpenAI-compatible)
+Drops into a REPL — type a prompt, hit enter, the response streams to
+stdout. `quit` / `exit` (or Ctrl-C) leaves the loop; in-flight
+generation stops gracefully.
+
+```
+./build/jetson-llm -m /opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf -i --chat
+```
+
+- `-i` interactive loop
+- `--chat` wraps each line with the Qwen chat template (auto-applied
+  when the model name contains `instruct`/`chat` — explicit on the
+  example above to be unambiguous; pass `--raw` to disable)
+- Each turn is independent (no chat history). For persisted multi-turn
+  history, add `--fp16-kv --conv-id mychat`:
+
+  ```
+  ./build/jetson-llm -m /opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf \
+      -i --chat --fp16-kv --conv-id mychat
+  ```
+
+  (Path F save is skipped under `--int8-kv` today, see alpha.12 note
+  above and [#67](https://github.com/GeniePod/genie-ai-runtime/issues/67).)
+
+A typical session looks like:
+
+```
+Loading model...
+[engine] Model loaded in 1325 ms (1797 MB/s)
+Model: Qwen3 4B Instruct Awq (36 layers, 32 heads, 8 KV heads, 2560 dim)
+
+Entering interactive mode. Type 'quit' to exit.
+
+> hello
+Hello! How can I assist you today?
+[10 tokens, 10.9 tok/s, peak 0 MB, 0.0°C]
+
+> can you turn on the camera?
+Sure! To turn on the camera, follow these steps depending on your device:
+...
+[256 tokens, 9.6 tok/s, peak 2683 MB, 58.5°C]
+
+> quit
+```
+
+### Server (HTTP, OpenAI-compatible)
+
+```
 ./build/jetson-llm-server -m /path/to/model.gguf -p 8080
 ```
+
+### Flag reference
 
 Short flags only. CLI: `-m` model, `-p` prompt, `-n` max tokens,
 `-c` context, `-t` temperature, `-i` interactive, `-v` verbose,
 `-h` help. Server: `-m` model, `-p` **port** (not prompt — heads up),
 `-c` context, `--fp16-kv` to disable INT8 KV cache.
 
-`--conv-id <id>` (Path F, see [#45](https://github.com/GeniePod/genie-ai-runtime/issues/45)) tags a request with a persistent-KV conversation identifier (`[A-Za-z0-9_-]{1,64}`). The HTTP server accepts the same id via a `conversation_id` field in `/v1/chat/completions`. Currently plumbing only — the engine logs the id but does not yet persist or hydrate KV state. F3 wires the save/load hooks against the on-disk format from [#46](https://github.com/GeniePod/genie-ai-runtime/pull/46).
+`--conv-id <id>` (Path F, see [#45](https://github.com/GeniePod/genie-ai-runtime/issues/45)) tags a request with a persistent-KV conversation identifier (`[A-Za-z0-9_-]{1,64}`). The HTTP server accepts the same id via a `conversation_id` field in `/v1/chat/completions`.
 
 ## Runtime Flags
 
