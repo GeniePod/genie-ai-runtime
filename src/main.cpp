@@ -84,19 +84,38 @@ Args parse_args(int argc, char** argv) {
         else if (strcmp(argv[i], "-i") == 0) args.interactive = true;
         else if (strcmp(argv[i], "-v") == 0) args.verbose = true;
         else if (strcmp(argv[i], "--int8-kv") == 0) {
-            // alpha.11: --int8-kv is currently a stub. The conversion
-            // helper (fp16_to_int8) is called without capturing per-head
-            // scales, and the attention kernel ends up dequantizing
-            // INT8 with scale=1.0 → numerical garbage AND prefill_batched
-            // falls back to N sequential decode calls, which hangs on
-            // medium-length prompts. Track the proper fix under Path I.
-            // Ignoring the flag (no functional change) until then.
-            fprintf(stderr,
-                    "[cli] WARNING: --int8-kv is currently unimplemented "
-                    "(scales not captured; attention math broken). "
-                    "Ignoring; running with FP16 KV. "
-                    "Tracked for proper fix.\n");
-            args.kv_int8 = false;
+            // alpha.11 disabled --int8-kv because the stub produced
+            // garbage / hangs (full triage in #62 / Path I umbrella).
+            //
+            // Path I phases I1–I3 wired the per-head scale machinery
+            // through KVCachePool → fp16_to_int8 → flash_attention.
+            // The path is now structurally correct. I5 (this PR) opens
+            // a back door for engineers to actually enable it and
+            // measure quality without changing the user-facing default:
+            //
+            //   - Default behavior unchanged: --int8-kv warns + runs FP16.
+            //   - JLLM_INT8_KV_EXPERIMENTAL=1 lets --int8-kv go through.
+            //
+            // Once we've measured output quality and confirmed it holds
+            // (vs FP16) on a representative corpus, I6 will flip the
+            // default: --int8-kv works normally, env var goes away.
+            const char* experimental = std::getenv("JLLM_INT8_KV_EXPERIMENTAL");
+            if (experimental && experimental[0] == '1') {
+                fprintf(stderr,
+                        "[cli] --int8-kv: experimental Path I path enabled "
+                        "(JLLM_INT8_KV_EXPERIMENTAL=1). Output quality vs "
+                        "FP16 not yet validated on a corpus; expect FP16-ULP-"
+                        "bounded drift on most outputs.\n");
+                args.kv_int8 = true;
+            } else {
+                fprintf(stderr,
+                        "[cli] WARNING: --int8-kv default-gated since "
+                        "alpha.11 pending quality validation. Set "
+                        "JLLM_INT8_KV_EXPERIMENTAL=1 to enable the wired "
+                        "Path I path (I1–I3 merged; I5 quality eval in "
+                        "progress). Running with FP16 KV for this run.\n");
+                args.kv_int8 = false;
+            }
         }
         else if (strcmp(argv[i], "--fp16-kv") == 0) args.kv_int8 = false;
         else if (strcmp(argv[i], "--chat") == 0) args.chat = true;
@@ -120,8 +139,9 @@ Args parse_args(int argc, char** argv) {
                 "  --raw      Do not auto-wrap Instruct/Chat models\n"
                 "  --think    Enable Qwen3 thinking output\n"
                 "  --no-think Disable Qwen3 thinking output (default)\n"
-                "  --int8-kv  (alpha.11: stub; warns + ignored — see Path I)\n"
-                "  --fp16-kv  Use FP16 KV cache (default; the only path that works today)\n"
+                "  --int8-kv  Default warns + ignored. Set JLLM_INT8_KV_EXPERIMENTAL=1\n"
+                "             to enable the Path I I1-I3 path (quality eval in I5).\n"
+                "  --fp16-kv  Use FP16 KV cache (default; the validated path)\n"
                 "  --conv-id ID  Path F: persistent-KV conversation id\n"
                 "                ([A-Za-z0-9_-]{1,64}). F2 plumbing only —\n"
                 "                no persistence yet; engine logs the id.\n"
