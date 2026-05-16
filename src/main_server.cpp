@@ -30,6 +30,13 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-c") == 0 && i+1 < argc) context = atoi(argv[++i]);
         else if (strcmp(argv[i], "--int8-kv") == 0) kv_int8 = true;
         else if (strcmp(argv[i], "--fp16-kv") == 0) kv_int8 = false;
+        else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+#ifndef JLLM_VERSION
+#define JLLM_VERSION "dev"
+#endif
+            fprintf(stdout, "genie-ai-runtime / jetson-llm-server %s\n", JLLM_VERSION);
+            return 0;
+        }
         else if (strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
                 "jetson-llm-server — OpenAI-compatible LLM API for Jetson\n\n"

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(jetson-llm LANGUAGES C CXX CUDA)
+project(jetson-llm VERSION 1.0.0 LANGUAGES C CXX CUDA)
+
+# Compile-time JLLM_VERSION string for CLI / server --version output.
+add_compile_definitions(JLLM_VERSION="${PROJECT_VERSION}")
 
 # ── Jetson ONLY — no x86, no discrete GPU, no Windows ────────────────────
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")

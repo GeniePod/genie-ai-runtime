@@ -106,10 +106,15 @@ JetsonInfo probe_jetson() {
 }
 
 void print_jetson_info(const JetsonInfo& info) {
+#ifndef JLLM_VERSION
+#define JLLM_VERSION "dev"
+#endif
     fprintf(stderr,
         "╔══════════════════════════════════════╗\n"
-        "║   Jetson LLM Runtime v0.1            ║\n"
-        "╠══════════════════════════════════════╣\n"
+        "║   genie-ai-runtime v%-16s ║\n"
+        "╠══════════════════════════════════════╣\n",
+        JLLM_VERSION);
+    fprintf(stderr,
         "║ L4T:    %-10s  CUDA: %d.%d       ║\n"
         "║ SMs:    %-3d         Cores: %-5d     ║\n"
         "║ RAM:    %-5ld MB    CMA: %-4ld MB    ║\n"

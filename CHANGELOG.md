@@ -1,5 +1,65 @@
 # Changelog
 
+## v1.0.0 — 2026-05-16
+
+First stable release. Cuts the `-alpha.N` suffix from `v0.1.0-alpha.12`
+and consolidates the alpha-track narrative (Paths A → I + the v1.0
+production-hardening cycle) into a single 1.0 line. **No engine
+behavior change vs alpha.12** — same Qwen3 path, same INT8 KV default,
+same kernels.
+
+What ships in v1.0.0 (cumulative vs the alpha.2 first-tokens baseline):
+
+| Metric                               | alpha.2 | v1.0.0           | Δ |
+| ------------------------------------ | ------- | ---------------- | --- |
+| Prefill (33-tok cold)                | 8.2 tok/s   | **38.0 tok/s**   | **+363 %** |
+| Decode                               | 7.5 tok/s   | **9.9 tok/s**    | **+32 %** |
+| Cold TTFT                            | 2200 ms     | **877 ms**       | **−60 %** |
+| Warm-turn TTFT (Path F, 67 % prefix) | n/a         | **444 ms**       | new |
+| KV pool memory @ 1024 ctx            | n/a         | **74 MB**        | new (−49 % vs alpha.11 FP16) |
+
+vs `llama-bench pp18 = 17.97 ± 0.65 tok/s`: **+115 % prefill**.
+
+### v1.0 cycle (production hardening, post-alpha.12)
+
+- **Server rewrite** ([#5](https://github.com/GeniePod/genie-ai-runtime/issues/5),
+  closed): dropped the 246-line raw-sockets + hand-rolled-JSON server,
+  rewrote on cpp-httplib + nlohmann/json (the same building blocks
+  llama.cpp uses). Full OpenAI-shape parsing, SSE streaming with
+  client-disconnect cancels generation, thread-per-request mutex-guarded
+  engine, opt-in build (`-DJLLM_BUILD_SERVER=ON`), systemd unit +
+  installer, refreshed `docs/server.md`. PRs
+  [#73](https://github.com/GeniePod/genie-ai-runtime/pull/73),
+  [#74](https://github.com/GeniePod/genie-ai-runtime/pull/74),
+  [#75](https://github.com/GeniePod/genie-ai-runtime/pull/75).
+- **Qwen3 reasoning split** ([#76](https://github.com/GeniePod/genie-ai-runtime/issues/76),
+  closed): server-side `ThinkSplit` extracts `<think>...</think>` and
+  surfaces it as DeepSeek-style `reasoning_content` (separate
+  non-streaming field; separate `delta.reasoning_content` SSE chunks).
+  PR [#77](https://github.com/GeniePod/genie-ai-runtime/pull/77).
+- **CLI observability**: per-run `[engine] Model loaded in X ms (Y MB/s)`
+  + `scripts/bench_load.sh` cold/warm bench (cold 30 s NVMe-bound, warm
+  1.3 s pagecache hit). PR [#71](https://github.com/GeniePod/genie-ai-runtime/pull/71).
+- **Stability soak harness** shipped ([#4](https://github.com/GeniePod/genie-ai-runtime/issues/4)
+  rescoped, harness in PR [#70](https://github.com/GeniePod/genie-ai-runtime/pull/70)
+  — actual 100-iter run still pending).
+- **`--version` / `-V`** flag added to both CLI and server; banner
+  reads `genie-ai-runtime v1.0.0`.
+- **README + ROADMAP rewrite**: README is now a clear user-facing
+  intro; ROADMAP carries the path-by-path narrative + perf evolution
+  (everything that used to live at the top of the README).
+
+### Known follow-ups (not blockers for v1.0)
+
+- Path F format v3 to persist INT8 KV scales ([#67](https://github.com/GeniePod/genie-ai-runtime/issues/67)) — until then, the server defaults to FP16 KV so `conversation_id` save works.
+- 24-hour soak + packaging + genie-claw default flip ([#7](https://github.com/GeniePod/genie-ai-runtime/issues/7)).
+- Path G v2 decode optimization ([#58](https://github.com/GeniePod/genie-ai-runtime/issues/58)) — G1 / G2-lite measured neutral; needs a different attack.
+- Cold-TTFT reduction beyond Path E + F ([#56](https://github.com/GeniePod/genie-ai-runtime/issues/56)).
+- `setup.sh` should detect stale `/opt/jetson-llm/bin/` binary and re-copy automatically.
+- `ThinkSplit` streaming buffer could only hold the tail when it looks like a partial `</think>` prefix (cleaner SSE chunks).
+- Server `jetson` extension block reports `peak_mem_mb: 0` / `peak_temp_c: 0.0` — decode-side live-stats watcher not attached on the server path.
+- CLI interactive REPL leaks `<|im_end|>` and shows raw `<think>` tags (same `ThinkSplit` from #76 could be reused on the CLI side).
+
 ## v0.1.0-alpha.12 — 2026-05-16
 
 Path I (proper INT8 KV cache) shipped end-to-end across I1–I5,

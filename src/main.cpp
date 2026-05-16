@@ -91,6 +91,13 @@ Args parse_args(int argc, char** argv) {
         else if (strcmp(argv[i], "--think") == 0) args.think = true;
         else if (strcmp(argv[i], "--no-think") == 0) args.think = false;
         else if (strcmp(argv[i], "--conv-id") == 0 && i+1 < argc) args.conversation_id = argv[++i];
+        else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+#ifndef JLLM_VERSION
+#define JLLM_VERSION "dev"
+#endif
+            fprintf(stdout, "genie-ai-runtime / jetson-llm %s\n", JLLM_VERSION);
+            exit(0);
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             fprintf(stderr,
                 "jetson-llm — Memory-first LLM runtime for Jetson Orin\n\n"
