@@ -67,28 +67,40 @@ Latest on-device measurement: Qwen3-4B Q4_K_M, 25 W MAXN SUPER, GPU
 locked at 918 MHz, 18-token user prompt (kernel sees N≈33 after Qwen3
 chat-template wrap).
 
-| | alpha.2 | alpha.3 | alpha.5 | alpha.6 | alpha.7 | alpha.8 | Cumulative Δ |
-|---|---|---|---|---|---|---|---|
-| Prefill | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | 28.16 tok/s | **38.68 ± 0.1 tok/s** | **+372 %** |
-| TTFT | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | ~1170 ms | **~860 ms** | **−61 %** |
-| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | **+21 %** |
-| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | sensibly-identical¹ | ✓ |
+| | alpha.2 | alpha.3 | alpha.5 | alpha.6 | alpha.7 | alpha.8 | alpha.9² | alpha.10² | Cumulative Δ |
+|---|---|---|---|---|---|---|---|---|---|
+| Prefill | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | 28.16 tok/s | 38.68 tok/s | 38.7 tok/s | **38.8 ± 0.04 tok/s** | **+373 %** |
+| TTFT (cold) | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | ~1170 ms | ~862 ms | 858 ms | **859 ± 3 ms** | **−61 %** |
+| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | **+21 %** |
+| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | ✓ |
 
 ¹ Path E's `mma.sync` reorders float adds differently than scalar FMAs;
 byte-equality breaks at FP16 ULP, generated text remains
 character-for-character the same on the reference prompt.
 
+² alpha.9 and alpha.10 are **feature releases**, not throughput
+releases. Prefill / decode / cold-TTFT match alpha.8 within
+measurement noise (alpha.10 re-measured today on the same 33-token
+prompt: 850 ± 2.7 ms prefill, 859 ± 2.7 ms TTFT, 5 samples; matches
+alpha.8/9 within ~3 ms). What they add: alpha.9 = Path F (persistent
+KV → **warm-turn TTFT 444 ms**, see below); alpha.10 = Path F5 (cache
+dir capped at 1 GB, oldest LRU-evicted, stale `*.tmp` cleaned). The
+"alpha.10" column above reports the latest measured cold numbers; the
+real story is the warm-turn TTFT row below.
+
 Same-day re-baseline used for alpha.7 → alpha.8 Δ (scalar fallback path
-re-measured today at 16.45 tok/s, alpha.8 = 38.68 tok/s, mean gap
-1153 ms vs combined σ ≈ 6 ms → ~190σ separation). **vs `llama-bench
-pp18 = 17.97 ± 0.65 tok/s` genie-ai-runtime now leads by +115 %.**
+re-measured at 16.45 tok/s, alpha.8 = 38.68 tok/s, mean gap 1153 ms vs
+combined σ ≈ 6 ms → ~190σ separation). **vs `llama-bench pp18 =
+17.97 ± 0.65 tok/s` genie-ai-runtime now leads by +115 %.**
 
 alpha.9 adds the multi-turn warm-start win on top: in a 2-turn
 conversation where the second prompt shares 24 / 36 = 67 % of its
 tokens with the first turn, **TTFT drops 857 → 444 ms (−48 %)** on
 the second turn vs cold prefill. Prefill / decode throughput per
 turn is unchanged; the gain is purely from skipping the matched
-prefix.
+prefix. alpha.10 layers a 1 GB LRU cap on the cache dir so persistent
+KV is production-safe — same warm-turn TTFT win, no unbounded disk
+growth.
 
 Long-prompt scaling validated 2026-05-16 across kernel N = 33 / 88 / 235:
 the ~2.36× speedup over the scalar fallback is essentially uniform
