@@ -343,6 +343,9 @@ __device__ __forceinline__ float dot_q6k_row(
     int lane)
 {
     float acc = 0.0f;
+    // Path G G2-lite: per-lane scale-group index is constant across the
+    // entire block iteration. Compute once outside the b/n loops.
+    const int is = lane / 16;
 
     for (int b = 0; b < n_blocks; b++) {
         const block_q6_K& blk = row_blocks[b];
@@ -353,7 +356,17 @@ __device__ __forceinline__ float dot_q6k_row(
             const uint8_t* ql = blk.ql + (n / 128) * 64;
             const uint8_t* qh = blk.qh + (n / 128) * 32;
             const int8_t*  sc = blk.scales + (n / 128) * 8;
-            const int is = lane / 16;
+
+            // G2-lite: hoist (d × sc[is+i]) precompute to the top of the
+            // n-iter. Replaces 4 ints sc-loads + 4 float muls fused into
+            // each of the 4 inner FMAs with 4 float loads + 4 float
+            // muls once, then 4 simple float FMAs in the inner work.
+            // No layout change, no semantic change beyond float-add
+            // ordering at the bit level.
+            const float dsc0 = d * (float)sc[is + 0];
+            const float dsc2 = d * (float)sc[is + 2];
+            const float dsc4 = d * (float)sc[is + 4];
+            const float dsc6 = d * (float)sc[is + 6];
 
             const int q1 = (int)((ql[lane +  0] & 0xF) | (((qh[lane] >> 0) & 3) << 4)) - 32;
             const int q2 = (int)((ql[lane + 32] & 0xF) | (((qh[lane] >> 2) & 3) << 4)) - 32;
@@ -361,10 +374,10 @@ __device__ __forceinline__ float dot_q6k_row(
             const int q4 = (int)((ql[lane + 32] >>  4) | (((qh[lane] >> 6) & 3) << 4)) - 32;
 
             const int k0 = k_base + n + lane;
-            acc += d * (float)sc[is + 0] * (float)q1 * __half2float(x[k0 +  0]);
-            acc += d * (float)sc[is + 2] * (float)q2 * __half2float(x[k0 + 32]);
-            acc += d * (float)sc[is + 4] * (float)q3 * __half2float(x[k0 + 64]);
-            acc += d * (float)sc[is + 6] * (float)q4 * __half2float(x[k0 + 96]);
+            acc += dsc0 * (float)q1 * __half2float(x[k0 +  0]);
+            acc += dsc2 * (float)q2 * __half2float(x[k0 + 32]);
+            acc += dsc4 * (float)q3 * __half2float(x[k0 + 64]);
+            acc += dsc6 * (float)q4 * __half2float(x[k0 + 96]);
         }
     }
 
