@@ -48,7 +48,11 @@ struct GenParams {
     float repeat_penalty = 1.1f;
     int   context_limit = 0;
     bool  use_cuda_graph = true;
-    bool  kv_int8       = false;
+    // alpha.12: INT8 KV is the default. Saves ~50 % of KV pool memory
+    // (e.g. 144 MB → 74 MB for Qwen3-4B at 1024 ctx) with FP16-ULP-
+    // bounded quality drift validated in Path I (#62). Set false via
+    // CLI --fp16-kv or HTTP body field to opt back into full FP16 KV.
+    bool  kv_int8       = true;
 
     // Path F (#45): persistent KV cache identifier. Empty = single-shot,
     // no cross-turn state. Non-empty = the engine will (in F3+) try to

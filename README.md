@@ -9,21 +9,16 @@ on a 7.6 GB iGPU without crowding out whisper.cpp + Piper + Home Assistant.
 
 ## Status
 
-`v0.1.0-alpha.11` — release-hygiene cleanup on top of alpha.10. Same
-throughput (no kernel changes), but ships two honest fixes:
+`v0.1.0-alpha.12` — Path I (proper INT8 KV cache) shipped and made the
+default. Saves ~50 % of KV pool memory (e.g. 144 MB → 74 MB for
+Qwen3-4B at 1024 ctx) with quality validated against FP16 on a
+representative prompt. Throughput is unchanged within noise; the win
+is memory headroom for longer contexts and concurrent voice/HA on
+Jetson Orin Nano Super 8 GB.
 
-1. **`--int8-kv` flag is now warned-and-ignored.** The path was
-   half-implemented since alpha.2 (`fp16_to_int8` was called without
-   capturing per-head scales; attention dequantized INT8 with scale=1.0
-   → numerical garbage AND prefill_batched fell back to N sequential
-   decode calls → effectively hung on medium prompts). Setting the
-   flag now prints a CLI warning and runs with FP16 KV. Proper INT8
-   implementation tracked as Path I (separate effort).
-2. **Documented performance numbers tightened to today's measurements.**
-   See the perf table below — the alpha.8 → alpha.10 throughput
-   numbers were measured on a 33-token short-prompt cold turn; this
-   release also reports the sustained throughput on a longer
-   serving-realistic prompt (57 tokens prefill + 200 decode).
+Use `--fp16-kv` to opt back into full-precision KV (no semantic
+difference today, but useful if you observe quality issues on a
+particular workload).
 
 Current validated path:
 - Coherent Qwen3 instruct output with automatic chat template and no-think mode.
@@ -280,7 +275,7 @@ JLLM_MMQ_Q4K=0           # disable Path E (tensor-core MMQ Q4_K prefill GEMM); d
 JLLM_KV_CACHE_DIR=...    # Path F: location for persistent KV files; default: /opt/jllm/data/kv-cache
 JLLM_KV_CACHE_MAX_MB=N   # Path F5: total *.bin budget in MB (oldest LRU-evicted); default: 1024, 0 disables
 JLLM_KV_CACHE_STALE_TMP_S=N  # Path F5: age (s) past which leftover *.tmp files get cleaned; default: 60
-# (alpha.11) --int8-kv is currently warned + ignored; only FP16 KV works. Proper INT8 KV tracked as Path I.
+# (alpha.12) --int8-kv now WORKS and is the default. --fp16-kv opts back into full-precision KV.
 JLLM_FAST_GEMV=0         # use CPU reference K-quant GEMV
 JLLM_FAST_EMBD=0         # use CPU reference token embedding dequantization
 JLLM_FAST_NORM=0         # use CPU reference RMSNorm

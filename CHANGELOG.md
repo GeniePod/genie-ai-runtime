@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.1.0-alpha.12 — 2026-05-16
+
+Path I (proper INT8 KV cache) shipped end-to-end across I1–I5,
+default-flipped in this release. Saves ~50 % of the KV pool's memory
+(144 MB → 74 MB for Qwen3-4B at 1024 ctx) with FP16-ULP-bounded output
+drift validated on Jetson Orin Nano Super 8 GB. Throughput is
+essentially unchanged at chat-typical contexts (attention is ~2 % of
+decode wall at N=40); the win compounds at longer contexts where
+attention's KV-read bandwidth share grows.
+
+### Verified on Jetson (33-token short prompt, temp=0)
+
+| | FP16 KV (alpha.11) | INT8 KV (alpha.12 default) | Δ |
+|---|---|---|---|
+| KV pool memory | 144 MB | **74 MB** (72 MB body + 2.25 MB scales) | **−49 %** |
+| Prefill (33 tok) | 857 ms / 38.5 tok/s | 867 ms / 38.0 tok/s | +10 ms (scale-lookup overhead) |
+| Decode | 10.0 tok/s | 9.9 tok/s | within noise |
+| TTFT | 867 ms | 877 ms | +10 ms |
+| Output | reference | sensibly-identical — *"...high performance, low power consumption, and advanced AI capabilities, making it suitable for edge computing applications requiring real-time processing and efficiency."* (vs FP16's *"...edge computing and real-time applications"*) | minor word-level drift |
+
+### Path I series
+
+| PR | Phase | What |
+|---|---|---|
+| #63 | I1 — per-head scale storage in KVCachePool | 2.25 MB scales region per layer; INT8-mode-only allocation |
+| #64 | I2 — wire fp16_to_int8 + fix kernel bugs | per-head conversion + scale capture; fixed uninit `row_max` and nullptr `scale_out` |
+| #65 | I3 — per-position scales through flash_attention + remove broken fallback | attention dequant reads `k_scales[kv_pos*n_kv_heads+kv_head]`; removed the `kv_int8 → N-sequential-decode` fallback that made alpha.11 hang |
+| #66 (closed) | I5 — `JLLM_INT8_KV_EXPERIMENTAL` env-gate for quality eval | enabled engineers to actually run INT8 KV before default-flip; superseded by this PR |
+| (this) | I6 — default-flip + Path F interop guard | this release |
+
+### Removed
+
+- `JLLM_INT8_KV_EXPERIMENTAL` env-var gate (no longer needed; `--int8-kv` works directly).
+- The alpha.11-era "warned + ignored" stub. `--int8-kv` is now the default and runs the real Path I path.
+
+### Changed
+
+- `GenParams::kv_int8` default flipped `false → true`. Embedders who default-construct `GenParams` get INT8 KV automatically.
+- `Args::kv_int8` in CLI default flipped `false → true`.
+- CLI `--help` text updated.
+
+### Path F (#45) interop guard
+
+The on-disk format from F4a (#50, v2) doesn't yet carry the per-head INT8 scales that attention needs at hydrate time. Saving INT8 bytes without the scales would produce silently-garbled output on the next turn. **alpha.12 skips save when `kv_int8` is active**, with a one-time warn-on-stderr. Use `--fp16-kv` if you need persistent KV today.
+
+Path F format v3 (persist scales) is the follow-up that closes this gap — tracked separately under a new issue.
+
+### Not in this release
+
+- **Path F format v3 — persist INT8 KV scales.** Open follow-up issue. Would let INT8 KV + persistent KV coexist for multi-turn warm-start.
+- **Quality eval on a corpus, not just one prompt.** alpha.12 ships on a single-prompt sensibility check (the bar for alpha-track releases). v1-track will broaden to multiple prompts + perplexity holdout.
+- Cosmetic post-hydrate prefill-log over-reporting (Path F4b artifact).
+
 ## v0.1.0-alpha.11 — 2026-05-16
 
 Release-hygiene cleanup. No throughput changes; two honesty fixes

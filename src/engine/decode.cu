@@ -1934,6 +1934,22 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         } else if (overflow_used) {
             fprintf(stderr, "[kv_cache] skip save (overflow pool used, "
                             "v1 fast-pool-only)\n");
+        } else if (params.kv_int8) {
+            // alpha.12 Path I + Path F interop guard: the on-disk format
+            // (v2, #50) doesn't yet carry the per-head INT8 scales that
+            // attention needs at hydrate time. Saving INT8 bytes without
+            // the scales would produce silently-garbled output on the
+            // next turn. Skip save until Path F format v3 lands the
+            // scales region.
+            static bool warned = false;
+            if (!warned) {
+                fprintf(stderr,
+                        "[kv_cache] skip save (INT8 KV active — Path F "
+                        "format v2 doesn't yet carry per-head scales; "
+                        "format v3 tracked separately. Use --fp16-kv if "
+                        "you need persistent KV today.)\n");
+                warned = true;
+            }
         } else {
             const std::string dir  = default_kv_cache_dir();
             const std::string path = path_for_conv_id(dir, params.conversation_id);
