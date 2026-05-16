@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.1.0-alpha.11 — 2026-05-16
+
+Release-hygiene cleanup. No throughput changes; two honesty fixes
+that close known user-facing footguns before they bite anyone:
+
+### Fixed: `--int8-kv` flag is warned-and-ignored
+
+The INT8 KV path has been half-implemented since the alpha.2/3 era.
+Three concrete bugs that have been there the whole time:
+
+1. `fp16_to_int8` was called with `nullptr` for the scale output and
+   `rows=1` (should be `rows=n_kv_heads`). Conversion ran but scales
+   were lost.
+2. `flash_attention_decode_kernel` received `kv_scales=nullptr` and
+   defaulted scale to 1.0 when dequantizing → numerical garbage.
+3. `flash_attention_prefill_batched` unconditionally fell back to N
+   sequential `flash_attention_decode` calls when `kv_int8=true`,
+   making medium-length prefills appear to hang (57-token prompt
+   took 30+ seconds vs 1.4 s with FP16 KV).
+
+Net effect: anyone passing `--int8-kv` got either a hang or garbage
+output. As of alpha.11, the flag prints a CLI warning and runs with
+FP16 KV instead. The CLI `--help` line reflects this. Proper INT8 KV
+support is tracked separately under **Path I** — needs per-(layer,
+pos, kv_head) scale storage in `KVCachePool`, plus interop with
+Path F's persistence layer (saved KV files must also carry the
+scales, or be invalidated when `kv_int8` is on).
+
+### Updated: performance numbers tightened to today's measurements
+
+Same code as alpha.10; just freshly re-measured on Jetson Orin Nano
+Super 8 GB. The previously-documented `Decode: 9.1 tok/s` was an old
+alpha.5 number that never got re-baselined; alpha.10 main today
+measures **10.0 ± 0.005 tok/s** decode on the same 33-token short
+prompt (3 samples, σ ≈ 1 ms on 40-token decode wall).
+
+The README's perf table gains a second row covering a more
+serving-realistic shape:
+
+| Shape | Prefill | TTFT | Decode |
+|---|---|---|---|
+| 33-tok cold | 38.8 tok/s | 859 ms | 10.0 tok/s |
+| **57-tok prefill + 200-tok sustained decode** | **40.8 tok/s** | 1410 ms | **9.5 tok/s** |
+
+Same physics as before — `ms/prefill-token` improves slightly on the
+longer prompt (dispatcher overhead amortizes), decode rate dips
+slightly as attention work scales with KV context length.
+
+### Not in this release
+
+- **Path I — proper INT8 KV.** Will land separately. Quality eval
+  (e.g. perplexity holdout) is also needed before flipping default.
+- **Path G G2-full (Q6_K uint16 weight loads).** G2-lite (#60) was
+  measured −0.09 tok/s, closed as no-op. G2-full needs a layout
+  redesign for ~1 tok/s projected win; not committed.
+- **Cosmetic post-hydrate prefill-log over-reporting** (Path F4b
+  artifact). Deferred.
+
 ## v0.1.0-alpha.10 — 2026-05-16
 
 Path F5: production hardening for the persistent KV cache. Caps the

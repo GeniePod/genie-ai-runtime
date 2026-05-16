@@ -9,12 +9,21 @@ on a 7.6 GB iGPU without crowding out whisper.cpp + Piper + Home Assistant.
 
 ## Status
 
-`v0.1.0-alpha.10` — Path F5 (LRU eviction + size cap + stale-tmp
-cleanup) layered on top of alpha.9's Path F. Same throughput and
-warm-turn TTFT win as alpha.9; this release makes the persistent KV
-cache **production-safe** — the cache directory now self-caps at
-1 GB by default, evicting oldest conversations by mtime instead of
-growing without bound.
+`v0.1.0-alpha.11` — release-hygiene cleanup on top of alpha.10. Same
+throughput (no kernel changes), but ships two honest fixes:
+
+1. **`--int8-kv` flag is now warned-and-ignored.** The path was
+   half-implemented since alpha.2 (`fp16_to_int8` was called without
+   capturing per-head scales; attention dequantized INT8 with scale=1.0
+   → numerical garbage AND prefill_batched fell back to N sequential
+   decode calls → effectively hung on medium prompts). Setting the
+   flag now prints a CLI warning and runs with FP16 KV. Proper INT8
+   implementation tracked as Path I (separate effort).
+2. **Documented performance numbers tightened to today's measurements.**
+   See the perf table below — the alpha.8 → alpha.10 throughput
+   numbers were measured on a 33-token short-prompt cold turn; this
+   release also reports the sustained throughput on a longer
+   serving-realistic prompt (57 tokens prefill + 200 decode).
 
 Current validated path:
 - Coherent Qwen3 instruct output with automatic chat template and no-think mode.
@@ -67,12 +76,26 @@ Latest on-device measurement: Qwen3-4B Q4_K_M, 25 W MAXN SUPER, GPU
 locked at 918 MHz, 18-token user prompt (kernel sees N≈33 after Qwen3
 chat-template wrap).
 
-| | alpha.2 | alpha.3 | alpha.5 | alpha.6 | alpha.7 | alpha.8 | alpha.9² | alpha.10² | Cumulative Δ |
-|---|---|---|---|---|---|---|---|---|---|
-| Prefill | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | 28.16 tok/s | 38.68 tok/s | 38.7 tok/s | **38.8 ± 0.04 tok/s** | **+373 %** |
-| TTFT (cold) | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | ~1170 ms | ~862 ms | 858 ms | **859 ± 3 ms** | **−61 %** |
-| Decode | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | **+21 %** |
-| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | ✓ |
+| | alpha.2 | alpha.3 | alpha.5 | alpha.6 | alpha.7 | alpha.8 | alpha.9² | alpha.10² | alpha.11² | Cumulative Δ |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Prefill (33-tok cold)  | 8.2 tok/s | 15.4 tok/s | 15.2 tok/s | 15.68 tok/s | 28.16 tok/s | 38.68 tok/s | 38.7 tok/s | 38.8 ± 0.04 tok/s | **38.8 tok/s** | **+373 %** |
+| TTFT (33-tok cold)     | 2200 ms | 1181 ms | ~1180 ms | ~1170 ms | ~1170 ms | ~862 ms | 858 ms | 859 ± 3 ms | **859 ms** | **−61 %** |
+| Decode (40-tok decode) | 7.5 tok/s | 7.5 tok/s | **9.1 tok/s** | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 9.1 tok/s | 10.0 ± 0.005 tok/s | **10.0 tok/s** | **+33 %** |
+| Output | reference | bit-identical | bit-identical | bit-identical | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | sensibly-identical¹ | ✓ |
+
+### Sustained-prompt measurement (added 2026-05-16)
+
+A second row captures a more serving-realistic shape: 57-token prompt
+(N≈57 after chat-wrap of a 24-token user message) + 200 generated
+tokens, same hardware and same alpha.11 main binary. Per-prefill-token
+gets a few % better than the 33-tok number because dispatcher overhead
+amortizes over more N; decode drops slightly as attention work scales
+with KV context length.
+
+| Shape | Prefill | TTFT | Decode |
+|---|---|---|---|
+| 33-tok cold (the table above) | **38.8 tok/s** | 859 ms | 10.0 tok/s |
+| **57-tok prefill + 200-tok sustained decode** | **40.8 tok/s** | 1410 ms | **9.5 tok/s** |
 
 ¹ Path E's `mma.sync` reorders float adds differently than scalar FMAs;
 byte-equality breaks at FP16 ULP, generated text remains
@@ -257,6 +280,7 @@ JLLM_MMQ_Q4K=0           # disable Path E (tensor-core MMQ Q4_K prefill GEMM); d
 JLLM_KV_CACHE_DIR=...    # Path F: location for persistent KV files; default: /opt/jllm/data/kv-cache
 JLLM_KV_CACHE_MAX_MB=N   # Path F5: total *.bin budget in MB (oldest LRU-evicted); default: 1024, 0 disables
 JLLM_KV_CACHE_STALE_TMP_S=N  # Path F5: age (s) past which leftover *.tmp files get cleaned; default: 60
+# (alpha.11) --int8-kv is currently warned + ignored; only FP16 KV works. Proper INT8 KV tracked as Path I.
 JLLM_FAST_GEMV=0         # use CPU reference K-quant GEMV
 JLLM_FAST_EMBD=0         # use CPU reference token embedding dequantization
 JLLM_FAST_NORM=0         # use CPU reference RMSNorm

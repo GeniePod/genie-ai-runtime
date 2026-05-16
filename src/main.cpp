@@ -83,7 +83,21 @@ Args parse_args(int argc, char** argv) {
         else if (strcmp(argv[i], "-t") == 0 && i+1 < argc) args.temperature = atof(argv[++i]);
         else if (strcmp(argv[i], "-i") == 0) args.interactive = true;
         else if (strcmp(argv[i], "-v") == 0) args.verbose = true;
-        else if (strcmp(argv[i], "--int8-kv") == 0) args.kv_int8 = true;
+        else if (strcmp(argv[i], "--int8-kv") == 0) {
+            // alpha.11: --int8-kv is currently a stub. The conversion
+            // helper (fp16_to_int8) is called without capturing per-head
+            // scales, and the attention kernel ends up dequantizing
+            // INT8 with scale=1.0 → numerical garbage AND prefill_batched
+            // falls back to N sequential decode calls, which hangs on
+            // medium-length prompts. Track the proper fix under Path I.
+            // Ignoring the flag (no functional change) until then.
+            fprintf(stderr,
+                    "[cli] WARNING: --int8-kv is currently unimplemented "
+                    "(scales not captured; attention math broken). "
+                    "Ignoring; running with FP16 KV. "
+                    "Tracked for proper fix.\n");
+            args.kv_int8 = false;
+        }
         else if (strcmp(argv[i], "--fp16-kv") == 0) args.kv_int8 = false;
         else if (strcmp(argv[i], "--chat") == 0) args.chat = true;
         else if (strcmp(argv[i], "--raw") == 0) args.raw_prompt = true;
@@ -106,8 +120,8 @@ Args parse_args(int argc, char** argv) {
                 "  --raw      Do not auto-wrap Instruct/Chat models\n"
                 "  --think    Enable Qwen3 thinking output\n"
                 "  --no-think Disable Qwen3 thinking output (default)\n"
-                "  --int8-kv  Use experimental INT8 KV cache\n"
-                "  --fp16-kv  Use FP16 KV cache (default)\n"
+                "  --int8-kv  (alpha.11: stub; warns + ignored — see Path I)\n"
+                "  --fp16-kv  Use FP16 KV cache (default; the only path that works today)\n"
                 "  --conv-id ID  Path F: persistent-KV conversation id\n"
                 "                ([A-Za-z0-9_-]{1,64}). F2 plumbing only —\n"
                 "                no persistence yet; engine logs the id.\n"
