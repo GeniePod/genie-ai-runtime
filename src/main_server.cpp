@@ -8,7 +8,7 @@
 #include <signal.h>
 
 namespace jllm {
-void run_server(Engine& engine, int port);
+void run_server(Engine& engine, int port, bool default_kv_int8);
 }
 
 static jllm::Engine* g_engine = nullptr;
@@ -79,7 +79,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Start server
-    jllm::run_server(engine, port);
+    // Start server. Pass the load-time kv_int8 so per-request GenParams
+    // built inside the handlers default to the matching format — see
+    // http_server.cpp comment for why a mismatch here corrupts decode.
+    jllm::run_server(engine, port, kv_int8);
     return 0;
 }

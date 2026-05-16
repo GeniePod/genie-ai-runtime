@@ -125,7 +125,19 @@ static void send_error(httplib::Response& res, int code,
 
 // ── Server entry ─────────────────────────────────────────────────────────
 
-void run_server(Engine& engine, int port) {
+// `default_kv_int8` is the KV cache format the Engine was loaded with —
+// must match what generate() reads from the pool, or the attention path
+// reinterprets the KV bytes against the wrong scale layout and the
+// model emits garbage. Set from main_server.cpp's --int8-kv / --fp16-kv.
+// Per-request `"kv_int8": <bool>` can still override (intended for the
+// future case where we want to surface it for diagnostics; today both
+// values produce identical results since the pool format is fixed at
+// load-time — overriding here just means "engine sees the matching
+// flag" — but if it ever drifts from the load-time value the attention
+// path will produce wrong output, so don't surface this on the client
+// side until #67 lands and the format truly becomes selectable per
+// request).
+void run_server(Engine& engine, int port, bool default_kv_int8) {
     httplib::Server svr;
     svr.set_default_headers({{"Access-Control-Allow-Origin", "*"}});
 
@@ -174,10 +186,12 @@ void run_server(Engine& engine, int port) {
         params.temperature = body.value("temperature", 0.7f);
         params.top_k       = body.value("top_k",       40);
         params.top_p       = body.value("top_p",       0.9f);
-
-        if (body.contains("kv_int8")) {
-            params.kv_int8 = body.value("kv_int8", false);
-        }
+        // CRITICAL: default to the load-time value, not the GenParams
+        // struct default — alpha.12 flipped the struct default to true,
+        // but the server keeps FP16 KV by default for Path F interop.
+        // Mismatch here = the decode path reinterprets KV bytes against
+        // the wrong format and the model emits garbage tokens.
+        params.kv_int8 = body.value("kv_int8", default_kv_int8);
 
         std::string conv_id = body.value("conversation_id", "");
         if (!conv_id.empty()) {
