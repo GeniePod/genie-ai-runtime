@@ -104,14 +104,27 @@ static int run_one_slot_round_trip() {
     CHECK_CUDA(cudaMemcpy(h_int8.data(),   d_dst,   total * sizeof(int8_t),  cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(h_scales.data(), d_scale, cfg.n_kv_heads * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // Verify each head has a distinct scale (since we made the magnitudes
-    // increase linearly across heads).
+    // Verify each head has a distinct, monotonically-increasing scale —
+    // input magnitudes go 0.1, 0.2, … 0.8 (per-head head_scale =
+    // 0.1 × (h+1)), so each head's absmax-derived scale should be
+    // ≈ head_scale / 127 and strictly larger than the previous head's.
+    // (Earlier draft of the test asserted a 1.5× growth ratio between
+    // adjacent heads — that's wrong for a linear input progression
+    // where the ratios are 2, 1.5, 1.33, 1.25, 1.2, 1.17, 1.14.)
     printf("  per-head scales:");
     for (int h = 0; h < cfg.n_kv_heads; h++) printf(" %.4g", h_scales[h]);
     printf("\n");
-    for (int h = 1; h < cfg.n_kv_heads; h++) {
-        if (h_scales[h] <= h_scales[h - 1] * 1.5f) {
-            fprintf(stderr, "FAIL: head %d scale (%g) does not scale up vs head %d (%g)\n",
+    for (int h = 0; h < cfg.n_kv_heads; h++) {
+        const float expected = (0.1f * (float)(h + 1)) / 127.0f;
+        const float ratio    = h_scales[h] / expected;
+        if (ratio < 0.5f || ratio > 1.5f) {
+            fprintf(stderr, "FAIL: head %d scale %.4g not within 0.5–1.5× of "
+                            "expected %.4g (ratio %.3f)\n",
+                    h, h_scales[h], expected, ratio);
+            cudaFree(d_src); pool.destroy(); return 1;
+        }
+        if (h > 0 && h_scales[h] <= h_scales[h - 1]) {
+            fprintf(stderr, "FAIL: head %d scale %.4g not strictly > head %d %.4g\n",
                     h, h_scales[h], h - 1, h_scales[h - 1]);
             cudaFree(d_src); pool.destroy(); return 1;
         }
