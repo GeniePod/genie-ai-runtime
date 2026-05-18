@@ -20,7 +20,9 @@
 
 #include <cstdio>
 #include <ctime>
+#include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 
 using json = nlohmann::json;
@@ -292,6 +294,7 @@ static void stream_chat_completion(httplib::Response& res, Engine& engine,
                 splitter.flush(emit_segment);
             } catch (const std::exception& e) {
                 errored = true;
+                fprintf(stderr, "[http] streaming chat failed: %s\n", e.what());
                 if (client_alive) {
                     std::string err = "data: " + json{{"error", json{
                         {"message", e.what()},
@@ -391,6 +394,12 @@ void run_server(Engine& engine, int port, bool default_kv_int8) {
 
         const bool think = body.value("think", false);
         const std::string prompt = format_qwen_chat(messages, think);
+        fprintf(stderr,
+                "[http] chat request body_bytes=%zu messages=%zu "
+                "prompt_bytes=%zu stream=%d max_tokens=%d think=%d\n",
+                req.body.size(), messages.size(), prompt.size(),
+                body.value("stream", false) ? 1 : 0,
+                params.max_tokens, think ? 1 : 0);
 
         if (body.value("stream", false)) {
             // SSE path — mutex is taken inside the chunked-content
@@ -401,9 +410,20 @@ void run_server(Engine& engine, int port, bool default_kv_int8) {
             return;
         }
 
-        std::lock_guard<std::mutex> lk(g_engine_mutex);
-        res.set_content(build_completion(engine, prompt, params).dump(),
-                        "application/json");
+        try {
+            std::lock_guard<std::mutex> lk(g_engine_mutex);
+            res.set_content(build_completion(engine, prompt, params).dump(),
+                            "application/json");
+        } catch (const std::length_error& e) {
+            fprintf(stderr, "[http] chat rejected: %s\n", e.what());
+            send_error(res, 400, e.what(), "invalid_request_error");
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[http] ERROR: chat completion failed: %s\n", e.what());
+            send_error(res, 500, e.what(), "internal_error");
+        } catch (...) {
+            fprintf(stderr, "[http] ERROR: chat completion failed: unknown exception\n");
+            send_error(res, 500, "chat completion failed", "internal_error");
+        }
     });
 
     // OPTIONS for CORS preflight — needed for browser-based callers.

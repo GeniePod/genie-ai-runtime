@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 #include <unistd.h>
 #include <sys/mman.h>   // BUG #4 fix
 
@@ -1626,6 +1627,15 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         prompt_tokens.push_back(tokenizer_.bos_id);
     }
 
+    const int kv_token_limit = kv_cache_.max_tokens();
+    if ((int)prompt_tokens.size() >= kv_token_limit) {
+        throw std::length_error(
+            "prompt length " + std::to_string(prompt_tokens.size()) +
+            " tokens exceeds runtime context capacity " +
+            std::to_string(kv_token_limit) +
+            " tokens; reduce the prompt/history or start the server with a larger -c value");
+    }
+
     // Path F4a (#45): track the tokens whose K/V state is committed to
     // the cache, in order, so we can persist them alongside the KV bytes
     // and F4b can find the longest common prefix between a cached
@@ -1812,7 +1822,6 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     // Decode loop (t2 already taken above so it covers Path A too).
     int64_t peak_mem = 0;
     float peak_temp = 0;
-    const int kv_token_limit = kv_cache_.max_tokens();
     // Path A: the first generated token (if any) was already sampled
     // above. Position advances to N (one past the prompt) — we did NOT
     // double-store position N-1 in the KV cache, unlike the previous
