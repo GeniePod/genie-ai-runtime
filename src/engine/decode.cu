@@ -1621,13 +1621,25 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     // (tokenization + prefill + first decode step).
     auto t_request = Clock::now();
 
+    const int kv_token_limit = kv_cache_.max_tokens();
+    const size_t max_prompt_bytes = std::max<size_t>(
+        4096, (size_t)kv_token_limit * 8);
+    if (prompt.size() > max_prompt_bytes) {
+        throw std::length_error(
+            "prompt size " + std::to_string(prompt.size()) +
+            " bytes exceeds runtime pre-tokenization budget " +
+            std::to_string(max_prompt_bytes) +
+            " bytes for context capacity " +
+            std::to_string(kv_token_limit) +
+            " tokens; reduce the prompt/history or start the server with a larger -c value");
+    }
+
     auto prompt_tokens = tokenizer_.encode(prompt);
     stats.prompt_tokens = prompt_tokens.size();
     if (prompt_tokens.empty()) {
         prompt_tokens.push_back(tokenizer_.bos_id);
     }
 
-    const int kv_token_limit = kv_cache_.max_tokens();
     if ((int)prompt_tokens.size() >= kv_token_limit) {
         throw std::length_error(
             "prompt length " + std::to_string(prompt_tokens.size()) +
