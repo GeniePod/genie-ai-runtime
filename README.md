@@ -25,7 +25,7 @@ Hello! How can I assist you today?
 - **Models:** GGUF only. Validated on Qwen3-4B-Q4_K_M; the architecture path supports any Qwen-family / Llama-3-family model the loader can parse.
 - **Kernels:** custom CUDA for SM 8.7 — INT4 dequant-fused GEMV, tensor-core MMQ Q4_K prefill, flash attention, fused RMSNorm + RoPE + SwiGLU.
 - **Memory model:** pre-allocated KV and scratch pools accounted before any inference starts; OOM-guard prevents crashes.
-- **KV cache:** INT8 by default (alpha.12, FP16-ULP-bounded drift); FP16 opt-in. Persistent across turns (Path F) when a `conversation_id` is given.
+- **KV cache:** INT8 by default (alpha.12, FP16-ULP-bounded drift); FP16 opt-in. Persistent across turns (Path F) when a `conversation_id` or `nvext.agent_hints.session_id` is given, with per-response KV reuse counters.
 - **Two binaries:**
   - `jetson-llm` — single-prompt / interactive CLI (default build).
   - `jetson-llm-server` — OpenAI-compatible HTTP server (opt-in: `-DJLLM_BUILD_SERVER=ON`).
