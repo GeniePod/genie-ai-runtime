@@ -74,7 +74,9 @@ using TokenCallback = std::function<void(const char* text, bool is_eos)>;
 
 struct GenStats {
     int     prompt_tokens      = 0;
+    int     prefill_tokens     = 0;
     int     completion_tokens  = 0;
+    int     kv_cache_reused_tokens = 0;
     float   prompt_ms          = 0;
     float   decode_ms          = 0;
     // Time-to-first-token: end-to-end wall clock from the start of

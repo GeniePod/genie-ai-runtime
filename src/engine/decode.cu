@@ -1667,6 +1667,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     // range. 0 means cold prefill (no cache file or no match).
     const int prefill_start = try_hydrate_kv(prompt_tokens,
                                              params.conversation_id);
+    stats.kv_cache_reused_tokens = prefill_start;
     if (debug_kernels_enabled()) {
         fprintf(stderr, "[tokenizer] prompt tokens:");
         for (int i = 0; i < (int)prompt_tokens.size() && i < 16; i++) {
@@ -1707,6 +1708,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     // the cache already covered the full prompt — handled as a special
     // case below (no Path A residual, fall through to fallback decode).
     const int M = N - prefill_start;
+    stats.prefill_tokens = M;
 
     if (M > 0 && batched_prefill_enabled() && batched_fits) {
         // Path B (issue #12): layer-major prefill. Allocate one
@@ -1773,10 +1775,13 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     cudaStreamSynchronize(stream_);
     auto t1 = Clock::now();
     stats.prompt_ms = Ms(t1 - t0).count();
-    if (stats.prompt_tokens > 0)
-        stats.prompt_tok_per_sec = stats.prompt_tokens / (stats.prompt_ms / 1000.0f);
-    fprintf(stderr, "[engine] Prefill: %d tokens in %.0f ms (%.1f tok/s)\n",
-            stats.prompt_tokens, stats.prompt_ms, stats.prompt_tok_per_sec);
+    if (stats.prefill_tokens > 0 && stats.prompt_ms > 0)
+        stats.prompt_tok_per_sec = stats.prefill_tokens / (stats.prompt_ms / 1000.0f);
+    fprintf(stderr,
+            "[engine] Prefill: %d new / %d prompt tokens in %.0f ms "
+            "(%.1f tok/s, kv_reused=%d)\n",
+            stats.prefill_tokens, stats.prompt_tokens, stats.prompt_ms,
+            stats.prompt_tok_per_sec, stats.kv_cache_reused_tokens);
 
     // Decode timer starts here so the Path A first-token sampling below
     // and the subsequent decode-loop iterations are both attributed to

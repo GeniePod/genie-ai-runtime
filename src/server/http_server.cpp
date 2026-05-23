@@ -295,6 +295,19 @@ static json build_completion(Engine& engine, const std::string& prompt,
     json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) message["reasoning_content"] = reasoning;
 
+    json cache = {
+        {"prompt_tokens", stats.prompt_tokens},
+        {"prefill_tokens", stats.prefill_tokens},
+        {"kv_reused_tokens", stats.kv_cache_reused_tokens},
+        {"kv_reuse_ratio",
+            stats.prompt_tokens > 0
+                ? (double)stats.kv_cache_reused_tokens / (double)stats.prompt_tokens
+                : 0.0},
+    };
+    if (!params.conversation_id.empty()) {
+        cache["conversation_id"] = params.conversation_id;
+    }
+
     return json{
         {"id",      "jllm-" + std::to_string(std::time(nullptr))},
         {"object",  "chat.completion"},
@@ -318,6 +331,7 @@ static json build_completion(Engine& engine, const std::string& prompt,
             {"ttft_ms",      stats.ttft_ms},
             {"peak_mem_mb",  stats.peak_memory_mb},
             {"peak_temp_c",  stats.peak_thermal_c},
+            {"cache",        cache},
         }},
     };
 }
