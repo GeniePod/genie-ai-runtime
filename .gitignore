@@ -44,3 +44,6 @@ core.*
 *.gcda
 *.gcno
 *.profraw
+
+# Soak harness outputs (issue #4)
+soak-runs/
