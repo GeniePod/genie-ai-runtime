@@ -1661,12 +1661,40 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     kv_tokens.reserve(prompt_tokens.size() + params.max_tokens);
     for (int t : prompt_tokens) kv_tokens.push_back((uint32_t)t);
 
-    // Path F4b (#45): try hydrating KV state from a persisted cache for
-    // this conversation_id. Returns the longest common prefix between
-    // the cached tokens and prompt_tokens; we'll skip prefill for that
-    // range. 0 means cold prefill (no cache file or no match).
-    const int prefill_start = try_hydrate_kv(prompt_tokens,
-                                             params.conversation_id);
+    // In-memory prefix cache: the KV buffers still hold the previous
+    // request's tokens (requests are serialized by the server mutex and
+    // nothing zeroes the KV between turns). Reuse the longest common prefix
+    // with the resident tokens and skip prefill for it — this is what makes
+    // the shared system prompt free across unrelated requests, with zero disk
+    // I/O. RoPE/positions stay consistent because the shared prefix sits at
+    // the same absolute positions. Capped at size()-1 so we always prefill
+    // >=1 token (the M>0 path; M==0 has no Path A residual). Causal attention
+    // only reads [0, pos], so the stale KV beyond the new sequence is never
+    // read — exactly as in the cold path. Disable with JLLM_NO_PREFIX_CACHE=1.
+    int prefill_start = 0;
+    if (getenv("JLLM_NO_PREFIX_CACHE") == nullptr) {
+        const int cap = std::min((int)resident_tokens_.size(),
+                                 (int)prompt_tokens.size() - 1);
+        int matched = 0;
+        while (matched < cap &&
+               resident_tokens_[matched] == (uint32_t)prompt_tokens[matched]) {
+            matched++;
+        }
+        if (matched > 0) {
+            prefill_start = matched;
+            fprintf(stderr,
+                    "[kv_cache] in-memory prefix reuse: %d / %zu prompt tokens "
+                    "(resident %zu) — skipping prefill for matched prefix\n",
+                    matched, prompt_tokens.size(), resident_tokens_.size());
+        }
+    }
+
+    // Path F4b (#45): fall back to the persisted conversation_id cache only
+    // when the in-memory prefix missed (cold start, or a divergent first
+    // token). Returns the longest common prefix it could hydrate; 0 = cold.
+    if (prefill_start == 0) {
+        prefill_start = try_hydrate_kv(prompt_tokens, params.conversation_id);
+    }
     if (debug_kernels_enabled()) {
         fprintf(stderr, "[tokenizer] prompt tokens:");
         for (int i = 0; i < (int)prompt_tokens.size() && i < 16; i++) {
@@ -2035,6 +2063,16 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                 }
             }
         }
+    }
+
+    // Remember the tokens now resident in the KV buffers so the next request
+    // can reuse the common prefix. Skip if the KV overflowed the fast pool
+    // (the contiguous-prefix invariant the in-memory reuse relies on no longer
+    // holds) — clearing forces a clean cold prefill next time.
+    if ((int)kv_tokens.size() <= kv_cache_.config().max_context) {
+        resident_tokens_ = std::move(kv_tokens);
+    } else {
+        resident_tokens_.clear();
     }
 
     return stats;

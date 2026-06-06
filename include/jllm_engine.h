@@ -227,6 +227,14 @@ private:
     int           last_token_ = 0;
     std::vector<int> recent_tokens_;
 
+    // In-memory prefix cache: the token sequence whose K/V is currently
+    // resident in kv_cache_ (the previous request's prompt + generated
+    // tokens). Requests are serialized by the server mutex and nothing zeroes
+    // the KV between turns, so a new request can skip prefill for the longest
+    // common prefix with these tokens — reusing the shared system prompt
+    // across unrelated requests with no disk I/O. Empty = cold (no reuse).
+    std::vector<uint32_t> resident_tokens_;
+
     cudaStream_t    stream_ = nullptr;
     cudaGraph_t     decode_graph_ = nullptr;
     cudaGraphExec_t decode_graph_exec_ = nullptr;
