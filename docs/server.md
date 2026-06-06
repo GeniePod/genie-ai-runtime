@@ -86,7 +86,23 @@ Qwen chat template; the rolling context determines the answer.
 | `stream`          | bool   | false   | Emit `text/event-stream` chunks instead of one JSON body |
 | `think`           | bool   | false   | Allow Qwen3 thinking-mode output. When `true`, the model may emit `<think>reasoning</think>final answer` — the server splits the two and returns them in separate fields (see "Reasoning output" below). When `false`, an empty think block is prefixed to suppress reasoning. |
 | `conversation_id` | string | —       | Path F persistent KV id (`[A-Za-z0-9_-]{1,64}`); only effective under FP16 KV today |
+| `nvext`           | object | —       | Optional Dynamo-style harness hints. `nvext.agent_hints.session_id` can supply the KV session when `conversation_id` is absent; `priority`, `osl`, `speculative_prefill`, and `cache_control.ttl` are accepted and echoed for observability. |
 | `kv_int8`         | bool   | (load)  | Override KV format per-request. Defaults to whatever the server was loaded with; mismatch with load-time format produces garbage tokens. Don't surface to clients today — see [#67](https://github.com/GeniePod/genie-ai-runtime/issues/67). |
+
+Cache-aware GenieClaw requests use both the legacy top-level
+`conversation_id` and the structured extension:
+
+```json
+{
+  "messages": [{"role": "user", "content": "Turn on the kitchen lights"}],
+  "max_tokens": 128,
+  "conversation_id": "conv-19f8",
+  "nvext": {
+    "agent_hints": {"session_id": "conv-19f8", "priority": 50, "osl": 128},
+    "cache_control": {"type": "ephemeral", "ttl": "15m"}
+  }
+}
+```
 
 **Non-streaming response** (typical):
 
@@ -111,7 +127,14 @@ curl -s http://jetson:8080/v1/chat/completions \
   "usage": {"prompt_tokens": 17, "completion_tokens": 7, "total_tokens": 24},
   "jetson": {
     "decode_tok_s": 11.6, "prompt_tok_s": 37.6, "ttft_ms": 914,
-    "peak_mem_mb": 0, "peak_temp_c": 0.0
+    "peak_mem_mb": 0, "peak_temp_c": 0.0,
+    "cache": {
+      "prompt_tokens": 17,
+      "prefill_tokens": 17,
+      "kv_reused_tokens": 0,
+      "kv_reuse_ratio": 0.0,
+      "conversation_id": "conv-19f8"
+    }
   }
 }
 ```
@@ -119,7 +142,9 @@ curl -s http://jetson:8080/v1/chat/completions \
 The `jetson` block is a non-standard extension with Jetson-specific
 perf metrics. (`peak_mem_mb` / `peak_temp_c` currently report 0 on the
 server path — the decode-side live-stats watcher used by the CLI isn't
-attached yet. Cosmetic; tracked separately.)
+attached yet. Cosmetic; tracked separately.) The nested `cache` object
+separates full prompt length from newly-prefilled tokens, which makes
+Path F KV reuse visible in normal API responses.
 
 **Streaming** — set `"stream": true` and read `text/event-stream`:
 
