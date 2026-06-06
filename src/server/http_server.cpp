@@ -537,6 +537,10 @@ void run_server(Engine& engine, int port, bool default_kv_int8) {
         // the wrong format and the model emits garbage tokens.
         params.kv_int8 = body.value("kv_int8", default_kv_int8);
 
+        // #86: optional GBNF grammar for constrained decoding. Empty = off.
+        params.grammar      = body.value("grammar",      std::string());
+        params.grammar_root = body.value("grammar_root", std::string("root"));
+
         AgentRequestHints request_hints = parse_agent_request_hints(body);
         std::string conv_id = body.value("conversation_id", "");
         if (conv_id.empty() && !request_hints.session_id.empty()) {

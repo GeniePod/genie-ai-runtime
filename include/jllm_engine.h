@@ -5,6 +5,7 @@
 #include "jllm_memory.h"
 #include "jllm_jetson.h"
 #include "jllm_kernels.h"
+#include "jllm_grammar.h"
 #include <cuda_runtime.h>
 #include <string>
 #include <vector>
@@ -63,6 +64,13 @@ struct GenParams {
     // ≤ 64 chars accepted. Invalid IDs are dropped at the CLI / HTTP
     // boundary, never reach the engine.
     std::string conversation_id;
+
+    // #86: GBNF grammar for constrained decoding. Empty = unconstrained
+    // (default; zero overhead). When non-empty and it parses, the sampler
+    // masks every token that can't continue a valid string under the
+    // grammar, guaranteeing structurally-valid output (e.g. tool-call JSON).
+    std::string grammar;
+    std::string grammar_root = "root";  // entry rule name
 };
 
 // Returns true if `id` is empty or matches /^[A-Za-z0-9_-]{1,64}$/.
@@ -228,6 +236,16 @@ private:
 
     int           last_token_ = 0;
     std::vector<int> recent_tokens_;
+
+    // #86: grammar-constrained decoding state. grammar_active_ is set per
+    // generate() when GenParams::grammar parses. grammar_token_bytes_ maps
+    // token id -> literal output bytes; built once from the tokenizer (vocab
+    // is fixed after load) and reused across requests.
+    Grammar                  grammar_;
+    GrammarState             grammar_state_;
+    bool                     grammar_active_ = false;
+    std::vector<std::string> grammar_token_bytes_;
+    void prepare_grammar(const GenParams& params);
 
     // In-memory prefix cache: the token sequence whose K/V is currently
     // resident in kv_cache_ (the previous request's prompt + generated

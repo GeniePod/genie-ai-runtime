@@ -79,6 +79,7 @@ set(ENGINE_SRC
     src/engine/model.cpp
     src/engine/decode.cu
     src/engine/sample.cpp
+    src/engine/grammar.cpp
     src/engine/tokenizer.cpp
 )
 
@@ -169,6 +170,11 @@ enable_testing()
 add_executable(test_memory tests/test_memory.cpp)
 target_link_libraries(test_memory PRIVATE jetson_llm_core)
 add_test(NAME memory COMMAND test_memory)
+
+# #86: GBNF grammar engine — pure host C++, no GPU needed to run.
+add_executable(test_grammar tests/test_grammar.cpp)
+target_link_libraries(test_grammar PRIVATE jetson_llm_core)
+add_test(NAME grammar COMMAND test_grammar)
 
 add_executable(test_kernels tests/test_kernels.cu)
 target_link_libraries(test_kernels PRIVATE jetson_llm_core)
