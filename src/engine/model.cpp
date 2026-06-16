@@ -129,6 +129,10 @@ ModelConfig load_gguf_config(const std::string& path) {
     fprintf(stderr, "[gguf] Version %u, %lu tensors, %lu metadata entries\n",
             hdr.version, hdr.n_tensors, hdr.n_kv);
 
+    // Gemma 4 (#88): final-logit softcap is read here and folded into the
+    // recipe after the metadata loop (the recipe is built once arch is known).
+    float g4_final_softcap = 0.0f;
+
     // Read metadata key-value pairs
     // This is a simplified reader — production code should handle all GGUF types
     for (uint64_t i = 0; i < hdr.n_kv && i < 256; i++) {
@@ -167,10 +171,23 @@ ModelConfig load_gguf_config(const std::string& path) {
             uint32_t val;
             fread(&val, sizeof(val), 1, f);
 
-            if (strstr(key, "block_count"))        cfg.n_layers = val;
+            // Gemma 4 per-attention-type / PLE hparams (#88). Match the longer
+            // keys before their shorter prefixes — the reader uses strstr
+            // (substring), so "key_length_swa" must be tested before
+            // "key_length", "sliding_window_pattern" before "sliding_window",
+            // and "embedding_length_per_layer_input" before "embedding_length".
+            if (strstr(key, "attention.key_length_swa") ||
+                strstr(key, "attention.value_length_swa")) cfg.sliding_head_dim = val;
+            else if (strstr(key, "attention.sliding_window_pattern")) cfg.sliding_window_pattern = val;
+            else if (strstr(key, "attention.sliding_window")) cfg.sliding_window = val;
+            else if (strstr(key, "attention.shared_kv_layers")) cfg.n_kv_shared_layers = val;
+            else if (strstr(key, "embedding_length_per_layer_input")) cfg.ple_input_dim = val;
+            else if (strstr(key, "block_count"))   cfg.n_layers = val;
             else if (strstr(key, "head_count_kv")) cfg.n_kv_heads = val;
             else if (strstr(key, "head_count"))    cfg.n_heads = val;
-            else if (strstr(key, "attention.key_length")) cfg.head_dim = val;
+            // For Gemma 4 the non-SWA key_length is the full/global head dim;
+            // it also seeds head_dim for the Llama/Qwen path (unchanged there).
+            else if (strstr(key, "attention.key_length")) { cfg.head_dim = val; cfg.global_head_dim = val; }
             else if (strstr(key, "attention.value_length")) cfg.head_dim = val;
             else if (strstr(key, "embedding_length")) cfg.hidden_dim = val;
             else if (strstr(key, "feed_forward_length")) cfg.intermediate_dim = val;
@@ -179,9 +196,11 @@ ModelConfig load_gguf_config(const std::string& path) {
         } else if (vtype == 6) {  // GGUF_TYPE_FLOAT32
             float val;
             fread(&val, sizeof(val), 1, f);
-            if (strstr(key, "rope.freq_base")) cfg.rope_theta = val;
+            if (strstr(key, "rope.freq_base_swa")) cfg.rope_theta_swa = val;  // gemma4 local
+            else if (strstr(key, "rope.freq_base")) cfg.rope_theta = val;
             else if (strstr(key, "layer_norm_rms_epsilon") ||
                      strstr(key, "rms_norm_eps")) cfg.rms_eps = val;
+            else if (strstr(key, "final_logit_softcapping")) g4_final_softcap = val;
         } else if (vtype == 8) {  // GGUF_TYPE_STRING
             uint64_t str_len;
             fread(&str_len, sizeof(str_len), 1, f);
@@ -192,10 +211,12 @@ ModelConfig load_gguf_config(const std::string& path) {
             } else if (strstr(key, "general.architecture")) {
                 std::string arch(str_len, '\0');
                 fread(&arch[0], 1, str_len, f);
+                cfg.arch_name = arch;
                 cfg.rope_neox =
                     arch == "qwen" || arch == "qwen2" || arch == "qwen3" ||
                     arch == "qwen2moe" || arch == "qwen3moe" ||
                     arch == "gemma" || arch == "gemma2" || arch == "gemma3" ||
+                    arch == "gemma4" || arch == "gemma4-assistant" ||
                     arch == "phi2" || arch == "phi3" || arch == "gptneox" ||
                     arch == "olmo" || arch == "olmo2";
             } else {
@@ -216,6 +237,30 @@ ModelConfig load_gguf_config(const std::string& path) {
     if (cfg.rope_theta == 0.0f) cfg.rope_theta = 10000.0f;
     if (cfg.max_seq_len == 0) cfg.max_seq_len = 2048;
     if (cfg.n_kv_heads == 0) cfg.n_kv_heads = cfg.n_heads;
+
+    // Resolve architecture family + forward recipe (#88, #89). The default
+    // recipe (LlamaQwen) reproduces the original hardcoded behavior exactly;
+    // Gemma 4 selects its divergent knobs. The recipe is consumed by the
+    // forward pass — currently gated in Engine::load until #92/#93 land.
+    if (cfg.arch_name == "gemma4" || cfg.arch_name == "gemma4-assistant") {
+        cfg.arch                      = Arch::Gemma4;
+        cfg.spec.arch                 = Arch::Gemma4;
+        cfg.spec.ffn_activation       = FfnActivation::GeluGeGLU;
+        cfg.spec.scale_embeddings     = true;
+        cfg.spec.attn_scale           = 1.0f;   // Gemma 4 query scaling = 1.0 (verify vs HF in #92)
+        cfg.spec.final_logit_softcap  = g4_final_softcap;
+        cfg.spec.post_attn_norm       = true;
+        cfg.spec.post_ffn_norm        = true;
+        cfg.spec.per_layer_head_dim   = (cfg.global_head_dim > 0 &&
+                                         cfg.sliding_head_dim > 0 &&
+                                         cfg.global_head_dim != cfg.sliding_head_dim);
+        cfg.spec.dual_rope            = (cfg.rope_theta_swa > 0.0f);
+        cfg.spec.sliding_window       = (cfg.sliding_window > 0);
+        cfg.spec.kv_shared_layers     = cfg.n_kv_shared_layers;
+        cfg.spec.per_layer_embeddings = (cfg.ple_input_dim > 0);
+    } else {
+        cfg.arch = Arch::LlamaQwen;
+    }
 
     fclose(f);
 

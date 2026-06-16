@@ -14,6 +14,45 @@
 
 namespace jllm {
 
+// ── Architecture recipe ──────────────────────────────────────────────────
+// The forward pass was originally hardcoded to the Qwen3 / Llama-3 shape.
+// `Arch` + `ArchSpec` make the model-family-specific behavior data-driven, so a
+// new architecture (Gemma 4, ...) is a *recipe* rather than a fork of the hot
+// path. The default recipe reproduces the original Qwen/Llama behavior exactly;
+// Gemma-specific knobs are off by default. See docs/gemma4-plan.md and issue #89.
+
+enum class Arch {
+    LlamaQwen,   // Llama-3 / Qwen2 / Qwen3 family — the original hardcoded path
+    Gemma4,      // Gemma 4 (PLE, dual head dim, dual RoPE, GeGLU, 4 norms, ...)
+    Unknown,
+};
+
+enum class FfnActivation {
+    SiluSwiGLU,  // silu(gate) * up      — Llama / Qwen
+    GeluGeGLU,   // gelu_tanh(gate) * up — Gemma
+};
+
+// Per-model-family forward recipe, read by the engine instead of hardcoded
+// constants.
+struct ArchSpec {
+    Arch          arch                 = Arch::LlamaQwen;
+    FfnActivation ffn_activation       = FfnActivation::SiluSwiGLU;
+    bool          scale_embeddings     = false;  // token embeds *= sqrt(hidden_dim)
+    float         attn_scale           = 0.0f;   // 0 => default 1/sqrt(head_dim)
+    float         final_logit_softcap  = 0.0f;   // 0 => off; else c*tanh(logit/c)
+    // Norm layout. LlamaQwen: input + pre-ffn (post-attention) norms only.
+    // Gemma 4 adds a post-attention norm (attn output, pre-residual) and a
+    // post-ffn norm (ffn output, pre-residual).
+    bool          post_attn_norm       = false;
+    bool          post_ffn_norm        = false;
+    // Per-attention-type behavior (Gemma 4: sliding/local vs full/global layers).
+    bool          per_layer_head_dim   = false;  // sliding 256 / full 512
+    bool          dual_rope            = false;  // local vs global theta + rotary frac
+    bool          sliding_window       = false;  // alternating local/global mask
+    int           kv_shared_layers     = 0;      // trailing layers reusing K/V (0 => none)
+    bool          per_layer_embeddings = false;  // PLE auxiliary pathway (Gemma 4 E2B)
+};
+
 // ── Model config (read from GGUF header) ─────────────────────────────────
 
 struct ModelConfig {
@@ -30,6 +69,23 @@ struct ModelConfig {
     float       rms_eps        = 1e-5f;
     bool        rope_neox      = false;
     int         quant_type     = 0;
+
+    // Architecture family + forward recipe (issue #89). `arch_name` is the raw
+    // GGUF general.architecture string; `spec` data-drives the forward pass.
+    std::string arch_name;
+    Arch        arch           = Arch::LlamaQwen;
+    ArchSpec    spec;
+
+    // Gemma 4 numeric hparams (valid only when arch == Arch::Gemma4). Head dim
+    // differs by attention type: sliding (local) layers use `head_dim`; full
+    // (global) layers use `global_head_dim`.
+    int         global_head_dim        = 0;   // gemma4.attention.key_length (full)
+    int         sliding_head_dim       = 0;   // gemma4.attention.key_length_swa (local)
+    int         sliding_window         = 0;   // gemma4.attention.sliding_window
+    int         sliding_window_pattern = 0;   // gemma4: 6 => 5 local : 1 global
+    int         n_kv_shared_layers     = 0;   // gemma4.attention.shared_kv_layers
+    int         ple_input_dim          = 0;   // gemma4.embedding_length_per_layer_input
+    float       rope_theta_swa         = 0.0f;// gemma4.rope.freq_base_swa (local)
 
     int gqa_group_size() const { return n_kv_heads > 0 ? n_heads / n_kv_heads : 1; }
     int64_t weight_bytes() const;
