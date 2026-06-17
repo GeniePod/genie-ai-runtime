@@ -288,15 +288,21 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
                     uint64_t alen;
                     fread(&atype, 4, 1, f);
                     fread(&alen, 8, 1, f);
-                    // Skip array elements (rough)
-                    for (uint64_t a = 0; a < alen; a++) {
-                        if (atype == 8) {  // string array
+                    if (atype == 8) {  // string array: each is len + bytes
+                        for (uint64_t a = 0; a < alen; a++) {
                             uint64_t slen;
                             fread(&slen, 8, 1, f);
                             fseek(f, slen, SEEK_CUR);
-                        } else if (atype == 6) fseek(f, 4, SEEK_CUR);
-                        else if (atype == 4) fseek(f, 4, SEEK_CUR);
-                        else fseek(f, 4, SEEK_CUR);  // guess
+                        }
+                    } else {
+                        // Fixed-width element: size by GGUF type id so bool(7),
+                        // int8(0/1), int16(2/3), and 64-bit(10/11/12) arrays are
+                        // skipped correctly (a wrong guess here desyncs the whole
+                        // metadata stream — e.g. Gemma's bool sliding_window_pattern).
+                        int esz = (atype <= 1 || atype == 7) ? 1
+                                  : (atype <= 3)            ? 2
+                                  : (atype <= 6)            ? 4 : 8;
+                        fseek(f, (long)alen * esz, SEEK_CUR);
                     }
                     break;
                 }
