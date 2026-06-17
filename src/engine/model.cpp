@@ -222,6 +222,38 @@ ModelConfig load_gguf_config(const std::string& path) {
             } else {
                 fseek(f, str_len, SEEK_CUR);
             }
+        } else if (vtype == 9) {  // GGUF_TYPE_ARRAY
+            // Gemma 4 stores several hparams per-layer as arrays. Skip every
+            // array by its true element size (a wrong guess desyncs the whole
+            // metadata stream), capturing the ones we need along the way.
+            uint32_t atype;
+            uint64_t alen;
+            fread(&atype, 4, 1, f);
+            fread(&alen, 8, 1, f);
+            bool want_ff  = strstr(key, "feed_forward_length") != nullptr;
+            bool want_swp = strstr(key, "sliding_window_pattern") != nullptr;
+            bool want_kv  = strstr(key, "head_count_kv") != nullptr;
+            if (atype == 8) {  // string array
+                for (uint64_t a = 0; a < alen; a++) {
+                    uint64_t sl; fread(&sl, 8, 1, f); fseek(f, sl, SEEK_CUR);
+                }
+            } else {
+                int esz = (atype <= 1 || atype == 7) ? 1
+                          : (atype <= 3)            ? 2
+                          : (atype <= 6)            ? 4 : 8;
+                if ((want_ff || want_swp || want_kv) && (esz == 1 || esz == 4)) {
+                    for (uint64_t a = 0; a < alen; a++) {
+                        long long v = 0;
+                        if (esz == 1) { unsigned char b; fread(&b, 1, 1, f); v = b; }
+                        else          { uint32_t u; fread(&u, 4, 1, f); v = (int32_t)u; }
+                        if (want_ff)  cfg.ff_per_layer.push_back((int)v);
+                        if (want_swp) cfg.layer_is_sliding.push_back((int)(v != 0));
+                        if (want_kv && a == 0) cfg.n_kv_heads = (int)v;
+                    }
+                } else {
+                    fseek(f, (long)alen * esz, SEEK_CUR);
+                }
+            }
         } else {
             // Skip unknown types (need proper GGUF parser for production)
             // For now, try to skip common sizes
@@ -258,6 +290,14 @@ ModelConfig load_gguf_config(const std::string& path) {
         cfg.spec.sliding_window       = (cfg.sliding_window > 0);
         cfg.spec.kv_shared_layers     = cfg.n_kv_shared_layers;
         cfg.spec.per_layer_embeddings = (cfg.ple_input_dim > 0);
+        // feed_forward_length is a per-layer array; the scalar handler never
+        // fired. Use the largest (double-wide) value so scratch buffers fit
+        // every layer; the forward indexes ff_per_layer per layer.
+        if (!cfg.ff_per_layer.empty()) {
+            int mx = 0;
+            for (int v : cfg.ff_per_layer) mx = std::max(mx, v);
+            cfg.intermediate_dim = mx;
+        }
     } else {
         cfg.arch = Arch::LlamaQwen;
     }

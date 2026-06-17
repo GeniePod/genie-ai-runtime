@@ -86,6 +86,9 @@ struct ModelConfig {
     int         n_kv_shared_layers     = 0;   // gemma4.attention.shared_kv_layers
     int         ple_input_dim          = 0;   // gemma4.embedding_length_per_layer_input
     float       rope_theta_swa         = 0.0f;// gemma4.rope.freq_base_swa (local)
+    // gemma4 per-layer tables (parsed from GGUF arrays).
+    std::vector<int> ff_per_layer;            // feed_forward_length per layer (6144 / 12288)
+    std::vector<int> layer_is_sliding;        // 1 = sliding (local), 0 = full (global)
 
     int gqa_group_size() const { return n_kv_heads > 0 ? n_heads / n_kv_heads : 1; }
     int64_t weight_bytes() const;
