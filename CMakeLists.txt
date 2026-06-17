@@ -218,6 +218,14 @@ add_executable(test_mmq_q4k_multiwarp tests/test_mmq_q4k_multiwarp.cu)
 target_link_libraries(test_mmq_q4k_multiwarp PRIVATE CUDA::cudart)
 add_test(NAME mmq_q4k_multiwarp COMMAND test_mmq_q4k_multiwarp)
 
+# Path E phase E6: int8 tensor-core MMQ Q4_K kernel. Replaces the E5 f16
+# mma.m16n8k16 (dequant->fp16) with mma.m16n8k32.s8.s8.s32 on raw nibbles x
+# q8_1 activations, scales applied in a float epilogue. Validates against an
+# int8 reference (tight) and reports the q8_1 quant error vs the fp16 ref.
+add_executable(test_mmq_q4k_int8 tests/test_mmq_q4k_int8.cu)
+target_link_libraries(test_mmq_q4k_int8 PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_int8 COMMAND test_mmq_q4k_int8)
+
 # Path F phase F1: KV cache serialization round-trip. Standalone test
 # that exercises the on-disk format (header + body) we'll use in F3 to
 # persist per-conversation KV state. No engine integration yet.
