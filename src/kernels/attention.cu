@@ -29,6 +29,46 @@ static bool fast_attention_enabled() {
     return enabled;
 }
 
+__device__ __forceinline__ float warp_max_f(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ float warp_sum_f(float v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+// Block reduce over up to 4 warps (ATTN_BLOCK=128). red[] is shared scratch.
+__device__ __forceinline__ float block_max_f(float v, float* red, int warp_id, int lane) {
+    v = warp_max_f(v);
+    if (lane == 0) red[warp_id] = v;
+    __syncthreads();
+    if (warp_id == 0) {
+        float x = (lane < 4) ? red[lane] : -FLT_MAX;
+        x = warp_max_f(x);
+        if (lane == 0) red[0] = x;
+    }
+    __syncthreads();
+    float r = red[0];
+    __syncthreads();
+    return r;
+}
+__device__ __forceinline__ float block_sum_f(float v, float* red, int warp_id, int lane) {
+    v = warp_sum_f(v);
+    if (lane == 0) red[warp_id] = v;
+    __syncthreads();
+    if (warp_id == 0) {
+        float x = (lane < 4) ? red[lane] : 0.0f;
+        x = warp_sum_f(x);
+        if (lane == 0) red[0] = x;
+    }
+    __syncthreads();
+    float r = red[0];
+    __syncthreads();
+    return r;
+}
+
 // Each thread handles ceil(head_dim / blockDim.x) output dimensions.
 // Accumulators stored in shared memory (visible to all threads in block).
 
@@ -203,6 +243,7 @@ __global__ void flash_attention_prefill_batched_kernel(
     __shared__ float s_running_max;
     __shared__ float s_running_sum;
     __shared__ float s_correction;
+    __shared__ float s_red[4];
 
     const int warp_id = tid >> 5;
     const int lane    = tid & 31;
@@ -253,11 +294,12 @@ __global__ void flash_attention_prefill_batched_kernel(
         }
         __syncthreads();
 
+        // Block-parallel online-softmax max (replaces the old tid==0 loop).
+        float lmax = -FLT_MAX;
+        for (int t = tid; t < tile_len; t += blockDim.x)
+            lmax = fmaxf(lmax, s_scores[t]);
+        float tile_max = block_max_f(lmax, s_red, warp_id, lane);
         if (tid == 0) {
-            float tile_max = -FLT_MAX;
-            for (int t = 0; t < tile_len; ++t) {
-                tile_max = fmaxf(tile_max, s_scores[t]);
-            }
             const float old_max = s_running_max;
             s_running_max = fmaxf(s_running_max, tile_max);
             s_correction  = expf(old_max - s_running_max);
@@ -267,17 +309,16 @@ __global__ void flash_attention_prefill_batched_kernel(
 
         for (int d = tid; d < head_dim; d += blockDim.x)
             s_out[d] *= s_correction;
-        __syncthreads();
 
-        if (tid == 0) {
-            float tile_sum = 0.0f;
-            for (int t = 0; t < tile_len; ++t) {
-                float p = expf(s_scores[t] - s_running_max);
-                s_scores[t] = p;
-                tile_sum += p;
-            }
-            s_running_sum += tile_sum;
+        // Block-parallel exp + sum.
+        float lsum = 0.0f;
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            float p = expf(s_scores[t] - s_running_max);
+            s_scores[t] = p;
+            lsum += p;
         }
+        float tile_sum = block_sum_f(lsum, s_red, warp_id, lane);
+        if (tid == 0) s_running_sum += tile_sum;
         __syncthreads();
 
         for (int d = tid; d < head_dim; d += blockDim.x) {
