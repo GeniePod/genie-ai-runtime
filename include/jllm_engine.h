@@ -205,14 +205,21 @@ struct Tokenizer {
     std::string decode(const std::vector<int>& ids) const;
 
 private:
+    // SentencePiece/unigram encode (Gemma, Llama-SPM): Viterbi over piece
+    // scores with byte fallback. Used when is_spm_; the BPE path is unchanged.
+    void encode_spm(const std::string& text, std::vector<int>& out) const;
+
     std::unordered_map<std::string, int> token_to_id_;
     std::unordered_map<std::string, int> bpe_ranks_;
     std::vector<std::pair<std::string, int>> special_tokens_;
     std::vector<int> sorted_by_len_;
+    std::vector<float> token_scores_;  // unigram piece scores (SPM)
     int max_token_len_ = 0;
     bool byte_encode_ = true;
     bool add_bos_ = true;
     bool add_eos_ = false;
+    bool is_spm_ = false;              // SentencePiece/unigram tokenizer
+    bool add_space_prefix_ = true;     // SPM: prepend ▁ to the segment
 };
 
 // ── Sampling ─────────────────────────────────────────────────────────────
