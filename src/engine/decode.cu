@@ -1196,12 +1196,58 @@ void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
                            config_.rms_eps, /*weight_fp32=*/true, stream_);
     vec_add(x, x2, ffn_out, H, stream_);
 
-    // 5. Per-Layer Embeddings (PLE) are injected here — issue #93.
+    // 5. Per-Layer Embeddings (PLE): inp_gate -> gelu(gate)*ple_input -> proj
+    //    -> post-norm -> residual. ple_input is computed once per token before
+    //    the layer loop (compute_gemma_ple_input); each layer reads its slice.
+    if (lw.ple_gate && gemma_ple_input_) {
+        const int D = config_.ple_input_dim;  // 256
+        half* g_in = (half*)scratch_.get(D * sizeof(half));
+        half* g    = (half*)scratch_.get(D * sizeof(half));
+        half* p    = (half*)scratch_.get(H * sizeof(half));
+        gemv_quant(g_in, lw.ple_gate, lw.type_ple_gate, x, D, H, stream_);
+        // fused_geglu(out, gate, up) = gelu_tanh(gate) * up.
+        fused_geglu(g, g_in, gemma_ple_input_ + (int64_t)layer * D, 1, D, stream_);
+        gemv_quant(p, lw.ple_proj, lw.type_ple_proj, g, H, D, stream_);
+        fused_rmsnorm_residual(p, p, nullptr, lw.ple_norm, 1, H,
+                               config_.rms_eps, /*weight_fp32=*/true, stream_);
+        vec_add(x, x, p, H, stream_);
+    }
 
     // 6. Per-layer learned output scale.
     if (lw.layer_scale_val != 1.0f) {
         vec_scale(x, H, lw.layer_scale_val, stream_);
     }
+}
+
+// Gemma 4 PLE: per-token per-layer input = (token_identity + context) / sqrt(2),
+// where token_identity = sqrt(ple_dim) * per_layer_token_embd[token] and
+// context = per_layer_proj_norm( (per_layer_model_proj @ embed) / sqrt(hidden) ),
+// both reshaped to [n_layers, ple_dim]. Computed once per token; each decoder
+// layer multiplies its gelu-gated hidden by its [ple_dim] slice.
+void Engine::compute_gemma_ple_input(const half* inputs_embeds, int token,
+                                     half* out) {
+    const auto& mw = model_weights_;
+    if (!mw.ple_embd || !mw.ple_model_proj || !mw.ple_proj_norm) return;
+    const int H = config_.hidden_dim;
+    const int D = config_.ple_input_dim;        // 256
+    const int L = config_.n_layers;             // 35
+    const int total = L * D;                     // 8960
+
+    // token_identity = per_layer_token_embd[token] * sqrt(D)  (dequant one row).
+    half* tid = (half*)scratch_.get(total * sizeof(half));
+    dequant_embedding(tid, mw.ple_embd, token, total, mw.ple_embd_type, stream_);
+    vec_scale(tid, total, sqrtf((float)D), stream_);
+
+    // context = per_layer_proj_norm( (model_proj @ embed) / sqrt(H) ), per D-row.
+    gemv_quant(out, mw.ple_model_proj, mw.ple_model_proj_type, inputs_embeds,
+               total, H, stream_);
+    vec_scale(out, total, 1.0f / sqrtf((float)H), stream_);
+    fused_rmsnorm_residual(out, out, nullptr, mw.ple_proj_norm, L, D,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+
+    // out = (context + token_identity) * (1/sqrt(2)).
+    vec_add(out, out, tid, total, stream_);
+    vec_scale(out, total, 0.70710678f, stream_);
 }
 
 void Engine::transformer_layer_attn_compute(int layer, int pos,

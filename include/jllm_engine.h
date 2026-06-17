@@ -333,9 +333,14 @@ private:
 
     void transformer_layer(int layer, int pos, half* x);
     // Gemma 4 decoder layer: per-layer head dim (256/512), dual RoPE, 4-norm
-    // sandwich + layer_output_scale, GeGLU double-wide MLP. PLE is applied
-    // separately (issue #93). See transformer_layer_gemma4 in decode.cu.
+    // sandwich + layer_output_scale, GeGLU double-wide MLP, and Per-Layer
+    // Embeddings (#93). See transformer_layer_gemma4 in decode.cu.
     void transformer_layer_gemma4(int layer, int pos, half* x);
+    // Gemma 4 PLE: compute per-token per-layer-input [n_layers * ple_dim] from
+    // the (scaled) token embedding + token id, into `out`. Set before the layer
+    // loop; each gemma4 layer reads its slice via gemma_ple_input_.
+    void compute_gemma_ple_input(const half* inputs_embeds, int token, half* out);
+    half* gemma_ple_input_ = nullptr;
     // Single-token attention pre-Wo: QK-norm (if not already done by the
     // caller), RoPE, KV store, attention. Writes attention output (head
     // mix) to `attn_out` [Q_DIM]. No projection, no residual — caller is
