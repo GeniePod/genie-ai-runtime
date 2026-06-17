@@ -353,8 +353,18 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
     for (const auto& t : vocab)
         max_token_len_ = std::max(max_token_len_, (int)t.size());
 
-    fprintf(stderr, "[tokenizer] vocab=%zu, bos=%d(add=%d), eos=%d(add=%d), max_token_len=%d\n",
-            vocab.size(), bos_id, add_bos_, eos_id, add_eos_, max_token_len_);
+    // SPM detection: GGUF labels SentencePiece as "llama", but be robust — a
+    // vocabulary that carries unigram scores and no BPE merges is SPM regardless
+    // of the model-name string (Gemma 4's GGUF doesn't use the "llama" label).
+    if (!is_spm_ && !token_scores_.empty() && bpe_ranks_.empty()) {
+        is_spm_ = true;
+    }
+
+    fprintf(stderr,
+            "[tokenizer] vocab=%zu, bos=%d(add=%d), eos=%d(add=%d), "
+            "max_token_len=%d, spm=%d, scores=%zu\n",
+            vocab.size(), bos_id, add_bos_, eos_id, add_eos_, max_token_len_,
+            (int)is_spm_, token_scores_.size());
     return !vocab.empty();
 }
 
