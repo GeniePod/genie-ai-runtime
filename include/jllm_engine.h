@@ -389,6 +389,13 @@ private:
     // rows 0..hidden_dim-1, etc.). x_batch is read AND written in
     // place per layer (residual additions).
     void transformer_prefill(int layer, int start_pos, int n_tokens, half* x_batch);
+    // Gemma 4 batched-prefill layer: same layer-major contract as
+    // transformer_prefill, but with the Gemma decoder structure (per-layer
+    // head dim, KV sharing, weightless V-norm, GeGLU, 4-norm sandwich, sliding
+    // window, PLE, layer scale). `ple_input_batch` is [n_tokens × n_layers ×
+    // ple_input_dim] — token t's layer-l slice at (t*n_layers + l)*ple_dim.
+    void transformer_prefill_gemma4(int layer, int start_pos, int n_tokens,
+                                    half* x_batch, const half* ple_input_batch);
     int  decode_step(int pos);
     void build_cuda_graph(int pos);
     bool check_memory_and_thermal(int pos);
