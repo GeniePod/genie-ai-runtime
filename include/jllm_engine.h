@@ -86,6 +86,9 @@ struct ModelConfig {
     int         n_kv_shared_layers     = 0;   // gemma4.attention.shared_kv_layers
     int         ple_input_dim          = 0;   // gemma4.embedding_length_per_layer_input
     float       rope_theta_swa         = 0.0f;// gemma4.rope.freq_base_swa (local)
+    // gemma4 per-layer tables (parsed from GGUF arrays).
+    std::vector<int> ff_per_layer;            // feed_forward_length per layer (6144 / 12288)
+    std::vector<int> layer_is_sliding;        // 1 = sliding (local), 0 = full (global)
 
     int gqa_group_size() const { return n_kv_heads > 0 ? n_heads / n_kv_heads : 1; }
     int64_t weight_bytes() const;
@@ -161,8 +164,23 @@ struct LayerWeights {
     const void* w_down   = nullptr;
     const void* rms_attn = nullptr;  // FP32 or FP16 depending on GGUF
     const void* rms_ffn  = nullptr;  // FP32 or FP16 depending on GGUF
-    const void* q_norm   = nullptr;  // Qwen3 per-head Q RMSNorm [head_dim]
-    const void* k_norm   = nullptr;  // Qwen3 per-head K RMSNorm [head_dim]
+    const void* q_norm   = nullptr;  // Qwen3/Gemma per-head Q RMSNorm [head_dim]
+    const void* k_norm   = nullptr;  // Qwen3/Gemma per-head K RMSNorm [head_dim]
+    // Gemma 4 extras (PLE-only architecture; nullptr for other models).
+    const void* post_attn_norm = nullptr;  // post_attention_norm.weight (sandwich)
+    const void* post_ffn_norm  = nullptr;  // post_ffw_norm.weight (sandwich)
+    const void* ple_gate       = nullptr;  // inp_gate.weight  (PLE input gate)
+    const void* ple_proj       = nullptr;  // proj.weight      (PLE projection)
+    const void* ple_norm       = nullptr;  // post_norm.weight (PLE post-norm)
+    const void* layer_scale    = nullptr;  // layer_output_scale.weight
+    float layer_scale_val = 1.0f;          // scalar value (read at load; 1.0 = no-op)
+    int type_ple_gate = 12;
+    int type_ple_proj = 12;
+    // Per-layer geometry (Gemma 4: sliding/local vs full/global layers differ).
+    int   head_dim_l     = 0;      // head dim (256 sliding / 512 global)
+    int   intermediate_l = 0;      // ffn width (6144 / 12288)
+    bool  is_sliding     = false;  // sliding (local) vs full (global) attention
+    float rope_theta_l   = 0.0f;   // RoPE base (1e4 sliding / 1e6 global)
     int type_wq     = 12;            // GGML tensor type for quantized matvec
     int type_wk     = 12;
     int type_wv     = 12;
@@ -188,6 +206,12 @@ struct ModelWeights {
     const void*     output      = nullptr;
     int             output_type = 12;       // GGML tensor type for output projection
     const half*     s_output    = nullptr;
+    // Gemma 4 Per-Layer Embeddings (PLE) — model-level tensors (nullptr otherwise).
+    const void*     ple_embd          = nullptr;  // per_layer_token_embd.weight
+    const void*     ple_model_proj    = nullptr;  // per_layer_model_proj.weight
+    const void*     ple_proj_norm     = nullptr;  // per_layer_proj_norm.weight
+    int             ple_embd_type       = 0;
+    int             ple_model_proj_type = 12;
     LayerWeights*   layers      = nullptr;
     int             n_layers    = 0;
 };
@@ -308,6 +332,19 @@ private:
     int             host_logits_capacity_ = 0;
 
     void transformer_layer(int layer, int pos, half* x);
+    // Gemma 4 decoder layer: per-layer head dim (256/512), dual RoPE, 4-norm
+    // sandwich + layer_output_scale, GeGLU double-wide MLP, and Per-Layer
+    // Embeddings (#93). See transformer_layer_gemma4 in decode.cu.
+    void transformer_layer_gemma4(int layer, int pos, half* x);
+    // Gemma 4 PLE: compute per-token per-layer-input [n_layers * ple_dim] from
+    // the (scaled) token embedding + token id, into `out`. Set before the layer
+    // loop; each gemma4 layer reads its slice via gemma_ple_input_.
+    void compute_gemma_ple_input(const half* inputs_embeds, int token, half* out);
+    half* gemma_ple_input_ = nullptr;
+    // Gemma 4 normalizes V with a *weightless* per-head RMSNorm before the KV
+    // store (ggml_rms_norm in llama.cpp). fused_rmsnorm_residual needs a weight
+    // vector, so this is a device buffer of `head_dim` ones used as unit weight.
+    float* gemma_vnorm_ones_ = nullptr;
     // Single-token attention pre-Wo: QK-norm (if not already done by the
     // caller), RoPE, KV store, attention. Writes attention output (head
     // mix) to `attn_out` [Q_DIM]. No projection, no residual — caller is

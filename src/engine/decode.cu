@@ -215,6 +215,50 @@ static void dequant_q6k_row(float* out, const void* data, int token_id, int hidd
     }
 }
 
+// Q5_K block layout (matches llama.cpp): d, dmin (fp16), scales[12] (6-bit
+// packed, same as Q4_K), qh[32] (one high bit per value), qs[128] (low 4 bits).
+// Gemma's token_embd / per_layer_token_embd come Q5_K in the Q4_K_M build.
+struct embd_block_q5_K {
+    uint16_t d_raw;
+    uint16_t dmin_raw;
+    uint8_t  scales[12];
+    uint8_t  qh[32];
+    uint8_t  qs[128];
+};
+static_assert(sizeof(embd_block_q5_K) == 176, "");
+
+static void dequant_q5k_row(float* out, const void* data, int token_id, int hidden_dim) {
+    int blocks_per_row = hidden_dim / 256;
+    int block_bytes = 176;
+    const uint8_t* row_data = (const uint8_t*)data + (int64_t)token_id * blocks_per_row * block_bytes;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        const embd_block_q5_K* blk = (const embd_block_q5_K*)(row_data + b * block_bytes);
+        float dall = fp16_to_float(blk->d_raw);
+        float dmin = fp16_to_float(blk->dmin_raw);
+        const uint8_t* qh = blk->qh;
+
+        for (int il = 0; il < 4; il++) {
+            int is = 2 * il;
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4_cpu(is + 0, blk->scales, sc1, m1);
+            get_scale_min_k4_cpu(is + 1, blk->scales, sc2, m2);
+            float d1 = dall * sc1, dm1 = dmin * m1;
+            float d2 = dall * sc2, dm2 = dmin * m2;
+            const uint8_t* q = blk->qs + 32 * il;
+            uint8_t u1 = 1 << (2 * il);
+            uint8_t u2 = 2 << (2 * il);
+            int out_base = b * 256 + 64 * il;
+            for (int l = 0; l < 32; l++) {
+                int hi1 = (qh[l] & u1) ? 16 : 0;
+                int hi2 = (qh[l] & u2) ? 16 : 0;
+                out[out_base + l]      = d1 * ((q[l] & 0xF) + hi1) - dm1;
+                out[out_base + l + 32] = d2 * ((q[l] >> 4)  + hi2) - dm2;
+            }
+        }
+    }
+}
+
 static void dequant_embedding(half* dst, const void* embd_data, int token_id,
                                int hidden_dim, int embd_type, cudaStream_t stream) {
     if (fast_embedding_enabled() && (embd_type == 12 || embd_type == 14) &&
@@ -236,8 +280,10 @@ static void dequant_embedding(half* dst, const void* embd_data, int token_id,
         return;
     }
 
-    float h_row[8192];  // max hidden_dim = 8192
-    half  h_fp16[8192];
+    // Sized for the largest row we dequant: Gemma's per_layer_token_embd is
+    // n_layers * ple_dim (e.g. 35*256 = 8960) wide, larger than any hidden_dim.
+    float h_row[16384];
+    half  h_fp16[16384];
 
     if (embd_type == 12) {
         // Q4_K (GGML_TYPE_Q4_K)
@@ -266,6 +312,11 @@ static void dequant_embedding(half* dst, const void* embd_data, int token_id,
             fprintf(stderr, "\n");
         }
         first = false;
+        for (int i = 0; i < hidden_dim; i++)
+            h_fp16[i] = __float2half(h_row[i]);
+    } else if (embd_type == 13) {
+        // Q5_K — Gemma's token_embd / per_layer_token_embd in Q4_K_M builds.
+        dequant_q5k_row(h_row, embd_data, token_id, hidden_dim);
         for (int i = 0; i < hidden_dim; i++)
             h_fp16[i] = __float2half(h_row[i]);
     } else if (embd_type == 0) {
@@ -355,10 +406,24 @@ static bool copy_weight_to_device(const void* src, size_t bytes, void** dst) {
 }
 
 static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
-                                     int head_dim,
+                                     int head_dim, int ple_input_dim,
                                      std::vector<void*>& owned) {
     const size_t norm_bytes = (size_t)hidden_dim * sizeof(float);
     const size_t qk_norm_bytes = (size_t)head_dim * sizeof(float);
+    const size_t ple_norm_bytes = (size_t)ple_input_dim * sizeof(float);
+
+    // Gemma 4 adds sandwich (post-attn / post-ffn) and PLE norms. Like the
+    // base RMSNorms, these are read directly by fused_rmsnorm_residual, so the
+    // raw mmap host pointer traps; copy each to device the same way. Helper
+    // stages one optional norm and reassigns the pointer in place.
+    auto stage = [&](const void*& w, size_t bytes) -> bool {
+        if (!w) return true;            // tensor absent (non-Gemma) — leave null
+        void* d = nullptr;
+        if (!copy_weight_to_device(w, bytes, &d)) return false;
+        owned.push_back(d);
+        w = d;
+        return true;
+    };
 
     for (int l = 0; l < mw.n_layers; l++) {
         auto& lw = mw.layers[l];
@@ -378,6 +443,11 @@ static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
         owned.push_back(ffn);
         lw.rms_attn = attn;
         lw.rms_ffn = ffn;
+
+        // Gemma 4 sandwich + PLE per-layer norms (all [hidden_dim] F32).
+        if (!stage(lw.post_attn_norm, norm_bytes)) return false;
+        if (!stage(lw.post_ffn_norm, norm_bytes)) return false;
+        if (!stage(lw.ple_norm, norm_bytes)) return false;
 
         if (lw.q_norm && lw.k_norm) {
             if (lw.qk_norm_type != 0) {
@@ -402,6 +472,10 @@ static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
     if (!copy_weight_to_device(mw.output_norm, norm_bytes, &out_norm)) return false;
     owned.push_back(out_norm);
     mw.output_norm = out_norm;
+
+    // Gemma 4 global PLE projection norm ([ple_input_dim] F32).
+    if (!stage(mw.ple_proj_norm, ple_norm_bytes)) return false;
+
     fprintf(stderr, "[model] Materialized up to %d RMSNorm tensors on device\n",
             mw.n_layers * 4 + 1);
     return true;
@@ -812,26 +886,26 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
             config_.vocab_size,
             config_.rms_eps, config_.rope_neox ? "neox" : "normal");
 
-    // Gemma 4 (#88): the frontend recognizes gemma4 and parses its hparams, but
-    // the forward pass is not implemented yet. Fail loud with the detected
-    // architecture instead of silently running it through the Llama/Qwen path
-    // (wrong RoPE / head dims / norms -> garbage). Lift once #92 + #93 land.
+    // Gemma 4 (#88): experimental dense forward + PLE (#92/#93). Sliding-window
+    // masking is not applied yet, so contexts beyond sliding_window (512) will
+    // diverge; short prompts are unaffected.
     if (config_.arch == Arch::Gemma4) {
         fprintf(stderr,
-                "[engine] Gemma 4 detected but not yet supported — refusing to run.\n"
-                "  layers=%d heads=%d kv_heads=%d hidden=%d ffn=%d vocab=%d\n"
-                "  head_dim: sliding=%d global=%d  sliding_window=%d pattern=%d\n"
-                "  rope_theta: global=%g sliding=%g  kv_shared_layers=%d\n"
-                "  ple_input_dim=%d  final_logit_softcap=%g\n"
-                "  Full support tracked in #88 (architecture #89, PLE #93).\n",
-                config_.n_layers, config_.n_heads, config_.n_kv_heads,
-                config_.hidden_dim, config_.intermediate_dim, config_.vocab_size,
-                config_.sliding_head_dim, config_.global_head_dim,
-                config_.sliding_window, config_.sliding_window_pattern,
-                config_.rope_theta, config_.rope_theta_swa,
+                "[engine] Gemma 4 (experimental): %d layers, head_dim "
+                "sliding=%d/global=%d, kv_shared=%d, ple=%d, softcap=%g. "
+                "Sliding-window masking not yet applied (ok for <=%d-token ctx).\n",
+                config_.n_layers, config_.sliding_head_dim, config_.global_head_dim,
                 config_.n_kv_shared_layers, config_.ple_input_dim,
-                config_.spec.final_logit_softcap);
-        return false;
+                config_.spec.final_logit_softcap, config_.sliding_window);
+        // Gemma's V activations have large-dynamic-range outliers (massive
+        // activations ~10x RMS). Per-row INT8 KV quantization collapses the
+        // small-but-significant V components and wrecks attention, so force
+        // FP16 KV for Gemma regardless of the requested kv_int8 default.
+        if (gen_params_.kv_int8) {
+            fprintf(stderr, "[engine] Gemma 4: forcing FP16 KV cache "
+                            "(INT8 KV too lossy for Gemma V distribution)\n");
+            gen_params_.kv_int8 = false;
+        }
     }
 
     if (!load_and_map_weights(gguf_path, &weights_, &weights_size_,
@@ -840,16 +914,29 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
         return false;
     }
     if (!materialize_norm_weights(model_weights_, config_.hidden_dim,
-                                  config_.head_dim,
+                                  config_.head_dim, config_.ple_input_dim,
                                   device_weight_copies_)) {
         fprintf(stderr, "[engine] Failed to materialize norm weights\n");
         return false;
+    }
+    // Gemma 4 applies a weightless per-head RMSNorm to V before the KV store.
+    // Build a [head_dim] device vector of ones to serve as the unit weight.
+    if (config_.arch == Arch::Gemma4) {
+        std::vector<float> ones(config_.head_dim, 1.0f);
+        void* d_ones = nullptr;
+        if (!copy_weight_to_device(ones.data(),
+                                   ones.size() * sizeof(float), &d_ones)) {
+            fprintf(stderr, "[engine] Failed to alloc Gemma V-norm ones\n");
+            return false;
+        }
+        device_weight_copies_.push_back(d_ones);
+        gemma_vnorm_ones_ = (float*)d_ones;
     }
     budget_.model_mb = mapped_weight_device_enabled()
         ? weights_size_ / (1024 * 1024)
         : 0;
 
-    int kv_bytes = params.kv_int8 ? 1 : 2;
+    int kv_bytes = gen_params_.kv_int8 ? 1 : 2;
     int auto_ctx = budget_.max_context(config_.n_layers, config_.n_kv_heads, config_.head_dim, kv_bytes);
 
     // Cap the implicit auto-context to something that leaves real headroom on
@@ -997,6 +1084,23 @@ static inline float attention_scale(const ArchSpec& spec, int head_dim) {
                                   : 1.0f / sqrtf((float)head_dim);
 }
 
+// Embedding scale: Gemma multiplies token embeddings by sqrt(hidden). `n_elems`
+// is the total element count (n_tokens * hidden). No-op for the default recipe.
+static inline void scale_embedding(const ArchSpec& spec, half* x, int n_elems,
+                                   int hidden, cudaStream_t stream) {
+    if (spec.scale_embeddings) {
+        vec_scale(x, n_elems, sqrtf((float)hidden), stream);
+    }
+}
+
+// Final-logit soft-cap (Gemma): x = c*tanh(x/c). No-op for the default recipe.
+static inline void apply_logit_softcap(const ArchSpec& spec, float* logits,
+                                       int n, cudaStream_t stream) {
+    if (spec.final_logit_softcap > 0.0f) {
+        logit_softcap(logits, n, spec.final_logit_softcap, stream);
+    }
+}
+
 void Engine::transformer_layer(int layer, int pos, half* x) {
     const auto& lw = model_weights_.layers[layer];
     int H = config_.hidden_dim;
@@ -1076,6 +1180,193 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
     transformer_layer_ffn_block(layer, x2, swiglu_out, x);
 }
 
+// Gemma 4 decoder layer (PLE-only architecture). Differs from the Llama/Qwen
+// path: per-layer head dim (256 sliding / 512 global), per-layer RoPE base,
+// a 4-norm "sandwich" (the post-attention and post-ffn norms apply to the
+// sub-layer OUTPUT before the residual add), GeGLU + double-wide MLP, and a
+// learned per-layer output scalar. Per-layer head dim is threaded through the
+// projections/RoPE/attention; the KV cache is sized for the max head dim (512)
+// so sliding layers use the first 256 of each slot. Sliding-window masking is
+// a no-op for prompts <= sliding_window (512) and lands later; PLE is #93.
+void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
+    const auto& lw = model_weights_.layers[layer];
+    const int H  = config_.hidden_dim;
+    const int hd = lw.head_dim_l;                 // 256 sliding / 512 global
+    const int Q_DIM  = config_.n_heads * hd;
+    const int KV_DIM = config_.n_kv_heads * hd;
+    const int I  = lw.intermediate_l;             // 6144 / 12288
+    const bool norm_fp32 = (lw.rms_type == 0);
+
+    half* normed   = (half*)scratch_.get(H * sizeof(half));
+    half* q_buf    = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* k_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* v_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* attn_out = (half*)scratch_.get(Q_DIM * sizeof(half));
+
+    // 1. Input RMSNorm (attn_norm).
+    fused_rmsnorm_residual(normed, x, nullptr, lw.rms_attn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+
+    // 2. QKV projections (per-layer head dim). Gemma 4 shares KV across the
+    //    last n_kv_shared_layers layers: layers [kv_from_start, n_layers) do
+    //    NOT compute their own K/V — they reuse the cache of the last
+    //    KV-producing layer of the same attention type (sliding ->
+    //    kv_from_start-2, global -> kv_from_start-1), matching llama.cpp's
+    //    has_kv() mapping (n_layer_kv_from_start = n_layer - shared_kv_layers).
+    const int kv_from_start = config_.n_layers - config_.n_kv_shared_layers;
+    const bool has_own_kv = (layer < kv_from_start);
+    const int kv_layer = has_own_kv
+        ? layer
+        : (lw.is_sliding ? kv_from_start - 2 : kv_from_start - 1);
+
+    if (has_own_kv) {
+        gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
+                          k_buf, lw.wk, lw.type_wk, KV_DIM,
+                          v_buf, lw.wv, lw.type_wv, KV_DIM,
+                          normed, H, stream_);
+    } else {
+        gemv_quant(q_buf, lw.wq, lw.type_wq, normed, Q_DIM, H, stream_);
+    }
+
+    // 3a. Per-head Q RMSNorm (always). K-norm + weightless V RMSNorm
+    //     (ggml_rms_norm; V is not RoPE'd) only when this layer owns its K/V.
+    if (lw.q_norm) {
+        fused_rmsnorm_residual(q_buf, q_buf, nullptr, lw.q_norm,
+                               config_.n_heads, hd, config_.rms_eps,
+                               lw.qk_norm_type == 0, stream_);
+    }
+    if (has_own_kv) {
+        if (lw.k_norm) {
+            fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
+                                   config_.n_kv_heads, hd, config_.rms_eps,
+                                   lw.qk_norm_type == 0, stream_);
+        }
+        if (gemma_vnorm_ones_) {
+            fused_rmsnorm_residual(v_buf, v_buf, nullptr, gemma_vnorm_ones_,
+                                   config_.n_kv_heads, hd, config_.rms_eps,
+                                   /*weight_fp32=*/true, stream_);
+        }
+    }
+
+    // 3b. RoPE (per-layer base, full rotary over hd) + KV store. Shared-KV
+    //     layers rotate Q only — their K/V already live in kv_layer's cache.
+    if (!has_own_kv) {
+        rope_inplace(q_buf, nullptr, config_.n_heads, 0, hd, pos,
+                     lw.rope_theta_l, config_.rope_neox, stream_);
+    } else if (!gen_params_.kv_int8 && kv_cache_.is_fast_position(pos)) {
+        rope_inplace_store_kv_fp16(q_buf, k_buf, v_buf,
+                                   (half*)kv_cache_.key_ptr(layer, pos),
+                                   (half*)kv_cache_.val_ptr(layer, pos),
+                                   config_.n_heads, config_.n_kv_heads, hd, pos,
+                                   lw.rope_theta_l, config_.rope_neox, stream_);
+    } else {
+        rope_inplace(q_buf, k_buf, config_.n_heads, config_.n_kv_heads, hd, pos,
+                     lw.rope_theta_l, config_.rope_neox, stream_);
+        if (gen_params_.kv_int8) {
+            float* ks = kv_cache_.kv_scale_ptr(layer, pos, false);
+            float* vs = kv_cache_.kv_scale_ptr(layer, pos, true);
+            fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), ks, k_buf,
+                         config_.n_kv_heads, hd, stream_);
+            fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), vs, v_buf,
+                         config_.n_kv_heads, hd, stream_);
+        } else {
+            cudaMemcpyAsync(kv_cache_.key_ptr(layer, pos), k_buf,
+                            KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+            cudaMemcpyAsync(kv_cache_.val_ptr(layer, pos), v_buf,
+                            KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+        }
+    }
+
+    // 3c. Flash attention (recipe scale = 1.0 for Gemma). Reads K/V from
+    //     kv_layer (== layer for KV-owning layers, else the shared source).
+    float scale = attention_scale(config_.spec, hd);
+    float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, false) : nullptr;
+    float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, true)  : nullptr;
+    flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(kv_layer, 0),
+                           kv_cache_.val_ptr(kv_layer, 0), config_.n_heads,
+                           config_.n_kv_heads, hd, config_.head_dim, pos + 1, scale,
+                           gen_params_.kv_int8, k_scales, v_scales, stream_);
+
+    // 3d. Output projection -> post-attention (sandwich) norm -> residual.
+    half* wo_out = (half*)scratch_.get(H * sizeof(half));
+    half* x2     = (half*)scratch_.get(H * sizeof(half));
+    gemv_quant(wo_out, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
+    fused_rmsnorm_residual(wo_out, wo_out, nullptr, lw.post_attn_norm, 1, H,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+    vec_add(x2, x, wo_out, H, stream_);
+
+    // 4. FFN: pre-norm -> GeGLU (double-wide) -> down -> post-ffn (sandwich) norm -> residual.
+    half* normed2 = (half*)scratch_.get(H * sizeof(half));
+    half* gate    = (half*)scratch_.get(I * sizeof(half));
+    half* up      = (half*)scratch_.get(I * sizeof(half));
+    half* act     = (half*)scratch_.get(I * sizeof(half));
+    half* ffn_out = (half*)scratch_.get(H * sizeof(half));
+    fused_rmsnorm_residual(normed2, x2, nullptr, lw.rms_ffn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+    gemv_quant_pair(gate, lw.w_gate, lw.type_w_gate, I,
+                    up,   lw.w_up,   lw.type_w_up,   I, normed2, H, stream_);
+    fused_geglu(act, gate, up, 1, I, stream_);
+    gemv_quant(ffn_out, lw.w_down, lw.type_w_down, act, H, I, stream_);
+    fused_rmsnorm_residual(ffn_out, ffn_out, nullptr, lw.post_ffn_norm, 1, H,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+    vec_add(x, x2, ffn_out, H, stream_);
+
+    // 5. Per-Layer Embeddings (PLE): inp_gate -> gelu(gate)*ple_input -> proj
+    //    -> post-norm -> residual. ple_input is computed once per token before
+    //    the layer loop (compute_gemma_ple_input); each layer reads its slice.
+    if (lw.ple_gate && gemma_ple_input_) {
+        const int D = config_.ple_input_dim;  // 256
+        half* g_in = (half*)scratch_.get(D * sizeof(half));
+        half* g    = (half*)scratch_.get(D * sizeof(half));
+        half* p    = (half*)scratch_.get(H * sizeof(half));
+        // inp_gate / proj are F32 (not K-quant), so use the dense GEMV.
+        gemv_dense(g_in, lw.ple_gate, lw.type_ple_gate, x, D, H, stream_);
+        // fused_geglu(out, gate, up) = gelu_tanh(gate) * up.
+        fused_geglu(g, g_in, gemma_ple_input_ + (int64_t)layer * D, 1, D, stream_);
+        gemv_dense(p, lw.ple_proj, lw.type_ple_proj, g, H, D, stream_);
+        fused_rmsnorm_residual(p, p, nullptr, lw.ple_norm, 1, H,
+                               config_.rms_eps, /*weight_fp32=*/true, stream_);
+        vec_add(x, x, p, H, stream_);
+    }
+
+    // 6. Per-layer learned output scale.
+    if (lw.layer_scale_val != 1.0f) {
+        vec_scale(x, H, lw.layer_scale_val, stream_);
+    }
+}
+
+// Gemma 4 PLE: per-token per-layer input = (token_identity + context) / sqrt(2),
+// where token_identity = sqrt(ple_dim) * per_layer_token_embd[token] and
+// context = per_layer_proj_norm( (per_layer_model_proj @ embed) / sqrt(hidden) ),
+// both reshaped to [n_layers, ple_dim]. Computed once per token; each decoder
+// layer multiplies its gelu-gated hidden by its [ple_dim] slice.
+void Engine::compute_gemma_ple_input(const half* inputs_embeds, int token,
+                                     half* out) {
+    const auto& mw = model_weights_;
+    if (!mw.ple_embd || !mw.ple_model_proj || !mw.ple_proj_norm) return;
+    const int H = config_.hidden_dim;
+    const int D = config_.ple_input_dim;        // 256
+    const int L = config_.n_layers;             // 35
+    const int total = L * D;                     // 8960
+
+    // token_identity = per_layer_token_embd[token] * sqrt(D)  (dequant one row).
+    half* tid = (half*)scratch_.get(total * sizeof(half));
+    dequant_embedding(tid, mw.ple_embd, token, total, mw.ple_embd_type, stream_);
+    vec_scale(tid, total, sqrtf((float)D), stream_);
+
+    // context = per_layer_proj_norm( (model_proj @ embed) / sqrt(H) ), per D-row.
+    // per_layer_model_proj is BF16 (not K-quant), so use the dense GEMV.
+    gemv_dense(out, mw.ple_model_proj, mw.ple_model_proj_type, inputs_embeds,
+               total, H, stream_);
+    vec_scale(out, total, 1.0f / sqrtf((float)H), stream_);
+    fused_rmsnorm_residual(out, out, nullptr, mw.ple_proj_norm, L, D,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+
+    // out = (context + token_identity) * (1/sqrt(2)).
+    vec_add(out, out, tid, total, stream_);
+    vec_scale(out, total, 0.70710678f, stream_);
+}
+
 void Engine::transformer_layer_attn_compute(int layer, int pos,
                                             half* q_buf, half* k_buf, half* v_buf,
                                             half* attn_out, bool qk_norm_already) {
@@ -1133,7 +1424,7 @@ void Engine::transformer_layer_attn_compute(int layer, int pos,
     flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(layer, 0),
                           kv_cache_.val_ptr(layer, 0),
                           config_.n_heads, config_.n_kv_heads, config_.head_dim,
-                          pos + 1, scale, gen_params_.kv_int8,
+                          config_.head_dim, pos + 1, scale, gen_params_.kv_int8,
                           k_scales, v_scales, stream_);
 }
 
@@ -1277,7 +1568,7 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
             attn_out_batch, q_batch,
             kv_cache_.key_ptr(layer, 0), kv_cache_.val_ptr(layer, 0),
             config_.n_heads, config_.n_kv_heads, config_.head_dim,
-            N, start_pos, scale,
+            config_.head_dim, N, start_pos, scale,
             gen_params_.kv_int8, k_scales, v_scales, stream_);
     }
 
@@ -1336,6 +1627,7 @@ int Engine::decode_step(int pos) {
     // token_embd is typically Q4_K (type 12) or Q6_K (type 14) in GGUF
     dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
                       model_weights_.embd_type, stream_);
+    scale_embedding(config_.spec, x, H, config_.hidden_dim, stream_);
     if (profile) {
         cudaStreamSynchronize(stream_);
         auto now = Clock::now();
@@ -1343,9 +1635,19 @@ int Engine::decode_step(int pos) {
         prof_t = now;
     }
 
+    // Gemma 4: compute the Per-Layer-Embedding input once from the scaled
+    // embedding (it depends on the token, so it can't be CUDA-graph captured).
+    gemma_ple_input_ = nullptr;
+    if (config_.arch == Arch::Gemma4 && config_.spec.per_layer_embeddings) {
+        gemma_ple_input_ = (half*)scratch_.get(
+            (int64_t)config_.n_layers * config_.ple_input_dim * sizeof(half));
+        compute_gemma_ple_input(x, last_token_, gemma_ple_input_);
+    }
+
     // All transformer layers
     for (int l = 0; l < config_.n_layers; l++) {
-        transformer_layer(l, pos, x);
+        if (config_.arch == Arch::Gemma4) transformer_layer_gemma4(l, pos, x);
+        else transformer_layer(l, pos, x);
     }
     if (profile) {
         cudaStreamSynchronize(stream_);
@@ -1375,6 +1677,7 @@ int Engine::decode_step(int pos) {
 
     gemv_quant_f32(logits_fp32, model_weights_.output, model_weights_.output_type,
                    normed, config_.vocab_size, H, stream_);
+    apply_logit_softcap(config_.spec, logits_fp32, config_.vocab_size, stream_);
 
     // Copy FP32 logits to a pinned host buffer for CPU sampling.
     cudaError_t copy_err = cudaMemcpyAsync(host_logits_, logits_fp32,
@@ -1443,6 +1746,9 @@ int Engine::decode_step(int pos) {
 void Engine::build_cuda_graph(int pos) {
     if (graph_captured_) return;
     if (!gen_params_.use_cuda_graph) return;
+    // Gemma 4's PLE recomputes per-token from the changing token, so the decode
+    // step can't be captured into a static graph — use the non-graph path.
+    if (config_.arch == Arch::Gemma4) return;
 
     fprintf(stderr, "[engine] Capturing CUDA graph...\n");
 
@@ -1466,6 +1772,7 @@ void Engine::build_cuda_graph(int pos) {
     float* g_logits_fp32 = (float*)scratch_.get(config_.vocab_size * sizeof(float));
     gemv_quant_f32(g_logits_fp32, model_weights_.output, model_weights_.output_type,
                    g_normed, config_.vocab_size, H, stream_);
+    apply_logit_softcap(config_.spec, g_logits_fp32, config_.vocab_size, stream_);
 
     cudaError_t err = cudaStreamEndCapture(stream_, &decode_graph_);
     if (err != cudaSuccess) {
@@ -1641,6 +1948,9 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     GenStats stats = {};
     stop_flag_ = false;
     gen_params_ = params;
+    // Keep KV precision consistent with how the pool was sized in load():
+    // Gemma forces FP16 KV (INT8 too lossy for its V distribution).
+    if (config_.arch == Arch::Gemma4) gen_params_.kv_int8 = false;
     recent_tokens_.clear();
 
     // Path F (#45): plumbing only in F2 — log conversation_id if set; the
@@ -1785,7 +2095,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     const int M = N - prefill_start;
     stats.prefill_tokens = M;
 
-    if (M > 0 && batched_prefill_enabled() && batched_fits) {
+    if (M > 0 && config_.arch != Arch::Gemma4 && batched_prefill_enabled() && batched_fits) {
         // Path B (issue #12): layer-major prefill. Allocate one
         // [M × H] activation buffer (M = tokens to prefill this turn),
         // dequantize each new prompt embedding into it, then loop
@@ -1807,6 +2117,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                               prompt_tokens[prefill_start + i], H,
                               model_weights_.embd_type, stream_);
         }
+        scale_embedding(config_.spec, x_batch, M * H, config_.hidden_dim, stream_);
         for (int l = 0; l < config_.n_layers; l++) {
             transformer_prefill(l, prefill_start, M, x_batch);
         }
@@ -1829,8 +2140,17 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             half* x = (half*)scratch_.get(H * sizeof(half));
             dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
                               model_weights_.embd_type, stream_);
-            for (int l = 0; l < config_.n_layers; l++)
-                transformer_layer(l, i, x);
+            scale_embedding(config_.spec, x, H, config_.hidden_dim, stream_);
+            gemma_ple_input_ = nullptr;
+            if (config_.arch == Arch::Gemma4 && config_.spec.per_layer_embeddings) {
+                gemma_ple_input_ = (half*)scratch_.get(
+                    (int64_t)config_.n_layers * config_.ple_input_dim * sizeof(half));
+                compute_gemma_ple_input(x, last_token_, gemma_ple_input_);
+            }
+            for (int l = 0; l < config_.n_layers; l++) {
+                if (config_.arch == Arch::Gemma4) transformer_layer_gemma4(l, i, x);
+                else transformer_layer(l, i, x);
+            }
             // Hang onto the last token's residual; the scratch pool has NOT
             // been reset between iterations within prefill, so this pointer
             // remains valid through the post-prefill sampling step below.
@@ -1890,6 +2210,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             gemv_quant_f32(logits_fp32, model_weights_.output,
                            model_weights_.output_type,
                            normed, config_.vocab_size, H, stream_);
+            apply_logit_softcap(config_.spec, logits_fp32, config_.vocab_size, stream_);
             cudaError_t copy_err =
                 cudaMemcpyAsync(host_logits_, logits_fp32,
                                 config_.vocab_size * sizeof(float),

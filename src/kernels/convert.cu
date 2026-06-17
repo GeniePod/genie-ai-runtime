@@ -134,4 +134,26 @@ void fused_geglu(half* output, const half* gate, const half* up,
         output, gate, up, rows, intermediate_dim);
 }
 
+// ── Scalar multiply (Gemma embedding scale: x *= sqrt(hidden)) ────────────
+__global__ void vec_scale_kernel(half* x, int n, float s) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __float2half(__half2float(x[i]) * s);
+}
+
+void vec_scale(half* x, int n, float s, cudaStream_t stream) {
+    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    vec_scale_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(x, n, s);
+}
+
+// ── Final-logit soft-cap (Gemma: x = c * tanh(x / c)) ─────────────────────
+__global__ void logit_softcap_kernel(float* x, int n, float cap) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = cap * tanhf(x[i] / cap);
+}
+
+void logit_softcap(float* x, int n, float cap, cudaStream_t stream) {
+    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    logit_softcap_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(x, n, cap);
+}
+
 }  // namespace jllm

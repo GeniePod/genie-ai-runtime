@@ -209,6 +209,17 @@ void fused_geglu(
     cudaStream_t   stream
 );
 
+// In-place scalar multiply of a half vector (Gemma embedding scale x*=sqrt(d)).
+void vec_scale(half* x, int n, float s, cudaStream_t stream);
+
+// In-place final-logit soft-cap on FP32 logits: x = cap * tanh(x / cap) (Gemma).
+void logit_softcap(float* x, int n, float cap, cudaStream_t stream);
+
+// Dense GEMV for non-K-quant weights — wtype 0=F32, 1=F16, 30=BF16. Used for the
+// Gemma PLE projections (per_layer_model_proj is BF16; inp_gate/proj are F32).
+void gemv_dense(half* out, const void* W, int wtype, const half* x,
+                int M, int K, cudaStream_t stream);
+
 // ── Rotary Position Embedding ────────────────────────────────────────────
 // Applied in-place to Q and K before attention.
 //
@@ -253,7 +264,8 @@ void flash_attention_decode(
     const void*    v_cache,    // [seq_len × n_kv_heads × head_dim]
     int            n_heads,
     int            n_kv_heads, // GQA: n_heads / n_kv_heads = group size
-    int            head_dim,
+    int            head_dim,   // active per-head vector length (Gemma sliding=256)
+    int            cache_head_dim, // KV cache slot per-head stride (Gemma=512)
     int            seq_len,    // current sequence length
     float          scale,      // 1/sqrt(head_dim)
     bool           kv_int8,    // true = INT8 KV cache
@@ -282,7 +294,8 @@ void flash_attention_prefill_batched(
     const void*    v_cache,
     int            n_heads,
     int            n_kv_heads,
-    int            head_dim,
+    int            head_dim,       // active per-head vector length
+    int            cache_head_dim, // KV cache slot per-head stride
     int            N,          // number of query tokens
     int            start_pos,  // absolute position of token 0 in the cache
     float          scale,
