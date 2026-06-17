@@ -76,6 +76,19 @@ static bool mmq_q4k_enabled() {
     return enabled;
 }
 
+// Path E6: int8 tensor-core MMQ for Q4_K prefill. Replaces the E5 f16
+// mma.m16n8k16 (dequant->fp16) with mma.m16n8k32.s8.s8.s32 on raw nibbles x
+// q8_1 activations (per-sub-block d/dm applied in a float epilogue). ~2x the
+// f16 kernel on Orin (validated in tests/test_mmq_q4k_int8.cu). Default on;
+// set JLLM_MMQ_Q4K_I8=0 to fall back to the E5 f16 MMA path.
+static bool mmq_q4k_i8_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_MMQ_Q4K_I8");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 static const void* resolve_weight_device_ptr(const void* W) {
     if (const void* mapped = resolve_mapped_weight_device_ptr(W)) {
         return mapped;
@@ -1839,6 +1852,156 @@ __global__ void gemm_mmq_q4k_kernel(half*             __restrict__ y,
     }
 }
 
+// Lazy scratch for the q8_1-quantized [N][K] activation matrix (N*K/32 blocks).
+static block_q8_1* get_q8_1_scratch_batched(int total_blocks) {
+    static block_q8_1* buf = nullptr;
+    static int cap_blocks = 0;
+    if (total_blocks > cap_blocks) {
+        if (buf) cudaFree(buf);
+        if (cudaMalloc(&buf, (size_t)total_blocks * sizeof(block_q8_1)) != cudaSuccess) {
+            buf = nullptr; cap_blocks = 0; return nullptr;
+        }
+        cap_blocks = total_blocks;
+    }
+    return buf;
+}
+
+// Path E6: int8 tensor-core MMQ Q4_K prefill GEMM. Same tiling as the E5 f16
+// kernel (16x32 M/N per block, 4 warps), but one mma.m16n8k32.s8.s8.s32 per
+// 32-wide sub-block on raw nibbles x q8_1 activations, with the Q4_K (d,dm)
+// and q8_1 (d8,s8) scales applied in a float epilogue. A-fragment layout and
+// the epilogue mapping validated in tests/test_mmq_q4k_int8.cu.
+__global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
+                                       const block_q4_K* __restrict__ W,
+                                       const block_q8_1* __restrict__ XQ,
+                                       int M, int N, int K)
+{
+    const int row_base     = blockIdx.y * MMQ_Q4K_TILE_M;
+    const int blk_tok_base = blockIdx.x * MMQ_Q4K_BLOCK_N;
+    if (row_base >= M) return;
+
+    const int t_id    = threadIdx.x;
+    const int warp_id = t_id >> 5;
+    const int lane    = t_id & 31;
+    const int groupID = lane >> 2;
+    const int tinG    = lane &  3;
+
+    const int tok_base = blk_tok_base + warp_id * MMQ_Q4K_TILE_N;
+    const int n_blocks = K / QK_K;
+    const int nsb      = n_blocks * 8;            // q8_1 sub-blocks along K
+
+    const int tok0 = tok_base + tinG * 2;
+    const int tok1 = tok0 + 1;
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    __shared__ int8_t A_tile[MMQ_Q4K_TILE_M][32];
+    __shared__ float  per_d [MMQ_Q4K_TILE_M][8];
+    __shared__ float  per_dm[MMQ_Q4K_TILE_M][8];
+
+    for (int b = 0; b < n_blocks; b++) {
+        {
+            const int row = t_id >> 3;
+            const int sb  = t_id &  7;
+            const int g_row = row_base + row;
+            float d = 0.0f, dm = 0.0f;
+            if (g_row < M) {
+                const block_q4_K& blk = W[(int64_t)g_row * n_blocks + b];
+                const float dall = raw_fp16_to_float(blk.d_raw);
+                const float dmin = raw_fp16_to_float(blk.dmin_raw);
+                uint8_t sc, mn;
+                get_scale_min_k4(sb, blk.scales, sc, mn);
+                d  = dall * sc;
+                dm = dmin * mn;
+            }
+            per_d [row][sb] = d;
+            per_dm[row][sb] = dm;
+        }
+        __syncthreads();
+
+        for (int sb = 0; sb < 8; sb++) {
+            const int il     = sb >> 1;
+            const int parity = sb &  1;
+
+            // Cooperative unpack of raw 4-bit nibbles -> int8 [0..15].
+            {
+                const int row   = t_id >> 3;
+                const int col_4 = (t_id & 7) << 2;
+                const int g_row = row_base + row;
+                const block_q4_K* bp = (g_row < M)
+                    ? &W[(int64_t)g_row * n_blocks + b] : nullptr;
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    const int col = col_4 + s;
+                    int8_t q = 0;
+                    if (g_row < M) {
+                        const uint8_t qb = bp->qs[32 * il + col];
+                        q = (int8_t)(parity ? (qb >> 4) : (qb & 0xF));
+                    }
+                    A_tile[row][col] = q;
+                }
+            }
+            __syncthreads();
+
+            const int gsb = b * 8 + sb;
+
+            // A fragment (m16n8k32 s8 layout, validated): rows {gid, gid+8}
+            // paired across k_lo (4t..+3) / k_hi (16+4t..+3).
+            const int a0 = *reinterpret_cast<const int*>(&A_tile[groupID    ][4 * tinG     ]);
+            const int a1 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][4 * tinG     ]);
+            const int a2 = *reinterpret_cast<const int*>(&A_tile[groupID    ][16 + 4 * tinG]);
+            const int a3 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][16 + 4 * tinG]);
+
+            // B fragment: q8_1 of token (tok_base+groupID).
+            const int g_tok = tok_base + groupID;
+            int bb0 = 0, bb1 = 0;
+            if (g_tok < N) {
+                const block_q8_1* q = &XQ[(int64_t)g_tok * nsb + gsb];
+                bb0 = *reinterpret_cast<const int*>(q->qs + 4 * tinG);
+                bb1 = *reinterpret_cast<const int*>(q->qs + 16 + 4 * tinG);
+            }
+
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bb0), "r"(bb1)
+            );
+
+            const float dA  = per_d [groupID    ][sb];
+            const float dmA = per_dm[groupID    ][sb];
+            const float dB  = per_d [groupID + 8][sb];
+            const float dmB = per_dm[groupID + 8][sb];
+            float d8_0 = 0.0f, s8_0 = 0.0f, d8_1 = 0.0f, s8_1 = 0.0f;
+            if (tok0 < N) {
+                d8_0 = raw_fp16_to_float(XQ[(int64_t)tok0 * nsb + gsb].d_raw);
+                s8_0 = raw_fp16_to_float(XQ[(int64_t)tok0 * nsb + gsb].s_raw);
+            }
+            if (tok1 < N) {
+                d8_1 = raw_fp16_to_float(XQ[(int64_t)tok1 * nsb + gsb].d_raw);
+                s8_1 = raw_fp16_to_float(XQ[(int64_t)tok1 * nsb + gsb].s_raw);
+            }
+            d0 += dA * d8_0 * (float)c0 - dmA * s8_0;
+            d1 += dA * d8_1 * (float)c1 - dmA * s8_1;
+            d2 += dB * d8_0 * (float)c2 - dmB * s8_0;
+            d3 += dB * d8_1 * (float)c3 - dmB * s8_1;
+            __syncthreads();
+        }
+    }
+
+    const int row_a = row_base + groupID;
+    const int row_b = row_base + groupID + 8;
+    if (row_a < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_a] = __float2half(d0);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_a] = __float2half(d1);
+    }
+    if (row_b < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_b] = __float2half(d2);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_b] = __float2half(d3);
+    }
+}
+
 static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
                                    const half* x, int M, int N, int K,
                                    cudaStream_t stream) {
@@ -1859,16 +2022,44 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
     // crash). Q5_K / Q6_K continue through the existing scalar
     // batched kernels.
     if (ggml_type == 12 && mmq_q4k_enabled()) {
+        dim3 mmq_grid((N + MMQ_Q4K_BLOCK_N - 1) / MMQ_Q4K_BLOCK_N,
+                      (M + MMQ_Q4K_TILE_M  - 1) / MMQ_Q4K_TILE_M,  1);
+
+        // Path E6: int8 tensor-core MMQ (default). Quantize the [N][K]
+        // activation to q8_1, then mma.m16n8k32.s8.s8.s32 — ~2x the f16 path.
+        if (mmq_q4k_i8_enabled() && (K % 32 == 0)) {
+            static bool announced = false;
+            if (!announced) {
+                announced = true;
+                fprintf(stderr,
+                        "[GEMM] Path E6 int8-MMA Q4_K tensor-core kernel active "
+                        "(default on; set JLLM_MMQ_Q4K_I8=0 to use the f16 path)\n");
+            }
+            const int total_blocks = N * (K / 32);
+            block_q8_1* xq = get_q8_1_scratch_batched(total_blocks);
+            if (xq) {
+                quantize_q8_1_kernel<<<total_blocks, 32, 0, stream>>>(
+                    x, xq, N * K);
+                gemm_mmq_q4k_i8_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, xq, M, N, K);
+                cudaError_t err = cudaGetLastError();
+                if (err == cudaSuccess) {
+                    return true;
+                }
+                fprintf(stderr,
+                        "[GEMM] int8-MMA Q4_K launch failed (%s), falling back "
+                        "to f16 MMA\n", cudaGetErrorString(err));
+            }
+        }
+
         static bool announced = false;
         if (!announced) {
             announced = true;
             fprintf(stderr,
                     "[GEMM] Path E MMQ Q4_K tensor-core kernel active "
-                    "(multi-warp, default on; set JLLM_MMQ_Q4K=0 to "
+                    "(multi-warp f16, default on; set JLLM_MMQ_Q4K=0 to "
                     "disable)\n");
         }
-        dim3 mmq_grid((N + MMQ_Q4K_BLOCK_N - 1) / MMQ_Q4K_BLOCK_N,
-                      (M + MMQ_Q4K_TILE_M  - 1) / MMQ_Q4K_TILE_M,  1);
         gemm_mmq_q4k_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
             y, (const block_q4_K*)W_device, x, M, N, K);
         cudaError_t err = cudaGetLastError();
