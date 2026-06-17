@@ -167,7 +167,7 @@ ModelConfig load_gguf_config(const std::string& path) {
         fread(&vtype, sizeof(vtype), 1, f);
 
         // Parse based on type
-        if (vtype == 4) {  // GGUF_TYPE_UINT32
+        if (vtype == 4 || vtype == 5) {  // GGUF_TYPE_UINT32 / INT32 (both 4B)
             uint32_t val;
             fread(&val, sizeof(val), 1, f);
 
@@ -255,9 +255,13 @@ ModelConfig load_gguf_config(const std::string& path) {
                 }
             }
         } else {
-            // Skip unknown types (need proper GGUF parser for production)
-            // For now, try to skip common sizes
-            fseek(f, 8, SEEK_CUR);  // rough skip
+            // Other scalar types: skip by true width. The old fixed 8-byte skip
+            // desynced the whole stream on, e.g., INT32 (vtype 5) or bool
+            // (vtype 7) values such as general.sampling.top_k.
+            int sz = (vtype <= 1 || vtype == 7) ? 1
+                     : (vtype <= 3)            ? 2
+                     : (vtype <= 6)            ? 4 : 8;
+            fseek(f, sz, SEEK_CUR);
         }
     }
 
