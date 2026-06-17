@@ -936,7 +936,17 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
         : 0;
 
     int kv_bytes = gen_params_.kv_int8 ? 1 : 2;
-    int auto_ctx = budget_.max_context(config_.n_layers, config_.n_kv_heads, config_.head_dim, kv_bytes);
+    // Gemma 4 shares KV across the trailing n_kv_shared_layers layers: only the
+    // first (n_layers - n_kv_shared_layers) layers hold their own K/V, and the
+    // shared layers read those slots (transformer_layer_gemma4's kv_layer is
+    // always < this count). Sizing the pool to the producing-layer count frees
+    // ~57% of KV memory on Gemma 4 E2B (15 of 35 layers) and lets the context
+    // budget stretch correspondingly. Other arches keep all n_layers.
+    const int kv_pool_layers =
+        (config_.arch == Arch::Gemma4 && config_.n_kv_shared_layers > 0)
+            ? (config_.n_layers - config_.n_kv_shared_layers)
+            : config_.n_layers;
+    int auto_ctx = budget_.max_context(kv_pool_layers, config_.n_kv_heads, config_.head_dim, kv_bytes);
 
     // Cap the implicit auto-context to something that leaves real headroom on
     // 8 GB Jetsons. Qwen3-4B uses 128-dim K/V heads, so 8192 tokens allocates
@@ -968,7 +978,7 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
     size_t layer_device_bytes = 0;
 
     KVCachePool::Config kv_cfg = {};
-    kv_cfg.n_layers = config_.n_layers;
+    kv_cfg.n_layers = kv_pool_layers;
     kv_cfg.n_kv_heads = config_.n_kv_heads;
     kv_cfg.head_dim = config_.head_dim;
     kv_cfg.max_context = ctx;
