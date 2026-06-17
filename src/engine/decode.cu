@@ -406,10 +406,24 @@ static bool copy_weight_to_device(const void* src, size_t bytes, void** dst) {
 }
 
 static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
-                                     int head_dim,
+                                     int head_dim, int ple_input_dim,
                                      std::vector<void*>& owned) {
     const size_t norm_bytes = (size_t)hidden_dim * sizeof(float);
     const size_t qk_norm_bytes = (size_t)head_dim * sizeof(float);
+    const size_t ple_norm_bytes = (size_t)ple_input_dim * sizeof(float);
+
+    // Gemma 4 adds sandwich (post-attn / post-ffn) and PLE norms. Like the
+    // base RMSNorms, these are read directly by fused_rmsnorm_residual, so the
+    // raw mmap host pointer traps; copy each to device the same way. Helper
+    // stages one optional norm and reassigns the pointer in place.
+    auto stage = [&](const void*& w, size_t bytes) -> bool {
+        if (!w) return true;            // tensor absent (non-Gemma) — leave null
+        void* d = nullptr;
+        if (!copy_weight_to_device(w, bytes, &d)) return false;
+        owned.push_back(d);
+        w = d;
+        return true;
+    };
 
     for (int l = 0; l < mw.n_layers; l++) {
         auto& lw = mw.layers[l];
@@ -429,6 +443,11 @@ static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
         owned.push_back(ffn);
         lw.rms_attn = attn;
         lw.rms_ffn = ffn;
+
+        // Gemma 4 sandwich + PLE per-layer norms (all [hidden_dim] F32).
+        if (!stage(lw.post_attn_norm, norm_bytes)) return false;
+        if (!stage(lw.post_ffn_norm, norm_bytes)) return false;
+        if (!stage(lw.ple_norm, norm_bytes)) return false;
 
         if (lw.q_norm && lw.k_norm) {
             if (lw.qk_norm_type != 0) {
@@ -453,6 +472,10 @@ static bool materialize_norm_weights(ModelWeights& mw, int hidden_dim,
     if (!copy_weight_to_device(mw.output_norm, norm_bytes, &out_norm)) return false;
     owned.push_back(out_norm);
     mw.output_norm = out_norm;
+
+    // Gemma 4 global PLE projection norm ([ple_input_dim] F32).
+    if (!stage(mw.ple_proj_norm, ple_norm_bytes)) return false;
+
     fprintf(stderr, "[model] Materialized up to %d RMSNorm tensors on device\n",
             mw.n_layers * 4 + 1);
     return true;
@@ -874,6 +897,15 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
                 config_.n_layers, config_.sliding_head_dim, config_.global_head_dim,
                 config_.n_kv_shared_layers, config_.ple_input_dim,
                 config_.spec.final_logit_softcap, config_.sliding_window);
+        // Gemma's V activations have large-dynamic-range outliers (massive
+        // activations ~10x RMS). Per-row INT8 KV quantization collapses the
+        // small-but-significant V components and wrecks attention, so force
+        // FP16 KV for Gemma regardless of the requested kv_int8 default.
+        if (gen_params_.kv_int8) {
+            fprintf(stderr, "[engine] Gemma 4: forcing FP16 KV cache "
+                            "(INT8 KV too lossy for Gemma V distribution)\n");
+            gen_params_.kv_int8 = false;
+        }
     }
 
     if (!load_and_map_weights(gguf_path, &weights_, &weights_size_,
@@ -882,16 +914,29 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
         return false;
     }
     if (!materialize_norm_weights(model_weights_, config_.hidden_dim,
-                                  config_.head_dim,
+                                  config_.head_dim, config_.ple_input_dim,
                                   device_weight_copies_)) {
         fprintf(stderr, "[engine] Failed to materialize norm weights\n");
         return false;
+    }
+    // Gemma 4 applies a weightless per-head RMSNorm to V before the KV store.
+    // Build a [head_dim] device vector of ones to serve as the unit weight.
+    if (config_.arch == Arch::Gemma4) {
+        std::vector<float> ones(config_.head_dim, 1.0f);
+        void* d_ones = nullptr;
+        if (!copy_weight_to_device(ones.data(),
+                                   ones.size() * sizeof(float), &d_ones)) {
+            fprintf(stderr, "[engine] Failed to alloc Gemma V-norm ones\n");
+            return false;
+        }
+        device_weight_copies_.push_back(d_ones);
+        gemma_vnorm_ones_ = (float*)d_ones;
     }
     budget_.model_mb = mapped_weight_device_enabled()
         ? weights_size_ / (1024 * 1024)
         : 0;
 
-    int kv_bytes = params.kv_int8 ? 1 : 2;
+    int kv_bytes = gen_params_.kv_int8 ? 1 : 2;
     int auto_ctx = budget_.max_context(config_.n_layers, config_.n_kv_heads, config_.head_dim, kv_bytes);
 
     // Cap the implicit auto-context to something that leaves real headroom on
@@ -1162,26 +1207,53 @@ void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
     fused_rmsnorm_residual(normed, x, nullptr, lw.rms_attn, 1, H,
                            config_.rms_eps, norm_fp32, stream_);
 
-    // 2. QKV projections (per-layer head dim).
-    gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
-                      k_buf, lw.wk, lw.type_wk, KV_DIM,
-                      v_buf, lw.wv, lw.type_wv, KV_DIM,
-                      normed, H, stream_);
+    // 2. QKV projections (per-layer head dim). Gemma 4 shares KV across the
+    //    last n_kv_shared_layers layers: layers [kv_from_start, n_layers) do
+    //    NOT compute their own K/V — they reuse the cache of the last
+    //    KV-producing layer of the same attention type (sliding ->
+    //    kv_from_start-2, global -> kv_from_start-1), matching llama.cpp's
+    //    has_kv() mapping (n_layer_kv_from_start = n_layer - shared_kv_layers).
+    const int kv_from_start = config_.n_layers - config_.n_kv_shared_layers;
+    const bool has_own_kv = (layer < kv_from_start);
+    const int kv_layer = has_own_kv
+        ? layer
+        : (lw.is_sliding ? kv_from_start - 2 : kv_from_start - 1);
 
-    // 3a. Per-head Q/K RMSNorm.
+    if (has_own_kv) {
+        gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
+                          k_buf, lw.wk, lw.type_wk, KV_DIM,
+                          v_buf, lw.wv, lw.type_wv, KV_DIM,
+                          normed, H, stream_);
+    } else {
+        gemv_quant(q_buf, lw.wq, lw.type_wq, normed, Q_DIM, H, stream_);
+    }
+
+    // 3a. Per-head Q RMSNorm (always). K-norm + weightless V RMSNorm
+    //     (ggml_rms_norm; V is not RoPE'd) only when this layer owns its K/V.
     if (lw.q_norm) {
         fused_rmsnorm_residual(q_buf, q_buf, nullptr, lw.q_norm,
                                config_.n_heads, hd, config_.rms_eps,
                                lw.qk_norm_type == 0, stream_);
     }
-    if (lw.k_norm) {
-        fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
-                               config_.n_kv_heads, hd, config_.rms_eps,
-                               lw.qk_norm_type == 0, stream_);
+    if (has_own_kv) {
+        if (lw.k_norm) {
+            fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
+                                   config_.n_kv_heads, hd, config_.rms_eps,
+                                   lw.qk_norm_type == 0, stream_);
+        }
+        if (gemma_vnorm_ones_) {
+            fused_rmsnorm_residual(v_buf, v_buf, nullptr, gemma_vnorm_ones_,
+                                   config_.n_kv_heads, hd, config_.rms_eps,
+                                   /*weight_fp32=*/true, stream_);
+        }
     }
 
-    // 3b. RoPE (per-layer base, full rotary over hd) + KV store.
-    if (!gen_params_.kv_int8 && kv_cache_.is_fast_position(pos)) {
+    // 3b. RoPE (per-layer base, full rotary over hd) + KV store. Shared-KV
+    //     layers rotate Q only — their K/V already live in kv_layer's cache.
+    if (!has_own_kv) {
+        rope_inplace(q_buf, nullptr, config_.n_heads, 0, hd, pos,
+                     lw.rope_theta_l, config_.rope_neox, stream_);
+    } else if (!gen_params_.kv_int8 && kv_cache_.is_fast_position(pos)) {
         rope_inplace_store_kv_fp16(q_buf, k_buf, v_buf,
                                    (half*)kv_cache_.key_ptr(layer, pos),
                                    (half*)kv_cache_.val_ptr(layer, pos),
@@ -1205,13 +1277,14 @@ void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
         }
     }
 
-    // 3c. Flash attention (recipe scale = 1.0 for Gemma).
+    // 3c. Flash attention (recipe scale = 1.0 for Gemma). Reads K/V from
+    //     kv_layer (== layer for KV-owning layers, else the shared source).
     float scale = attention_scale(config_.spec, hd);
-    float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, false) : nullptr;
-    float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, true)  : nullptr;
-    flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(layer, 0),
-                           kv_cache_.val_ptr(layer, 0), config_.n_heads,
-                           config_.n_kv_heads, hd, pos + 1, scale,
+    float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, false) : nullptr;
+    float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, true)  : nullptr;
+    flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(kv_layer, 0),
+                           kv_cache_.val_ptr(kv_layer, 0), config_.n_heads,
+                           config_.n_kv_heads, hd, config_.head_dim, pos + 1, scale,
                            gen_params_.kv_int8, k_scales, v_scales, stream_);
 
     // 3d. Output projection -> post-attention (sandwich) norm -> residual.
@@ -1351,7 +1424,7 @@ void Engine::transformer_layer_attn_compute(int layer, int pos,
     flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(layer, 0),
                           kv_cache_.val_ptr(layer, 0),
                           config_.n_heads, config_.n_kv_heads, config_.head_dim,
-                          pos + 1, scale, gen_params_.kv_int8,
+                          config_.head_dim, pos + 1, scale, gen_params_.kv_int8,
                           k_scales, v_scales, stream_);
 }
 
@@ -1495,7 +1568,7 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
             attn_out_batch, q_batch,
             kv_cache_.key_ptr(layer, 0), kv_cache_.val_ptr(layer, 0),
             config_.n_heads, config_.n_kv_heads, config_.head_dim,
-            N, start_pos, scale,
+            config_.head_dim, N, start_pos, scale,
             gen_params_.kv_int8, k_scales, v_scales, stream_);
     }
 
@@ -1875,6 +1948,9 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     GenStats stats = {};
     stop_flag_ = false;
     gen_params_ = params;
+    // Keep KV precision consistent with how the pool was sized in load():
+    // Gemma forces FP16 KV (INT8 too lossy for its V distribution).
+    if (config_.arch == Arch::Gemma4) gen_params_.kv_int8 = false;
     recent_tokens_.clear();
 
     // Path F (#45): plumbing only in F2 — log conversation_id if set; the

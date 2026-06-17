@@ -341,6 +341,10 @@ private:
     // loop; each gemma4 layer reads its slice via gemma_ple_input_.
     void compute_gemma_ple_input(const half* inputs_embeds, int token, half* out);
     half* gemma_ple_input_ = nullptr;
+    // Gemma 4 normalizes V with a *weightless* per-head RMSNorm before the KV
+    // store (ggml_rms_norm in llama.cpp). fused_rmsnorm_residual needs a weight
+    // vector, so this is a device buffer of `head_dim` ones used as unit weight.
+    float* gemma_vnorm_ones_ = nullptr;
     // Single-token attention pre-Wo: QK-norm (if not already done by the
     // caller), RoPE, KV store, attention. Writes attention output (head
     // mix) to `attn_out` [Q_DIM]. No projection, no residual — caller is

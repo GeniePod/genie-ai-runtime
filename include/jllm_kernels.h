@@ -264,7 +264,8 @@ void flash_attention_decode(
     const void*    v_cache,    // [seq_len × n_kv_heads × head_dim]
     int            n_heads,
     int            n_kv_heads, // GQA: n_heads / n_kv_heads = group size
-    int            head_dim,
+    int            head_dim,   // active per-head vector length (Gemma sliding=256)
+    int            cache_head_dim, // KV cache slot per-head stride (Gemma=512)
     int            seq_len,    // current sequence length
     float          scale,      // 1/sqrt(head_dim)
     bool           kv_int8,    // true = INT8 KV cache
@@ -293,7 +294,8 @@ void flash_attention_prefill_batched(
     const void*    v_cache,
     int            n_heads,
     int            n_kv_heads,
-    int            head_dim,
+    int            head_dim,       // active per-head vector length
+    int            cache_head_dim, // KV cache slot per-head stride
     int            N,          // number of query tokens
     int            start_pos,  // absolute position of token 0 in the cache
     float          scale,
