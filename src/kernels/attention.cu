@@ -198,16 +198,23 @@ __global__ void flash_attention_prefill_batched_kernel(
     extern __shared__ float smem[];
     float* s_scores = smem;
     float* s_out    = smem + ATTN_TILE_KV;
+    float* s_q      = smem + ATTN_TILE_KV + head_dim;   // cached query row
 
     __shared__ float s_running_max;
     __shared__ float s_running_sum;
     __shared__ float s_correction;
 
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+
     const half* q_local   = q      + (int64_t)token * q_dim + (int64_t)head * head_dim;
     half*       out_local = output + (int64_t)token * q_dim + (int64_t)head * head_dim;
 
-    for (int d = tid; d < head_dim; d += blockDim.x)
+    // Cache the query row once (reused across every KV position).
+    for (int d = tid; d < head_dim; d += blockDim.x) {
         s_out[d] = 0.0f;
+        s_q[d]   = __half2float(q_local[d]);
+    }
     if (tid == 0) {
         s_running_max = -FLT_MAX;
         s_running_sum = 0.0f;
@@ -218,29 +225,31 @@ __global__ void flash_attention_prefill_batched_kernel(
     for (int kv_start = 0; kv_start < seq_len; kv_start += ATTN_TILE_KV) {
         int tile_len = min(ATTN_TILE_KV, seq_len - kv_start);
 
-        // Q × K^T for tile
-        for (int t = tid; t < tile_len; t += blockDim.x) {
+        // Q × K^T for tile: one warp per KV position, 32 lanes split + reduce
+        // the head_dim dot (vs the old one-thread-per-position serial dot).
+        for (int t = warp_id; t < tile_len; t += (blockDim.x >> 5)) {
             int kv_pos = kv_start + t;
             if (window > 0 && kv_pos < seq_len - window) {
-                s_scores[t] = -INFINITY;
+                if (lane == 0) s_scores[t] = -INFINITY;
                 continue;
             }
             float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) {
-                float q_val = __half2float(q_local[d]);
-                float k_val;
-                if (kv_int8) {
-                    const int8_t* ki = (const int8_t*)k_cache;
-                    float ks = k_scales ? k_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
-                    k_val = ki[(int64_t)kv_pos * kv_dim + kv_hoff + d] * ks;
-                } else {
-                    const half* kf = (const half*)k_cache;
-                    k_val = __half2float(
-                        kf[(int64_t)kv_pos * kv_dim + kv_hoff + d]);
-                }
-                dot += q_val * k_val;
+            if (kv_int8) {
+                const int8_t* krow = (const int8_t*)k_cache
+                    + (int64_t)kv_pos * kv_dim + kv_hoff;
+                float ks = k_scales ? k_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
+                for (int d = lane; d < head_dim; d += 32)
+                    dot += s_q[d] * (krow[d] * ks);
+            } else {
+                const half* krow = (const half*)k_cache
+                    + (int64_t)kv_pos * kv_dim + kv_hoff;
+                for (int d = lane; d < head_dim; d += 32)
+                    dot += s_q[d] * __half2float(krow[d]);
             }
-            s_scores[t] = dot * scale;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) s_scores[t] = dot * scale;
         }
         __syncthreads();
 
@@ -329,7 +338,7 @@ void flash_attention_prefill_batched(
     }
 
     const dim3 grid(n_heads, N, 1);
-    const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
+    const int smem = (ATTN_TILE_KV + 2 * head_dim) * (int)sizeof(float);
     flash_attention_prefill_batched_kernel<<<grid, ATTN_BLOCK, smem, stream>>>(
         output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, cache_head_dim,
         start_pos, scale, kv_int8, k_scales, v_scales, window);
