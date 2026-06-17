@@ -197,6 +197,18 @@ void fused_swiglu(
     cudaStream_t   stream
 );
 
+// ── Fused GeGLU (Gemma) ──────────────────────────────────────────────────
+// output = gelu_tanh(gate) * up   (the "gelu_pytorch_tanh" approximation).
+// Same shape/contract as fused_swiglu; selected per ArchSpec::ffn_activation.
+void fused_geglu(
+    half*          output,
+    const half*    gate,
+    const half*    up,
+    int            rows,
+    int            intermediate_dim,
+    cudaStream_t   stream
+);
+
 // ── Rotary Position Embedding ────────────────────────────────────────────
 // Applied in-place to Q and K before attention.
 //

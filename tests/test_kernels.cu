@@ -135,6 +135,31 @@ static void test_swiglu() {
     cudaFree(d_out); cudaFree(d_gate); cudaFree(d_up);
 }
 
+// ── Test: GeGLU (Gemma) ──────────────────────────────────────────────────
+static void test_geglu() {
+    const int n = 256;
+    half *d_out, *d_gate, *d_up;
+    CHECK_CUDA(cudaMalloc(&d_out,  n * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&d_gate, n * sizeof(half)));
+    CHECK_CUDA(cudaMalloc(&d_up,   n * sizeof(half)));
+
+    std::vector<half> gate(n, __float2half(1.0f));
+    std::vector<half> up(n, __float2half(2.0f));
+    cudaMemcpy(d_gate, gate.data(), n * sizeof(half), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_up, up.data(), n * sizeof(half), cudaMemcpyHostToDevice);
+
+    jllm::fused_geglu(d_out, d_gate, d_up, 1, n, 0);
+    cudaDeviceSynchronize();
+
+    std::vector<half> res(n);
+    cudaMemcpy(res.data(), d_out, n * sizeof(half), cudaMemcpyDeviceToHost);
+    float val = __half2float(res[0]);
+    // gelu_tanh(1.0) ≈ 0.8412, × up(2.0) ≈ 1.6824
+    assert(fabsf(val - 1.6824f) < 0.05f);
+    printf("PASS: geglu (val=%.4f, expected ~1.6824)\n", val);
+    cudaFree(d_out); cudaFree(d_gate); cudaFree(d_up);
+}
+
 int main() {
     printf("=== jetson-llm kernel tests ===\n\n");
     cudaSetDevice(0);
@@ -148,6 +173,7 @@ int main() {
     test_fused_norm();
     test_convert();
     test_swiglu();
+    test_geglu();
 
     printf("\nAll kernel tests passed.\n");
     return 0;

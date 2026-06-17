@@ -974,6 +974,29 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
 //   ffn_out   = FFN(RMSNorm(x2))
 //   x_out     = x2 + ffn_out                  ← second residual add
 
+// ── Arch-recipe dispatch helpers (#89) ───────────────────────────────────
+// The forward pass reads these instead of hardcoded constants so a new model
+// family is a recipe, not a fork of the hot path. For the default (Llama/Qwen)
+// recipe they reproduce the original behavior exactly (byte-identical).
+
+// FFN activation: SwiGLU (Llama/Qwen) vs GeGLU (Gemma).
+static inline void ffn_activation(const ArchSpec& spec, half* out,
+                                  const half* gate, const half* up,
+                                  int rows, int dim, cudaStream_t stream) {
+    if (spec.ffn_activation == FfnActivation::GeluGeGLU) {
+        fused_geglu(out, gate, up, rows, dim, stream);
+    } else {
+        fused_swiglu(out, gate, up, rows, dim, stream);
+    }
+}
+
+// Attention softmax scale: an explicit recipe override (Gemma uses 1.0), else
+// the default 1/sqrt(head_dim).
+static inline float attention_scale(const ArchSpec& spec, int head_dim) {
+    return spec.attn_scale > 0.0f ? spec.attn_scale
+                                  : 1.0f / sqrtf((float)head_dim);
+}
+
 void Engine::transformer_layer(int layer, int pos, half* x) {
     const auto& lw = model_weights_.layers[layer];
     int H = config_.hidden_dim;
@@ -1047,7 +1070,7 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
     gemv_quant_pair(gate_buf, lw.w_gate, lw.type_w_gate, I,
                     up_buf,   lw.w_up,   lw.type_w_up,   I,
                     normed2, H, stream_);
-    fused_swiglu(swiglu_out, gate_buf, up_buf, 1, I, stream_);
+    ffn_activation(config_.spec, swiglu_out, gate_buf, up_buf, 1, I, stream_);
 
     // 3c. FFN exit: x = x2 + W_down(swiglu_out).
     transformer_layer_ffn_block(layer, x2, swiglu_out, x);
@@ -1102,7 +1125,7 @@ void Engine::transformer_layer_attn_compute(int layer, int pos,
                         KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
     }
 
-    float scale = 1.0f / sqrtf((float)config_.head_dim);
+    float scale = attention_scale(config_.spec, config_.head_dim);
     // Path I3 (#62): per-(pos, kv_head) scale regions for the current
     // layer. nullptr in FP16 mode (matches the kernel's null-check).
     float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, /*is_value=*/false) : nullptr;
@@ -1246,7 +1269,7 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
 
     // ── Batched attention (NEW in PR #17): all N queries in one launch ──
     {
-        const float scale = 1.0f / sqrtf((float)config_.head_dim);
+        const float scale = attention_scale(config_.spec, config_.head_dim);
         // Path I3 (#62): per-(pos, kv_head) scale regions for the layer.
         float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, /*is_value=*/false) : nullptr;
         float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, /*is_value=*/true)  : nullptr;
@@ -1271,7 +1294,7 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
                        I, N, H, stream_);
     gemm_quant_batched(up_batch,   lw.w_up,   lw.type_w_up,   normed2_batch,
                        I, N, H, stream_);
-    fused_swiglu(swiglu_batch, gate_batch, up_batch, N, I, stream_);
+    ffn_activation(config_.spec, swiglu_batch, gate_batch, up_batch, N, I, stream_);
 
     // ── Batched W_down + batched residual #2 (NEW in PR #16) ──────────
     // W_down is 25.8 MB / layer on Qwen3-4B (~35% of per-layer weight
