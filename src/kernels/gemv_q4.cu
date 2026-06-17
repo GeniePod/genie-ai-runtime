@@ -89,6 +89,18 @@ static bool mmq_q4k_i8_enabled() {
     return enabled;
 }
 
+// Path E6 for Q6_K (ffn_down): int8 tensor-core MMQ. Q6_K's per-16-element
+// scales use mma.m16n8k16.s8.s8.s32 (one MMA per 16-wide scale group) on
+// (q6-32) s8 weights x q8_1 activations, scaled by d*scale*d8 (no min term —
+// Q6_K is symmetric). Default on; JLLM_MMQ_Q6K_I8=0 -> scalar batched kernel.
+static bool mmq_q6k_i8_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_MMQ_Q6K_I8");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 static const void* resolve_weight_device_ptr(const void* W) {
     if (const void* mapped = resolve_mapped_weight_device_ptr(W)) {
         return mapped;
@@ -541,6 +553,24 @@ __global__ void gemv_quant_pair_dp4a_kernel(
 __device__ __forceinline__ int load_int_u16(const void* p) {
     const uint16_t* s = (const uint16_t*)p;
     return (int)((uint32_t)s[0] | ((uint32_t)s[1] << 16));
+}
+
+// 4 packed (q6-32) int8 for positions 4*gi..4*gi+3 of a Q6_K block. Shared by
+// the decode dp4a dot and the prefill int8-MMA tile build. The scale for
+// element k is blk.scales[k >> 4] (contiguous 16-element groups).
+__device__ __forceinline__ int q6_unpack4(const block_q6_K& blk, int gi) {
+    const int p = 4 * gi, n = (p >= 128) ? 128 : 0, ph = p - n;
+    const int g = ph >> 5, r = ph & 31;
+    const uint8_t* ql_h = blk.ql + (n >> 1);
+    const uint8_t* qh_h = blk.qh + (n >> 2);
+    const int qlbyte = (ph < 64) ? ph : (ph - 64);
+    const int ql_int = load_int_u16(ql_h + qlbyte);
+    const int vil = (ph >= 64) ? ((ql_int >> 4) & 0x0F0F0F0F) : (ql_int & 0x0F0F0F0F);
+    const int qh_int = load_int_u16(qh_h + r);
+    const int shift = 2 * g;
+    const int sel = qh_int & (0x03030303 << shift);
+    const int vih = (shift <= 4 ? (sel << (4 - shift)) : (sel >> (shift - 4))) & 0x30303030;
+    return __vsubss4(vil | vih, 0x20202020);
 }
 
 // dp4a dot of one Q6_K weight row against the q8_1 activation. Each lane owns
@@ -2002,6 +2032,103 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
     }
 }
 
+// Path E6 Q6_K: int8 tensor-core MMQ for the ffn_down prefill GEMM. One
+// mma.m16n8k16.s8.s8.s32 per 16-wide Q6_K scale group, (q6-32) s8 weights x
+// q8_1 activations, scaled by d*scale*d8 in a float epilogue (no min term).
+// Validated in tests/test_mmq_q6k_int8.cu.
+__global__ void gemm_mmq_q6k_i8_kernel(half*             __restrict__ y,
+                                       const block_q6_K* __restrict__ W,
+                                       const block_q8_1* __restrict__ XQ,
+                                       int M, int N, int K)
+{
+    const int row_base     = blockIdx.y * MMQ_Q4K_TILE_M;
+    const int blk_tok_base = blockIdx.x * MMQ_Q4K_BLOCK_N;
+    if (row_base >= M) return;
+
+    const int t_id    = threadIdx.x;
+    const int warp_id = t_id >> 5;
+    const int lane    = t_id & 31;
+    const int groupID = lane >> 2;
+    const int tinG    = lane &  3;
+
+    const int tok_base = blk_tok_base + warp_id * MMQ_Q4K_TILE_N;
+    const int n_blocks = K / QK_K;
+    const int nsb      = n_blocks * 8;            // q8_1 (32-elt) sub-blocks
+    const int tok0 = tok_base + tinG * 2;
+    const int tok1 = tok0 + 1;
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    __shared__ int8_t A_tile[MMQ_Q4K_TILE_M][16];
+    __shared__ float  per_dsc[MMQ_Q4K_TILE_M][16];   // d_row * scales_row[j]
+
+    for (int b = 0; b < n_blocks; b++) {
+        {
+            const int row = t_id >> 3;
+            const int two = t_id & 7;
+            const int g_row = row_base + row;
+            float d = 0.0f; const block_q6_K* bp = nullptr;
+            if (g_row < M) { bp = &W[(int64_t)g_row * n_blocks + b]; d = raw_fp16_to_float(bp->d_raw); }
+            #pragma unroll
+            for (int hpart = 0; hpart < 2; hpart++) {
+                const int j = two + 8 * hpart;
+                per_dsc[row][j] = (g_row < M) ? d * (float)bp->scales[j] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        for (int j = 0; j < 16; j++) {
+            if (t_id < 64) {
+                const int row = t_id >> 2;
+                const int gilocal = t_id & 3;
+                const int g_row = row_base + row;
+                int vi = 0;
+                if (g_row < M) vi = q6_unpack4(W[(int64_t)g_row * n_blocks + b], 4 * j + gilocal);
+                *reinterpret_cast<int*>(&A_tile[row][4 * gilocal]) = vi;
+            }
+            __syncthreads();
+
+            const int a0 = *reinterpret_cast<const int*>(&A_tile[groupID    ][4 * tinG]);
+            const int a1 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][4 * tinG]);
+
+            const int g_tok = tok_base + groupID;
+            const int qsb = b * 8 + (j >> 1);
+            const int qoff = (j & 1) * 16;
+            int bb0 = 0;
+            if (g_tok < N)
+                bb0 = *reinterpret_cast<const int*>(XQ[(int64_t)g_tok * nsb + qsb].qs + qoff + 4 * tinG);
+
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+                : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                : "r"(a0), "r"(a1), "r"(bb0));
+
+            const float dscA = per_dsc[groupID    ][j];
+            const float dscB = per_dsc[groupID + 8][j];
+            float d8_0 = 0.0f, d8_1 = 0.0f;
+            if (tok0 < N) d8_0 = raw_fp16_to_float(XQ[(int64_t)tok0 * nsb + qsb].d_raw);
+            if (tok1 < N) d8_1 = raw_fp16_to_float(XQ[(int64_t)tok1 * nsb + qsb].d_raw);
+            d0 += dscA * d8_0 * (float)c0;
+            d1 += dscA * d8_1 * (float)c1;
+            d2 += dscB * d8_0 * (float)c2;
+            d3 += dscB * d8_1 * (float)c3;
+            __syncthreads();
+        }
+    }
+
+    const int row_a = row_base + groupID;
+    const int row_b = row_base + groupID + 8;
+    if (row_a < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_a] = __float2half(d0);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_a] = __float2half(d1);
+    }
+    if (row_b < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_b] = __float2half(d2);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_b] = __float2half(d3);
+    }
+}
+
 static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
                                    const half* x, int M, int N, int K,
                                    cudaStream_t stream) {
@@ -2070,6 +2197,35 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
                 "[GEMM] MMQ Q4_K launch failed (%s), falling back to "
                 "scalar batched kernel\n",
                 cudaGetErrorString(err));
+    }
+
+    // Path E6 Q6_K (ffn_down): int8 tensor-core MMQ replacing the scalar
+    // batched Q6_K kernel — the #1 prefill cost. Quantize x->q8_1, then
+    // one mma.m16n8k16.s8.s8.s32 per 16-wide scale group.
+    if (ggml_type == 14 && mmq_q6k_i8_enabled() && (K % 32 == 0)) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr,
+                    "[GEMM] Path E6 int8-MMA Q6_K tensor-core kernel active "
+                    "(default on; set JLLM_MMQ_Q6K_I8=0 to use the scalar path)\n");
+        }
+        const int total_blocks = N * (K / 32);
+        block_q8_1* xq = get_q8_1_scratch_batched(total_blocks);
+        if (xq) {
+            dim3 mmq_grid((N + MMQ_Q4K_BLOCK_N - 1) / MMQ_Q4K_BLOCK_N,
+                          (M + MMQ_Q4K_TILE_M  - 1) / MMQ_Q4K_TILE_M,  1);
+            quantize_q8_1_kernel<<<total_blocks, 32, 0, stream>>>(x, xq, N * K);
+            gemm_mmq_q6k_i8_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
+                y, (const block_q6_K*)W_device, xq, M, N, K);
+            cudaError_t err = cudaGetLastError();
+            if (err == cudaSuccess) {
+                return true;
+            }
+            fprintf(stderr,
+                    "[GEMM] int8-MMA Q6_K launch failed (%s), falling back to "
+                    "scalar batched kernel\n", cudaGetErrorString(err));
+        }
     }
 
     switch (ggml_type) {

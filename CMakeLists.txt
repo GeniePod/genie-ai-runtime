@@ -226,6 +226,13 @@ add_executable(test_mmq_q4k_int8 tests/test_mmq_q4k_int8.cu)
 target_link_libraries(test_mmq_q4k_int8 PRIVATE CUDA::cudart)
 add_test(NAME mmq_q4k_int8 COMMAND test_mmq_q4k_int8)
 
+# Path E6 Q6_K: int8 tensor-core MMQ for the ffn_down GEMM. mma.m16n8k16
+# (per 16-wide Q6_K scale group) on (q6-32) s8 weights x q8_1 activations,
+# d*scale*d8 epilogue (no min term). Validates vs an int8 reference.
+add_executable(test_mmq_q6k_int8 tests/test_mmq_q6k_int8.cu)
+target_link_libraries(test_mmq_q6k_int8 PRIVATE CUDA::cudart)
+add_test(NAME mmq_q6k_int8 COMMAND test_mmq_q6k_int8)
+
 # Path F phase F1: KV cache serialization round-trip. Standalone test
 # that exercises the on-disk format (header + body) we'll use in F3 to
 # persist per-conversation KV state. No engine integration yet.
