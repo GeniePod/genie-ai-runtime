@@ -145,17 +145,6 @@ void vec_scale(half* x, int n, float s, cudaStream_t stream) {
     vec_scale_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(x, n, s);
 }
 
-// ── Element-wise add: out = a + b (Gemma residuals around sandwich norms) ─
-__global__ void vec_add_kernel(half* out, const half* a, const half* b, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
-}
-
-void vec_add(half* out, const half* a, const half* b, int n, cudaStream_t stream) {
-    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    vec_add_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(out, a, b, n);
-}
-
 // ── Final-logit soft-cap (Gemma: x = c * tanh(x / c)) ─────────────────────
 __global__ void logit_softcap_kernel(float* x, int n, float cap) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
