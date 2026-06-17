@@ -240,6 +240,14 @@ add_executable(test_mmq_q4k_cpasync tests/test_mmq_q4k_cpasync.cu)
 target_link_libraries(test_mmq_q4k_cpasync PRIVATE CUDA::cudart)
 add_test(NAME mmq_q4k_cpasync COMMAND test_mmq_q4k_cpasync)
 
+# cp.async for the int8-MMA Q6_K (ffn_down) kernel. Q6_K's 210 B block is not
+# 16-aligned in the weight array, so cp.async needs the weights repacked into a
+# padded 224 B (=14x16) stride first; this test validates that approach and
+# measures the gain (reference for a future engine integration).
+add_executable(test_mmq_q6k_cpasync tests/test_mmq_q6k_cpasync.cu)
+target_link_libraries(test_mmq_q6k_cpasync PRIVATE CUDA::cudart)
+add_test(NAME mmq_q6k_cpasync COMMAND test_mmq_q6k_cpasync)
+
 # Path F phase F1: KV cache serialization round-trip. Standalone test
 # that exercises the on-disk format (header + body) we'll use in F3 to
 # persist per-conversation KV state. No engine integration yet.
