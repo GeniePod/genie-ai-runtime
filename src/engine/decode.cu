@@ -812,6 +812,28 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
             config_.vocab_size,
             config_.rms_eps, config_.rope_neox ? "neox" : "normal");
 
+    // Gemma 4 (#88): the frontend recognizes gemma4 and parses its hparams, but
+    // the forward pass is not implemented yet. Fail loud with the detected
+    // architecture instead of silently running it through the Llama/Qwen path
+    // (wrong RoPE / head dims / norms -> garbage). Lift once #92 + #93 land.
+    if (config_.arch == Arch::Gemma4) {
+        fprintf(stderr,
+                "[engine] Gemma 4 detected but not yet supported — refusing to run.\n"
+                "  layers=%d heads=%d kv_heads=%d hidden=%d ffn=%d vocab=%d\n"
+                "  head_dim: sliding=%d global=%d  sliding_window=%d pattern=%d\n"
+                "  rope_theta: global=%g sliding=%g  kv_shared_layers=%d\n"
+                "  ple_input_dim=%d  final_logit_softcap=%g\n"
+                "  Full support tracked in #88 (architecture #89, PLE #93).\n",
+                config_.n_layers, config_.n_heads, config_.n_kv_heads,
+                config_.hidden_dim, config_.intermediate_dim, config_.vocab_size,
+                config_.sliding_head_dim, config_.global_head_dim,
+                config_.sliding_window, config_.sliding_window_pattern,
+                config_.rope_theta, config_.rope_theta_swa,
+                config_.n_kv_shared_layers, config_.ple_input_dim,
+                config_.spec.final_logit_softcap);
+        return false;
+    }
+
     if (!load_and_map_weights(gguf_path, &weights_, &weights_size_,
                               &model_weights_, config_)) {
         fprintf(stderr, "[engine] Failed to load/map weights\n");
