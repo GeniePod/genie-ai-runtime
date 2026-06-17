@@ -996,6 +996,25 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
     scratch_bytes += config_.intermediate_dim * sizeof(half) * 4;
     scratch_bytes += config_.vocab_size * sizeof(float);
     scratch_bytes = std::max(scratch_bytes, (int64_t)64 * 1024 * 1024);
+    // Size for batched prefill of up to BATCH_CAP tokens so common-length
+    // prompts take the fast layer-major path instead of per-token fallback.
+    // Per-token batched footprint mirrors transformer_prefill's buffers
+    // (5H + 2Q + 2KV + 3I), plus Gemma's persistent per-token PLE-input table.
+    {
+        const int64_t BATCH_CAP = std::min<int64_t>(ctx > 0 ? ctx : 2048, 1024);
+        int64_t per_tok = (int64_t)(5 * config_.hidden_dim + 2 * q_dim +
+                                    2 * kv_dim + 3 * config_.intermediate_dim) *
+                          sizeof(half);
+        if (config_.arch == Arch::Gemma4) {
+            per_tok += (int64_t)config_.n_layers * config_.ple_input_dim *
+                       sizeof(half);
+        }
+        const int64_t batched_scratch = BATCH_CAP * per_tok +
+                                        (int64_t)config_.vocab_size *
+                                            sizeof(float) +
+                                        8 * 1024 * 1024;
+        scratch_bytes = std::max(scratch_bytes, batched_scratch);
+    }
     scratch_bytes = (scratch_bytes + 4095) & ~4095LL;
 
     if (!scratch_.init(scratch_bytes)) return false;
@@ -1608,6 +1627,179 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
     scratch_.rewind_to(snapshot);
 }
 
+// Gemma 4 batched-prefill decoder layer. Mirrors transformer_prefill's
+// layer-major batched structure, but with the Gemma decoder math validated in
+// transformer_layer_gemma4: per-layer head dim, KV sharing (shared layers
+// compute Q only and read the source layer's cache), weightless V-RMSNorm,
+// GeGLU, the 4-norm sandwich, per-layer RoPE base + sliding window, PLE, and
+// the learned layer-output scale. The big K-quant projections (QKV, Wo,
+// gate/up, down) are batched across the N prompt tokens; only RoPE/KV-store
+// and the small F32/BF16 PLE projections remain per-token.
+void Engine::transformer_prefill_gemma4(int layer, int start_pos, int n_tokens,
+                                        half* x_batch,
+                                        const half* ple_input_batch) {
+    const auto& lw = model_weights_.layers[layer];
+    const int H  = config_.hidden_dim;
+    const int hd = lw.head_dim_l;                  // 256 sliding / 512 global
+    const int Q_DIM  = config_.n_heads * hd;
+    const int KV_DIM = config_.n_kv_heads * hd;
+    const int I  = lw.intermediate_l;              // 6144 / 12288
+    const int N  = n_tokens;
+    const int L  = config_.n_layers;
+    const int D  = config_.ple_input_dim;          // 256
+    const bool norm_fp32 = (lw.rms_type == 0);
+
+    // KV sharing: layers [kv_from_start, n_layers) reuse the cache of the last
+    // KV-producing layer of their attention type (see transformer_layer_gemma4).
+    const int kv_from_start = config_.n_layers - config_.n_kv_shared_layers;
+    const bool has_own_kv = (layer < kv_from_start);
+    const int kv_layer = has_own_kv
+        ? layer
+        : (lw.is_sliding ? kv_from_start - 2 : kv_from_start - 1);
+
+    const int64_t snapshot = scratch_.mark();
+
+    half* normed_batch    = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* q_batch         = (half*)scratch_.get((int64_t)N * Q_DIM  * sizeof(half));
+    half* k_batch         = (half*)scratch_.get((int64_t)N * KV_DIM * sizeof(half));
+    half* v_batch         = (half*)scratch_.get((int64_t)N * KV_DIM * sizeof(half));
+    half* attn_out_batch  = (half*)scratch_.get((int64_t)N * Q_DIM  * sizeof(half));
+    half* attn_proj_batch = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* x_attn_batch    = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* normed2_batch   = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    half* gate_batch      = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
+    half* up_batch        = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
+    half* act_batch       = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
+    half* ffn_out_batch   = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
+    // Reused per-token PLE scratch (allocated once, not per token).
+    half* ple_gin = (half*)scratch_.get((int64_t)D * sizeof(half));
+    half* ple_g   = (half*)scratch_.get((int64_t)D * sizeof(half));
+    half* ple_p   = (half*)scratch_.get((int64_t)H * sizeof(half));
+
+    // 1. Input RMSNorm (batched).
+    fused_rmsnorm_residual(normed_batch, x_batch, nullptr, lw.rms_attn,
+                           N, H, config_.rms_eps, norm_fp32, stream_);
+
+    // 2. QKV projections (batched). Shared-KV layers compute Q only.
+    gemm_quant_batched(q_batch, lw.wq, lw.type_wq, normed_batch, Q_DIM, N, H, stream_);
+    if (has_own_kv) {
+        gemm_quant_batched(k_batch, lw.wk, lw.type_wk, normed_batch, KV_DIM, N, H, stream_);
+        gemm_quant_batched(v_batch, lw.wv, lw.type_wv, normed_batch, KV_DIM, N, H, stream_);
+    }
+
+    // 3a. Q-norm always; K-norm + weightless V-norm only when owning K/V.
+    if (lw.q_norm) {
+        fused_rmsnorm_residual(q_batch, q_batch, nullptr, lw.q_norm,
+                               N * config_.n_heads, hd, config_.rms_eps,
+                               lw.qk_norm_type == 0, stream_);
+    }
+    if (has_own_kv) {
+        if (lw.k_norm) {
+            fused_rmsnorm_residual(k_batch, k_batch, nullptr, lw.k_norm,
+                                   N * config_.n_kv_heads, hd, config_.rms_eps,
+                                   lw.qk_norm_type == 0, stream_);
+        }
+        if (gemma_vnorm_ones_) {
+            fused_rmsnorm_residual(v_batch, v_batch, nullptr, gemma_vnorm_ones_,
+                                   N * config_.n_kv_heads, hd, config_.rms_eps,
+                                   /*weight_fp32=*/true, stream_);
+        }
+    }
+
+    // 3b. Per-token RoPE (per-layer base) + KV store. Shared layers rotate Q
+    //     only; their K/V already live in kv_layer's cache.
+    for (int i = 0; i < N; i++) {
+        const int pos = start_pos + i;
+        half* q_t = q_batch + (int64_t)i * Q_DIM;
+        if (!has_own_kv) {
+            rope_inplace(q_t, nullptr, config_.n_heads, 0, hd, pos,
+                         lw.rope_theta_l, config_.rope_neox, stream_);
+            continue;
+        }
+        half* k_t = k_batch + (int64_t)i * KV_DIM;
+        half* v_t = v_batch + (int64_t)i * KV_DIM;
+        if (!gen_params_.kv_int8 && kv_cache_.is_fast_position(pos)) {
+            rope_inplace_store_kv_fp16(q_t, k_t, v_t,
+                                       (half*)kv_cache_.key_ptr(layer, pos),
+                                       (half*)kv_cache_.val_ptr(layer, pos),
+                                       config_.n_heads, config_.n_kv_heads, hd, pos,
+                                       lw.rope_theta_l, config_.rope_neox, stream_);
+        } else {
+            rope_inplace(q_t, k_t, config_.n_heads, config_.n_kv_heads, hd, pos,
+                         lw.rope_theta_l, config_.rope_neox, stream_);
+            if (gen_params_.kv_int8) {
+                float* ks = kv_cache_.kv_scale_ptr(layer, pos, false);
+                float* vs = kv_cache_.kv_scale_ptr(layer, pos, true);
+                fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), ks, k_t,
+                             config_.n_kv_heads, hd, stream_);
+                fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), vs, v_t,
+                             config_.n_kv_heads, hd, stream_);
+            } else {
+                cudaMemcpyAsync(kv_cache_.key_ptr(layer, pos), k_t,
+                                KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+                cudaMemcpyAsync(kv_cache_.val_ptr(layer, pos), v_t,
+                                KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+            }
+        }
+    }
+
+    // 3c. Batched attention (reads kv_layer; sliding layers mask the window).
+    {
+        const float scale = attention_scale(config_.spec, hd);
+        const int window = lw.is_sliding ? config_.sliding_window : 0;
+        float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, false) : nullptr;
+        float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, true)  : nullptr;
+        flash_attention_prefill_batched(
+            attn_out_batch, q_batch,
+            kv_cache_.key_ptr(kv_layer, 0), kv_cache_.val_ptr(kv_layer, 0),
+            config_.n_heads, config_.n_kv_heads, hd, config_.head_dim,
+            N, start_pos, scale,
+            gen_params_.kv_int8, k_scales, v_scales, window, stream_);
+    }
+
+    // 3d. Wo -> post-attention (sandwich) norm -> residual (all batched).
+    gemm_quant_batched(attn_proj_batch, lw.wo, lw.type_wo, attn_out_batch,
+                       H, N, Q_DIM, stream_);
+    fused_rmsnorm_residual(attn_proj_batch, attn_proj_batch, nullptr,
+                           lw.post_attn_norm, N, H, config_.rms_eps,
+                           /*weight_fp32=*/true, stream_);
+    vec_add(x_attn_batch, x_batch, attn_proj_batch, N * H, stream_);
+
+    // 4. FFN: norm -> GeGLU (double-wide) -> down -> post-ffn norm -> residual.
+    fused_rmsnorm_residual(normed2_batch, x_attn_batch, nullptr, lw.rms_ffn,
+                           N, H, config_.rms_eps, norm_fp32, stream_);
+    gemm_quant_batched(gate_batch, lw.w_gate, lw.type_w_gate, normed2_batch, I, N, H, stream_);
+    gemm_quant_batched(up_batch,   lw.w_up,   lw.type_w_up,   normed2_batch, I, N, H, stream_);
+    fused_geglu(act_batch, gate_batch, up_batch, N, I, stream_);
+    gemm_quant_batched(ffn_out_batch, lw.w_down, lw.type_w_down, act_batch, H, N, I, stream_);
+    fused_rmsnorm_residual(ffn_out_batch, ffn_out_batch, nullptr, lw.post_ffn_norm,
+                           N, H, config_.rms_eps, /*weight_fp32=*/true, stream_);
+    // x_batch becomes pe_in = x_attn + post_ffn_norm(ffn); PLE then adds to it.
+    vec_add(x_batch, x_attn_batch, ffn_out_batch, N * H, stream_);
+
+    // 5. Per-Layer Embeddings (PLE), per token: inp_gate -> gelu*ple_input ->
+    //    proj -> post-norm -> residual. ple_input slice is per (token, layer).
+    if (lw.ple_gate && ple_input_batch) {
+        for (int i = 0; i < N; i++) {
+            half* x_t = x_batch + (int64_t)i * H;
+            const half* ple_in = ple_input_batch + ((int64_t)i * L + layer) * D;
+            gemv_dense(ple_gin, lw.ple_gate, lw.type_ple_gate, x_t, D, H, stream_);
+            fused_geglu(ple_g, ple_gin, ple_in, 1, D, stream_);
+            gemv_dense(ple_p, lw.ple_proj, lw.type_ple_proj, ple_g, H, D, stream_);
+            fused_rmsnorm_residual(ple_p, ple_p, nullptr, lw.ple_norm, 1, H,
+                                   config_.rms_eps, /*weight_fp32=*/true, stream_);
+            vec_add(x_t, x_t, ple_p, H, stream_);
+        }
+    }
+
+    // 6. Per-layer learned output scale (batched).
+    if (lw.layer_scale_val != 1.0f) {
+        vec_scale(x_batch, N * H, lw.layer_scale_val, stream_);
+    }
+
+    scratch_.rewind_to(snapshot);
+}
+
 bool Engine::batched_prefill_enabled() const {
     // Default-on after the Path B series (#13-#17) landed. Output is
     // bit-identical to the per-token path on every tested model, and the
@@ -2098,6 +2290,14 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     const bool batched_fits =
         (scratch_.capacity() - batched_total) >= kBatchedScratchMargin;
 
+    // Gemma 4 batched prefill needs the same per-token transient plus a
+    // persistent per-token PLE-input table [n_layers × ple_input_dim].
+    const int64_t gemma_ple_batch_bytes =
+        (int64_t)N * config_.n_layers * config_.ple_input_dim * sizeof(half);
+    const int64_t gemma_batched_total = batched_total + gemma_ple_batch_bytes;
+    const bool gemma_batched_fits =
+        (scratch_.capacity() - gemma_batched_total) >= kBatchedScratchMargin;
+
     // Path F4b: prefill works on tokens [prefill_start, N). Positions
     // [0, prefill_start) are already in kv_cache_ via try_hydrate_kv.
     // M is the number of tokens actually prefilled this turn; M=0 means
@@ -2131,6 +2331,44 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         scale_embedding(config_.spec, x_batch, M * H, config_.hidden_dim, stream_);
         for (int l = 0; l < config_.n_layers; l++) {
             transformer_prefill(l, prefill_start, M, x_batch);
+        }
+        last_token_ = prompt_tokens.back();
+        last_prefill_x = x_batch + (int64_t)(M - 1) * H;
+    } else if (M > 0 && config_.arch == Arch::Gemma4 &&
+               config_.spec.per_layer_embeddings &&
+               batched_prefill_enabled() && gemma_batched_fits) {
+        // Path B for Gemma 4: layer-major batched prefill. Build the [M × H]
+        // activation batch and the per-token PLE-input table once, then loop
+        // layers-outer via transformer_prefill_gemma4 (batches the big K-quant
+        // projections; RoPE/KV-store and PLE stay per-token).
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] Path B: Gemma 4 batched prefill enabled\n");
+            logged = true;
+        }
+        scratch_.reset();
+        const int L = config_.n_layers;
+        const int D = config_.ple_input_dim;
+        half* x_batch = (half*)scratch_.get((int64_t)M * H * sizeof(half));
+        for (int i = 0; i < M; i++) {
+            dequant_embedding(x_batch + (int64_t)i * H, model_weights_.tok_embd,
+                              prompt_tokens[prefill_start + i], H,
+                              model_weights_.embd_type, stream_);
+        }
+        scale_embedding(config_.spec, x_batch, M * H, config_.hidden_dim, stream_);
+        // Per-token PLE input [M × n_layers × ple_dim]; persistent across layers.
+        half* ple_input_batch =
+            (half*)scratch_.get((int64_t)M * L * D * sizeof(half));
+        for (int i = 0; i < M; i++) {
+            const int64_t snap = scratch_.mark();
+            compute_gemma_ple_input(x_batch + (int64_t)i * H,
+                                    prompt_tokens[prefill_start + i],
+                                    ple_input_batch + (int64_t)i * L * D);
+            scratch_.rewind_to(snap);
+        }
+        for (int l = 0; l < config_.n_layers; l++) {
+            transformer_prefill_gemma4(l, prefill_start, M, x_batch,
+                                       ple_input_batch);
         }
         last_token_ = prompt_tokens.back();
         last_prefill_x = x_batch + (int64_t)(M - 1) * H;
