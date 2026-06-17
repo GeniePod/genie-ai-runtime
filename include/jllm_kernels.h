@@ -220,6 +220,12 @@ void logit_softcap(float* x, int n, float cap, cudaStream_t stream);
 void gemv_dense(half* out, const void* W, int wtype, const half* x,
                 int M, int K, cudaStream_t stream);
 
+// Batched dense GEMV: out[N×M] = x[N×K] · Wᵀ[K×M], dense weight W[M×K]
+// (wtype 0=F32, 1=F16, 30=BF16). Batches the Gemma PLE projections across the
+// N prompt tokens in batched prefill; routes to gemv_dense when N==1.
+void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
+                        int M, int N, int K, cudaStream_t stream);
+
 // ── Rotary Position Embedding ────────────────────────────────────────────
 // Applied in-place to Q and K before attention.
 //

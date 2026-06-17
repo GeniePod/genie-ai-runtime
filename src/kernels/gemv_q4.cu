@@ -2023,4 +2023,45 @@ void gemv_dense(half* out, const void* W, int wtype, const half* x,
     gemv_dense_kernel<<<M, 256, 0, stream>>>(out, Wd, wtype, x, M, K);
 }
 
+// Batched dense GEMV: out[N×M] = x[N×K] · Wᵀ[K×M] for a dense (non-K-quant)
+// weight W[M×K] (wtype 0=F32, 1=F16, 30=BF16). One block per (token, row);
+// threads reduce over K. Used to batch the Gemma PLE projections across the
+// N prompt tokens during prefill. Reads the weight once per (token,row) — not
+// bandwidth-optimal, but the PLE matrices are tiny vs the K-quant projections.
+__global__ void gemm_dense_batched_kernel(half* __restrict__ out,
+                                          const void* __restrict__ W, int wtype,
+                                          const half* __restrict__ x,
+                                          int M, int N, int K) {
+    const int m = blockIdx.x;   // weight row / output feature
+    const int n = blockIdx.y;   // token
+    if (m >= M || n >= N) return;
+    const int tid = threadIdx.x;
+    const int64_t wbase = (int64_t)m * K;
+    const int64_t xbase = (int64_t)n * K;
+    float acc = 0.0f;
+    for (int k = tid; k < K; k += blockDim.x) {
+        float w;
+        if (wtype == 0)      w = ((const float*)W)[wbase + k];
+        else if (wtype == 1) w = __half2float(((const half*)W)[wbase + k]);
+        else { uint32_t bits = (uint32_t)((const uint16_t*)W)[wbase + k] << 16; w = __int_as_float(bits); }
+        acc += w * __half2float(x[xbase + k]);
+    }
+    __shared__ float sm[256];
+    sm[tid] = acc;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sm[tid] += sm[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) out[(int64_t)n * M + m] = __float2half(sm[0]);
+}
+
+void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
+                        int M, int N, int K, cudaStream_t stream) {
+    if (N == 1) { gemv_dense(out, W, wtype, x, M, K, stream); return; }
+    const void* Wd = resolve_weight_device_ptr(W);
+    dim3 grid(M, N);
+    gemm_dense_batched_kernel<<<grid, 256, 0, stream>>>(out, Wd, wtype, x, M, N, K);
+}
+
 }  // namespace jllm

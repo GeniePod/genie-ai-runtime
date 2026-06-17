@@ -1006,7 +1006,11 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
                                     2 * kv_dim + 3 * config_.intermediate_dim) *
                           sizeof(half);
         if (config_.arch == Arch::Gemma4) {
+            // Persistent per-token PLE-input table + the per-layer batched PLE
+            // transient (ple_in_layer + inp_gate out + gated + proj).
             per_tok += (int64_t)config_.n_layers * config_.ple_input_dim *
+                       sizeof(half);
+            per_tok += (int64_t)(3 * config_.ple_input_dim + config_.hidden_dim) *
                        sizeof(half);
         }
         const int64_t batched_scratch = BATCH_CAP * per_tok +
@@ -1671,10 +1675,12 @@ void Engine::transformer_prefill_gemma4(int layer, int start_pos, int n_tokens,
     half* up_batch        = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
     half* act_batch       = (half*)scratch_.get((int64_t)N * I      * sizeof(half));
     half* ffn_out_batch   = (half*)scratch_.get((int64_t)N * H      * sizeof(half));
-    // Reused per-token PLE scratch (allocated once, not per token).
-    half* ple_gin = (half*)scratch_.get((int64_t)D * sizeof(half));
-    half* ple_g   = (half*)scratch_.get((int64_t)D * sizeof(half));
-    half* ple_p   = (half*)scratch_.get((int64_t)H * sizeof(half));
+    // Batched PLE buffers: this layer's per-token ple-input gathered into a
+    // contiguous [N×D], then inp_gate output, gated value, and projection.
+    half* ple_in_layer = (half*)scratch_.get((int64_t)N * D * sizeof(half));
+    half* ple_gin_b    = (half*)scratch_.get((int64_t)N * D * sizeof(half));
+    half* ple_g_b      = (half*)scratch_.get((int64_t)N * D * sizeof(half));
+    half* ple_p_b      = (half*)scratch_.get((int64_t)N * H * sizeof(half));
 
     // 1. Input RMSNorm (batched).
     fused_rmsnorm_residual(normed_batch, x_batch, nullptr, lw.rms_attn,
@@ -1777,19 +1783,25 @@ void Engine::transformer_prefill_gemma4(int layer, int start_pos, int n_tokens,
     // x_batch becomes pe_in = x_attn + post_ffn_norm(ffn); PLE then adds to it.
     vec_add(x_batch, x_attn_batch, ffn_out_batch, N * H, stream_);
 
-    // 5. Per-Layer Embeddings (PLE), per token: inp_gate -> gelu*ple_input ->
-    //    proj -> post-norm -> residual. ple_input slice is per (token, layer).
+    // 5. Per-Layer Embeddings (PLE), batched: inp_gate -> gelu*ple_input ->
+    //    proj -> post-norm -> residual, over all N tokens at once.
     if (lw.ple_gate && ple_input_batch) {
-        for (int i = 0; i < N; i++) {
-            half* x_t = x_batch + (int64_t)i * H;
-            const half* ple_in = ple_input_batch + ((int64_t)i * L + layer) * D;
-            gemv_dense(ple_gin, lw.ple_gate, lw.type_ple_gate, x_t, D, H, stream_);
-            fused_geglu(ple_g, ple_gin, ple_in, 1, D, stream_);
-            gemv_dense(ple_p, lw.ple_proj, lw.type_ple_proj, ple_g, H, D, stream_);
-            fused_rmsnorm_residual(ple_p, ple_p, nullptr, lw.ple_norm, 1, H,
-                                   config_.rms_eps, /*weight_fp32=*/true, stream_);
-            vec_add(x_t, x_t, ple_p, H, stream_);
-        }
+        // Gather this layer's per-token ple-input into a contiguous [N×D].
+        // ple_input_batch is [N × n_layers × D]; token t's layer slice is at
+        // (t*L + layer)*D, strided by L*D between tokens.
+        cudaMemcpy2DAsync(ple_in_layer, (size_t)D * sizeof(half),
+                          ple_input_batch + (int64_t)layer * D,
+                          (size_t)L * D * sizeof(half),
+                          (size_t)D * sizeof(half), N,
+                          cudaMemcpyDeviceToDevice, stream_);
+        gemm_dense_batched(ple_gin_b, lw.ple_gate, lw.type_ple_gate, x_batch,
+                           D, N, H, stream_);
+        fused_geglu(ple_g_b, ple_gin_b, ple_in_layer, N, D, stream_);
+        gemm_dense_batched(ple_p_b, lw.ple_proj, lw.type_ple_proj, ple_g_b,
+                           H, N, D, stream_);
+        fused_rmsnorm_residual(ple_p_b, ple_p_b, nullptr, lw.ple_norm, N, H,
+                               config_.rms_eps, /*weight_fp32=*/true, stream_);
+        vec_add(x_batch, x_batch, ple_p_b, N * H, stream_);
     }
 
     // 6. Per-layer learned output scale (batched).
@@ -2291,9 +2303,12 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         (scratch_.capacity() - batched_total) >= kBatchedScratchMargin;
 
     // Gemma 4 batched prefill needs the same per-token transient plus a
-    // persistent per-token PLE-input table [n_layers × ple_input_dim].
+    // persistent per-token PLE-input table [n_layers × ple_input_dim] and the
+    // per-layer batched PLE transient (3*ple_dim + hidden per token).
     const int64_t gemma_ple_batch_bytes =
-        (int64_t)N * config_.n_layers * config_.ple_input_dim * sizeof(half);
+        (int64_t)N * (config_.n_layers * config_.ple_input_dim +
+                      3 * config_.ple_input_dim + config_.hidden_dim) *
+        sizeof(half);
     const int64_t gemma_batched_total = batched_total + gemma_ple_batch_bytes;
     const bool gemma_batched_fits =
         (scratch_.capacity() - gemma_batched_total) >= kBatchedScratchMargin;
