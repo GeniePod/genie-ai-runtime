@@ -160,6 +160,31 @@ static void test_geglu() {
     cudaFree(d_out); cudaFree(d_gate); cudaFree(d_up);
 }
 
+// ── Test: final-logit soft-cap (Gemma) ──────────────────────────────────
+static void test_logit_softcap() {
+    const int n = 64;
+    float* d_x;
+    CHECK_CUDA(cudaMalloc(&d_x, n * sizeof(float)));
+    std::vector<float> x(n);
+    for (int i = 0; i < n; i++) x[i] = (float)(i - 32) * 4.0f;  // -128..124
+    cudaMemcpy(d_x, x.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+    jllm::logit_softcap(d_x, n, 30.0f, 0);
+    cudaDeviceSynchronize();
+
+    std::vector<float> r(n);
+    cudaMemcpy(r.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost);
+    bool bounded = true;
+    for (int i = 0; i < n; i++)
+        if (r[i] <= -30.0f || r[i] >= 30.0f) bounded = false;
+    assert(bounded);
+    float expect = 30.0f * tanhf(x[50] / 30.0f);
+    assert(fabsf(r[50] - expect) < 0.05f);
+    printf("PASS: logit_softcap (bounded |x|<30, r[50]=%.3f exp %.3f)\n",
+           r[50], expect);
+    cudaFree(d_x);
+}
+
 int main() {
     printf("=== jetson-llm kernel tests ===\n\n");
     cudaSetDevice(0);
@@ -174,6 +199,7 @@ int main() {
     test_convert();
     test_swiglu();
     test_geglu();
+    test_logit_softcap();
 
     printf("\nAll kernel tests passed.\n");
     return 0;

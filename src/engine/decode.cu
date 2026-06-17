@@ -997,6 +997,23 @@ static inline float attention_scale(const ArchSpec& spec, int head_dim) {
                                   : 1.0f / sqrtf((float)head_dim);
 }
 
+// Embedding scale: Gemma multiplies token embeddings by sqrt(hidden). `n_elems`
+// is the total element count (n_tokens * hidden). No-op for the default recipe.
+static inline void scale_embedding(const ArchSpec& spec, half* x, int n_elems,
+                                   int hidden, cudaStream_t stream) {
+    if (spec.scale_embeddings) {
+        vec_scale(x, n_elems, sqrtf((float)hidden), stream);
+    }
+}
+
+// Final-logit soft-cap (Gemma): x = c*tanh(x/c). No-op for the default recipe.
+static inline void apply_logit_softcap(const ArchSpec& spec, float* logits,
+                                       int n, cudaStream_t stream) {
+    if (spec.final_logit_softcap > 0.0f) {
+        logit_softcap(logits, n, spec.final_logit_softcap, stream);
+    }
+}
+
 void Engine::transformer_layer(int layer, int pos, half* x) {
     const auto& lw = model_weights_.layers[layer];
     int H = config_.hidden_dim;
@@ -1336,6 +1353,7 @@ int Engine::decode_step(int pos) {
     // token_embd is typically Q4_K (type 12) or Q6_K (type 14) in GGUF
     dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
                       model_weights_.embd_type, stream_);
+    scale_embedding(config_.spec, x, H, config_.hidden_dim, stream_);
     if (profile) {
         cudaStreamSynchronize(stream_);
         auto now = Clock::now();
@@ -1375,6 +1393,7 @@ int Engine::decode_step(int pos) {
 
     gemv_quant_f32(logits_fp32, model_weights_.output, model_weights_.output_type,
                    normed, config_.vocab_size, H, stream_);
+    apply_logit_softcap(config_.spec, logits_fp32, config_.vocab_size, stream_);
 
     // Copy FP32 logits to a pinned host buffer for CPU sampling.
     cudaError_t copy_err = cudaMemcpyAsync(host_logits_, logits_fp32,
@@ -1466,6 +1485,7 @@ void Engine::build_cuda_graph(int pos) {
     float* g_logits_fp32 = (float*)scratch_.get(config_.vocab_size * sizeof(float));
     gemv_quant_f32(g_logits_fp32, model_weights_.output, model_weights_.output_type,
                    g_normed, config_.vocab_size, H, stream_);
+    apply_logit_softcap(config_.spec, g_logits_fp32, config_.vocab_size, stream_);
 
     cudaError_t err = cudaStreamEndCapture(stream_, &decode_graph_);
     if (err != cudaSuccess) {
@@ -1807,6 +1827,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                               prompt_tokens[prefill_start + i], H,
                               model_weights_.embd_type, stream_);
         }
+        scale_embedding(config_.spec, x_batch, M * H, config_.hidden_dim, stream_);
         for (int l = 0; l < config_.n_layers; l++) {
             transformer_prefill(l, prefill_start, M, x_batch);
         }
@@ -1829,6 +1850,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             half* x = (half*)scratch_.get(H * sizeof(half));
             dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
                               model_weights_.embd_type, stream_);
+            scale_embedding(config_.spec, x, H, config_.hidden_dim, stream_);
             for (int l = 0; l < config_.n_layers; l++)
                 transformer_layer(l, i, x);
             // Hang onto the last token's residual; the scratch pool has NOT
@@ -1890,6 +1912,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             gemv_quant_f32(logits_fp32, model_weights_.output,
                            model_weights_.output_type,
                            normed, config_.vocab_size, H, stream_);
+            apply_logit_softcap(config_.spec, logits_fp32, config_.vocab_size, stream_);
             cudaError_t copy_err =
                 cudaMemcpyAsync(host_logits_, logits_fp32,
                                 config_.vocab_size * sizeof(float),

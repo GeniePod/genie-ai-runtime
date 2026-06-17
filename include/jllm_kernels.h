@@ -209,6 +209,12 @@ void fused_geglu(
     cudaStream_t   stream
 );
 
+// In-place scalar multiply of a half vector (Gemma embedding scale x*=sqrt(d)).
+void vec_scale(half* x, int n, float s, cudaStream_t stream);
+
+// In-place final-logit soft-cap on FP32 logits: x = cap * tanh(x / cap) (Gemma).
+void logit_softcap(float* x, int n, float cap, cudaStream_t stream);
+
 // ── Rotary Position Embedding ────────────────────────────────────────────
 // Applied in-place to Q and K before attention.
 //
