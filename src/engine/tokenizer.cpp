@@ -239,9 +239,11 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
             std::string model(str_len, '\0');
             fread(&model[0], 1, str_len, f);
             byte_encode_ = (model == "gpt2" || model == "qwen2");
-            // "llama" is GGUF's label for the SentencePiece/unigram tokenizer
-            // used by Gemma and Llama-SPM models.
-            is_spm_ = (model == "llama");
+            // GGUF labels the SentencePiece/unigram tokenizer "llama"; Gemma
+            // ships its own labels ("gemma", "gemma2".."gemma4") that are also
+            // SentencePiece (▁ meta-space, unigram scores), even though the
+            // file may additionally carry a BPE merge table.
+            is_spm_ = (model == "llama" || model.rfind("gemma", 0) == 0);
         }
         else if (strcmp(key, "tokenizer.ggml.add_space_prefix") == 0 && vtype == 7) {
             uint8_t v = 0;
