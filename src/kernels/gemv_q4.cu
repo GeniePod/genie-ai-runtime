@@ -401,6 +401,89 @@ __device__ __forceinline__ float warp_reduce_sum(float acc) {
     return acc;
 }
 
+// ── MMVQ (int8 dp4a) path ────────────────────────────────────────────────
+// Quantize the activation to int8 (q8_1) and dot it against Q4_K weights with
+// __dp4a, avoiding the per-element float dequant of the weights (the decode
+// compute bottleneck). Mirrors llama.cpp's vec_dot_q4_K_q8_1.
+struct __attribute__((packed)) block_q8_1 {
+    uint16_t d_raw;     // FP16 scale = max(|x|)/127
+    uint16_t s_raw;     // FP16 d * sum(qs)  (the min-term scale)
+    int8_t   qs[32];
+};
+static_assert(sizeof(block_q8_1) == 36, "block_q8_1 must be 36 bytes");
+
+// Quantize x[K] -> block_q8_1[K/32]. One warp per 32-block.
+__global__ void quantize_q8_1_kernel(const half* __restrict__ x,
+                                     block_q8_1* __restrict__ y, int K) {
+    const int b = blockIdx.x;
+    const int i = threadIdx.x;            // 0..31
+    const int k = b * 32 + i;
+    float v = (k < K) ? __half2float(x[k]) : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o));
+    const float d = amax / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = __float2int_rn(v * id);
+    q = max(-127, min(127, q));
+    int sumq = q;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sumq += __shfl_xor_sync(0xFFFFFFFF, sumq, o);
+    y[b].qs[i] = (int8_t)q;
+    if (i == 0) {
+        y[b].d_raw = __half_as_ushort(__float2half(d));
+        y[b].s_raw = __half_as_ushort(__float2half(d * (float)sumq));
+    }
+}
+
+void quantize_q8_1(const half* x, void* y, int K, cudaStream_t stream) {
+    quantize_q8_1_kernel<<<K / QK_K * 8, 32, 0, stream>>>(x, (block_q8_1*)y, K);
+}
+
+// dp4a dot of one Q4_K weight row against the q8_1 activation. Lane strides
+// over the 8*n_blocks sub-blocks (32 quants each); warp-sum-reduce the caller.
+__device__ __forceinline__ float dot_q4k_row_q8_1(
+    const block_q4_K* __restrict__ row, const block_q8_1* __restrict__ xq,
+    int n_blocks, int lane) {
+    const int n_sub = n_blocks * 8;
+    float acc = 0.0f;
+    for (int s = lane; s < n_sub; s += 32) {
+        const int sbk = s >> 3;          // super-block index
+        const int j   = s & 7;           // sub-block 0..7
+        const int il  = j >> 1;          // which 32-byte qs group (0..3)
+        const bool hi = j & 1;           // high nibble?
+        const block_q4_K& blk = row[sbk];
+        uint8_t sc, m;
+        get_scale_min_k4(j, blk.scales, sc, m);
+        const int* qsi = (const int*)(blk.qs + 32 * il);
+        const int* q8i = (const int*)(xq[s].qs);
+        int dot = 0;
+        #pragma unroll
+        for (int n = 0; n < 8; n++) {
+            const int w4 = hi ? ((qsi[n] >> 4) & 0x0F0F0F0F) : (qsi[n] & 0x0F0F0F0F);
+            dot = __dp4a(w4, q8i[n], dot);
+        }
+        const float dall = raw_fp16_to_float(blk.d_raw);
+        const float dmin = raw_fp16_to_float(blk.dmin_raw);
+        const float d8   = raw_fp16_to_float(xq[s].d_raw);
+        const float s8   = raw_fp16_to_float(xq[s].s_raw);
+        acc += dall * sc * (d8 * dot) - dmin * m * s8;
+    }
+    return acc;
+}
+
+__global__ void gemv_q4k_f32_dp4a_kernel(
+    float* __restrict__ y, const block_q4_K* __restrict__ W,
+    const block_q8_1* __restrict__ xq, int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int n_blocks = K / QK_K;
+    float acc = dot_q4k_row_q8_1(W + (int64_t)row * n_blocks, xq, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
 __global__ void gemv_q4k_kernel(
     half*              __restrict__ y,
     const block_q4_K*  __restrict__ W,
@@ -1006,6 +1089,21 @@ static bool gemv_quant_gpu(half* y, const void* W, int ggml_type,
     return true;
 }
 
+// Lazy device scratch for the q8_1-quantized activation (one row of K).
+static block_q8_1* get_q8_1_scratch(int K) {
+    static block_q8_1* buf = nullptr;
+    static int cap_blocks = 0;
+    const int nb = K / 32;
+    if (nb > cap_blocks) {
+        if (buf) cudaFree(buf);
+        if (cudaMalloc(&buf, (size_t)nb * sizeof(block_q8_1)) != cudaSuccess) {
+            buf = nullptr; cap_blocks = 0; return nullptr;
+        }
+        cap_blocks = nb;
+    }
+    return buf;
+}
+
 static bool gemv_quant_gpu_f32(float* y, const void* W, int ggml_type,
                                const half* x, int M, int K, cudaStream_t stream) {
     const void* W_device = resolve_weight_device_ptr(W);
@@ -1018,10 +1116,20 @@ static bool gemv_quant_gpu_f32(float* y, const void* W, int ggml_type,
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
     switch (ggml_type) {
-        case 12:
-            gemv_q4k_f32_kernel<<<grid, block, 0, stream>>>(
-                y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+        case 12: {
+            // MMVQ dp4a path: quantize the activation to int8 (q8_1) once, then
+            // dot it against the Q4_K weights with __dp4a (no float dequant).
+            block_q8_1* xq = get_q8_1_scratch(K);
+            if (xq) {
+                quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+                gemv_q4k_f32_dp4a_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, xq, M, K, rows_per_block);
+            } else {
+                gemv_q4k_f32_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+            }
             break;
+        }
         case 13:
             gemv_q5k_f32_kernel<<<grid, block, 0, stream>>>(
                 y, (const block_q5_K*)W_device, x, M, K, rows_per_block);
