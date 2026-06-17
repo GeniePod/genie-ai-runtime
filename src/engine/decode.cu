@@ -1093,6 +1093,117 @@ void Engine::transformer_layer(int layer, int pos, half* x) {
     transformer_layer_ffn_block(layer, x2, swiglu_out, x);
 }
 
+// Gemma 4 decoder layer (PLE-only architecture). Differs from the Llama/Qwen
+// path: per-layer head dim (256 sliding / 512 global), per-layer RoPE base,
+// a 4-norm "sandwich" (the post-attention and post-ffn norms apply to the
+// sub-layer OUTPUT before the residual add), GeGLU + double-wide MLP, and a
+// learned per-layer output scalar. Per-layer head dim is threaded through the
+// projections/RoPE/attention; the KV cache is sized for the max head dim (512)
+// so sliding layers use the first 256 of each slot. Sliding-window masking is
+// a no-op for prompts <= sliding_window (512) and lands later; PLE is #93.
+void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
+    const auto& lw = model_weights_.layers[layer];
+    const int H  = config_.hidden_dim;
+    const int hd = lw.head_dim_l;                 // 256 sliding / 512 global
+    const int Q_DIM  = config_.n_heads * hd;
+    const int KV_DIM = config_.n_kv_heads * hd;
+    const int I  = lw.intermediate_l;             // 6144 / 12288
+    const bool norm_fp32 = (lw.rms_type == 0);
+
+    half* normed   = (half*)scratch_.get(H * sizeof(half));
+    half* q_buf    = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* k_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* v_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* attn_out = (half*)scratch_.get(Q_DIM * sizeof(half));
+
+    // 1. Input RMSNorm (attn_norm).
+    fused_rmsnorm_residual(normed, x, nullptr, lw.rms_attn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+
+    // 2. QKV projections (per-layer head dim).
+    gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
+                      k_buf, lw.wk, lw.type_wk, KV_DIM,
+                      v_buf, lw.wv, lw.type_wv, KV_DIM,
+                      normed, H, stream_);
+
+    // 3a. Per-head Q/K RMSNorm.
+    if (lw.q_norm) {
+        fused_rmsnorm_residual(q_buf, q_buf, nullptr, lw.q_norm,
+                               config_.n_heads, hd, config_.rms_eps,
+                               lw.qk_norm_type == 0, stream_);
+    }
+    if (lw.k_norm) {
+        fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
+                               config_.n_kv_heads, hd, config_.rms_eps,
+                               lw.qk_norm_type == 0, stream_);
+    }
+
+    // 3b. RoPE (per-layer base, full rotary over hd) + KV store.
+    if (!gen_params_.kv_int8 && kv_cache_.is_fast_position(pos)) {
+        rope_inplace_store_kv_fp16(q_buf, k_buf, v_buf,
+                                   (half*)kv_cache_.key_ptr(layer, pos),
+                                   (half*)kv_cache_.val_ptr(layer, pos),
+                                   config_.n_heads, config_.n_kv_heads, hd, pos,
+                                   lw.rope_theta_l, config_.rope_neox, stream_);
+    } else {
+        rope_inplace(q_buf, k_buf, config_.n_heads, config_.n_kv_heads, hd, pos,
+                     lw.rope_theta_l, config_.rope_neox, stream_);
+        if (gen_params_.kv_int8) {
+            float* ks = kv_cache_.kv_scale_ptr(layer, pos, false);
+            float* vs = kv_cache_.kv_scale_ptr(layer, pos, true);
+            fp16_to_int8((int8_t*)kv_cache_.key_ptr(layer, pos), ks, k_buf,
+                         config_.n_kv_heads, hd, stream_);
+            fp16_to_int8((int8_t*)kv_cache_.val_ptr(layer, pos), vs, v_buf,
+                         config_.n_kv_heads, hd, stream_);
+        } else {
+            cudaMemcpyAsync(kv_cache_.key_ptr(layer, pos), k_buf,
+                            KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+            cudaMemcpyAsync(kv_cache_.val_ptr(layer, pos), v_buf,
+                            KV_DIM * sizeof(half), cudaMemcpyDefault, stream_);
+        }
+    }
+
+    // 3c. Flash attention (recipe scale = 1.0 for Gemma).
+    float scale = attention_scale(config_.spec, hd);
+    float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, false) : nullptr;
+    float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(layer, 0, true)  : nullptr;
+    flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(layer, 0),
+                           kv_cache_.val_ptr(layer, 0), config_.n_heads,
+                           config_.n_kv_heads, hd, pos + 1, scale,
+                           gen_params_.kv_int8, k_scales, v_scales, stream_);
+
+    // 3d. Output projection -> post-attention (sandwich) norm -> residual.
+    half* wo_out = (half*)scratch_.get(H * sizeof(half));
+    half* x2     = (half*)scratch_.get(H * sizeof(half));
+    gemv_quant(wo_out, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
+    fused_rmsnorm_residual(wo_out, wo_out, nullptr, lw.post_attn_norm, 1, H,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+    vec_add(x2, x, wo_out, H, stream_);
+
+    // 4. FFN: pre-norm -> GeGLU (double-wide) -> down -> post-ffn (sandwich) norm -> residual.
+    half* normed2 = (half*)scratch_.get(H * sizeof(half));
+    half* gate    = (half*)scratch_.get(I * sizeof(half));
+    half* up      = (half*)scratch_.get(I * sizeof(half));
+    half* act     = (half*)scratch_.get(I * sizeof(half));
+    half* ffn_out = (half*)scratch_.get(H * sizeof(half));
+    fused_rmsnorm_residual(normed2, x2, nullptr, lw.rms_ffn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+    gemv_quant_pair(gate, lw.w_gate, lw.type_w_gate, I,
+                    up,   lw.w_up,   lw.type_w_up,   I, normed2, H, stream_);
+    fused_geglu(act, gate, up, 1, I, stream_);
+    gemv_quant(ffn_out, lw.w_down, lw.type_w_down, act, H, I, stream_);
+    fused_rmsnorm_residual(ffn_out, ffn_out, nullptr, lw.post_ffn_norm, 1, H,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+    vec_add(x, x2, ffn_out, H, stream_);
+
+    // 5. Per-Layer Embeddings (PLE) are injected here — issue #93.
+
+    // 6. Per-layer learned output scale.
+    if (lw.layer_scale_val != 1.0f) {
+        vec_scale(x, H, lw.layer_scale_val, stream_);
+    }
+}
+
 void Engine::transformer_layer_attn_compute(int layer, int pos,
                                             half* q_buf, half* k_buf, half* v_buf,
                                             half* attn_out, bool qk_norm_already) {

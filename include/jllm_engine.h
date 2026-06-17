@@ -173,6 +173,7 @@ struct LayerWeights {
     const void* ple_proj       = nullptr;  // proj.weight      (PLE projection)
     const void* ple_norm       = nullptr;  // post_norm.weight (PLE post-norm)
     const void* layer_scale    = nullptr;  // layer_output_scale.weight
+    float layer_scale_val = 1.0f;          // scalar value (read at load; 1.0 = no-op)
     int type_ple_gate = 12;
     int type_ple_proj = 12;
     // Per-layer geometry (Gemma 4: sliding/local vs full/global layers differ).
@@ -331,6 +332,10 @@ private:
     int             host_logits_capacity_ = 0;
 
     void transformer_layer(int layer, int pos, half* x);
+    // Gemma 4 decoder layer: per-layer head dim (256/512), dual RoPE, 4-norm
+    // sandwich + layer_output_scale, GeGLU double-wide MLP. PLE is applied
+    // separately (issue #93). See transformer_layer_gemma4 in decode.cu.
+    void transformer_layer_gemma4(int layer, int pos, half* x);
     // Single-token attention pre-Wo: QK-norm (if not already done by the
     // caller), RoPE, KV store, attention. Writes attention output (head
     // mix) to `attn_out` [Q_DIM]. No projection, no residual — caller is

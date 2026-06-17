@@ -737,6 +737,9 @@ bool load_and_map_weights(const std::string& path, void** blob, int64_t* blob_si
             }
             else if (strstr(ti.name, "layer_output_scale.weight")) {
                 lw.layer_scale = ptr;
+                // Scalar [1] F32 in the host-mmapped blob; read it once so the
+                // forward can do a plain scalar multiply (x *= layer_scale_val).
+                if (ti.type == 0) lw.layer_scale_val = *(const float*)ptr;
             }
             else continue;
             mapped++;
