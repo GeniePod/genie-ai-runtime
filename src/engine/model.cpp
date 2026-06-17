@@ -719,6 +719,25 @@ bool load_and_map_weights(const std::string& path, void** blob, int64_t* blob_si
                 lw.rms_ffn = ptr;
                 lw.rms_type = (ti.type == 0) ? 0 : 1;
             }
+            // Gemma 4: sandwich norms, PLE per-layer tensors, and layer scale.
+            else if (strstr(ti.name, "post_attention_norm.weight")) {
+                lw.post_attn_norm = ptr;
+            }
+            else if (strstr(ti.name, "post_ffw_norm.weight")) {
+                lw.post_ffn_norm = ptr;
+            }
+            else if (strstr(ti.name, "post_norm.weight")) {
+                lw.ple_norm = ptr;
+            }
+            else if (strstr(ti.name, "inp_gate.weight")) {
+                lw.ple_gate = ptr; lw.type_ple_gate = ti.type;
+            }
+            else if (strstr(ti.name, ".proj.weight")) {
+                lw.ple_proj = ptr; lw.type_ple_proj = ti.type;
+            }
+            else if (strstr(ti.name, "layer_output_scale.weight")) {
+                lw.layer_scale = ptr;
+            }
             else continue;
             mapped++;
         }
@@ -737,6 +756,30 @@ bool load_and_map_weights(const std::string& path, void** blob, int64_t* blob_si
             mw->output = ptr;
             mw->output_type = ti.type;
             mapped++;
+        }
+        else if (strcmp(ti.name, "per_layer_token_embd.weight") == 0) {
+            mw->ple_embd = ptr; mw->ple_embd_type = ti.type; mapped++;
+        }
+        else if (strcmp(ti.name, "per_layer_model_proj.weight") == 0) {
+            mw->ple_model_proj = ptr; mw->ple_model_proj_type = ti.type; mapped++;
+        }
+        else if (strcmp(ti.name, "per_layer_proj_norm.weight") == 0) {
+            mw->ple_proj_norm = ptr; mapped++;
+        }
+    }
+
+    // Gemma 4: fill per-layer geometry (head dim, ffn width, RoPE base, attn
+    // type) from the parsed per-layer tables so the forward can index per layer.
+    if (cfg.arch == Arch::Gemma4) {
+        for (int l = 0; l < cfg.n_layers; l++) {
+            auto& lw = mw->layers[l];
+            bool sliding = (l < (int)cfg.layer_is_sliding.size())
+                               ? cfg.layer_is_sliding[l] != 0 : true;
+            lw.is_sliding     = sliding;
+            lw.head_dim_l     = sliding ? cfg.sliding_head_dim : cfg.global_head_dim;
+            lw.rope_theta_l   = sliding ? cfg.rope_theta_swa : cfg.rope_theta;
+            lw.intermediate_l = (l < (int)cfg.ff_per_layer.size())
+                                    ? cfg.ff_per_layer[l] : cfg.intermediate_dim;
         }
     }
 

@@ -164,8 +164,22 @@ struct LayerWeights {
     const void* w_down   = nullptr;
     const void* rms_attn = nullptr;  // FP32 or FP16 depending on GGUF
     const void* rms_ffn  = nullptr;  // FP32 or FP16 depending on GGUF
-    const void* q_norm   = nullptr;  // Qwen3 per-head Q RMSNorm [head_dim]
-    const void* k_norm   = nullptr;  // Qwen3 per-head K RMSNorm [head_dim]
+    const void* q_norm   = nullptr;  // Qwen3/Gemma per-head Q RMSNorm [head_dim]
+    const void* k_norm   = nullptr;  // Qwen3/Gemma per-head K RMSNorm [head_dim]
+    // Gemma 4 extras (PLE-only architecture; nullptr for other models).
+    const void* post_attn_norm = nullptr;  // post_attention_norm.weight (sandwich)
+    const void* post_ffn_norm  = nullptr;  // post_ffw_norm.weight (sandwich)
+    const void* ple_gate       = nullptr;  // inp_gate.weight  (PLE input gate)
+    const void* ple_proj       = nullptr;  // proj.weight      (PLE projection)
+    const void* ple_norm       = nullptr;  // post_norm.weight (PLE post-norm)
+    const void* layer_scale    = nullptr;  // layer_output_scale.weight
+    int type_ple_gate = 12;
+    int type_ple_proj = 12;
+    // Per-layer geometry (Gemma 4: sliding/local vs full/global layers differ).
+    int   head_dim_l     = 0;      // head dim (256 sliding / 512 global)
+    int   intermediate_l = 0;      // ffn width (6144 / 12288)
+    bool  is_sliding     = false;  // sliding (local) vs full (global) attention
+    float rope_theta_l   = 0.0f;   // RoPE base (1e4 sliding / 1e6 global)
     int type_wq     = 12;            // GGML tensor type for quantized matvec
     int type_wk     = 12;
     int type_wv     = 12;
@@ -191,6 +205,12 @@ struct ModelWeights {
     const void*     output      = nullptr;
     int             output_type = 12;       // GGML tensor type for output projection
     const half*     s_output    = nullptr;
+    // Gemma 4 Per-Layer Embeddings (PLE) — model-level tensors (nullptr otherwise).
+    const void*     ple_embd          = nullptr;  // per_layer_token_embd.weight
+    const void*     ple_model_proj    = nullptr;  // per_layer_model_proj.weight
+    const void*     ple_proj_norm     = nullptr;  // per_layer_proj_norm.weight
+    int             ple_embd_type       = 0;
+    int             ple_model_proj_type = 12;
     LayerWeights*   layers      = nullptr;
     int             n_layers    = 0;
 };
