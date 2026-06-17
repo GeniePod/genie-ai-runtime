@@ -3,6 +3,7 @@
 
 #include "jllm_kernels.h"
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1925,18 +1926,38 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
 
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 
+    // cp.async double-buffered raw Q4_K tile: the next K-block streams into
+    // shared while the int8 tensor cores work the current one. block_q4_K is
+    // 144 B = 9x16 and blocks sit at 144*k (16-aligned) in the weight array,
+    // so the async copy is 16-byte-aligned. 16B-align the shared buffer too.
+    __align__(16) __shared__ block_q4_K Wsh[2][MMQ_Q4K_TILE_M];
     __shared__ int8_t A_tile[MMQ_Q4K_TILE_M][32];
     __shared__ float  per_d [MMQ_Q4K_TILE_M][8];
     __shared__ float  per_dm[MMQ_Q4K_TILE_M][8];
 
+    auto prefetch = [&](int buf, int blk_idx) {
+        for (int ci = t_id; ci < MMQ_Q4K_TILE_M * 9; ci += blockDim.x) {
+            const int row = ci / 9, c16 = ci % 9, g_row = row_base + row;
+            const char* src = (const char*)((g_row < M)
+                ? &W[(int64_t)g_row * n_blocks + blk_idx] : &W[0]) + c16 * 16;
+            __pipeline_memcpy_async((char*)&Wsh[buf][row] + c16 * 16, src, 16);
+        }
+        __pipeline_commit();
+    };
+    prefetch(0, 0);
+
     for (int b = 0; b < n_blocks; b++) {
+        if (b + 1 < n_blocks) prefetch((b + 1) & 1, b + 1);
+        __pipeline_wait_prior(b + 1 < n_blocks ? 1 : 0);
+        __syncthreads();
+        const block_q4_K* Wb = Wsh[b & 1];
         {
             const int row = t_id >> 3;
             const int sb  = t_id &  7;
             const int g_row = row_base + row;
             float d = 0.0f, dm = 0.0f;
             if (g_row < M) {
-                const block_q4_K& blk = W[(int64_t)g_row * n_blocks + b];
+                const block_q4_K& blk = Wb[row];
                 const float dall = raw_fp16_to_float(blk.d_raw);
                 const float dmin = raw_fp16_to_float(blk.dmin_raw);
                 uint8_t sc, mn;
@@ -1958,14 +1979,12 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
                 const int row   = t_id >> 3;
                 const int col_4 = (t_id & 7) << 2;
                 const int g_row = row_base + row;
-                const block_q4_K* bp = (g_row < M)
-                    ? &W[(int64_t)g_row * n_blocks + b] : nullptr;
                 #pragma unroll
                 for (int s = 0; s < 4; s++) {
                     const int col = col_4 + s;
                     int8_t q = 0;
                     if (g_row < M) {
-                        const uint8_t qb = bp->qs[32 * il + col];
+                        const uint8_t qb = Wb[row].qs[32 * il + col];
                         q = (int8_t)(parity ? (qb >> 4) : (qb & 0xF));
                     }
                     A_tile[row][col] = q;

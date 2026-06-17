@@ -233,6 +233,13 @@ add_executable(test_mmq_q6k_int8 tests/test_mmq_q6k_int8.cu)
 target_link_libraries(test_mmq_q6k_int8 PRIVATE CUDA::cudart)
 add_test(NAME mmq_q6k_int8 COMMAND test_mmq_q6k_int8)
 
+# cp.async double-buffering for the int8-MMA Q4_K kernel: prefetch the next
+# K-block's weight tile into shared while the tensor cores work the current
+# one. Compares the baseline int8 kernel vs the cp.async-pipelined version.
+add_executable(test_mmq_q4k_cpasync tests/test_mmq_q4k_cpasync.cu)
+target_link_libraries(test_mmq_q4k_cpasync PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_cpasync COMMAND test_mmq_q4k_cpasync)
+
 # Path F phase F1: KV cache serialization round-trip. Standalone test
 # that exercises the on-disk format (header + body) we'll use in F3 to
 # persist per-conversation KV state. No engine integration yet.
