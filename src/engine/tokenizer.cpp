@@ -216,12 +216,39 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
             }
             fprintf(stderr, "[tokenizer] Loaded %zu BPE merges from GGUF\n", bpe_ranks_.size());
         }
+        // tokenizer.ggml.scores = array of float32 unigram piece scores (SPM)
+        else if (strcmp(key, "tokenizer.ggml.scores") == 0 && vtype == 9) {
+            uint32_t arr_type;
+            uint64_t arr_len;
+            fread(&arr_type, 4, 1, f);
+            fread(&arr_len, 8, 1, f);
+            token_scores_.resize(arr_len);
+            if (arr_type == 6) {  // float32
+                fread(token_scores_.data(), sizeof(float), arr_len, f);
+            } else {
+                int esz = (arr_type <= 1 || arr_type == 7) ? 1
+                          : (arr_type <= 3) ? 2 : (arr_type <= 6) ? 4 : 8;
+                fseek(f, (long)arr_len * esz, SEEK_CUR);
+            }
+            fprintf(stderr, "[tokenizer] Loaded %zu unigram scores from GGUF\n",
+                    token_scores_.size());
+        }
         else if (strcmp(key, "tokenizer.ggml.model") == 0 && vtype == 8) {
             uint64_t str_len;
             fread(&str_len, 8, 1, f);
             std::string model(str_len, '\0');
             fread(&model[0], 1, str_len, f);
             byte_encode_ = (model == "gpt2" || model == "qwen2");
+            // GGUF labels the SentencePiece/unigram tokenizer "llama"; Gemma
+            // ships its own labels ("gemma", "gemma2".."gemma4") that are also
+            // SentencePiece (▁ meta-space, unigram scores), even though the
+            // file may additionally carry a BPE merge table.
+            is_spm_ = (model == "llama" || model.rfind("gemma", 0) == 0);
+        }
+        else if (strcmp(key, "tokenizer.ggml.add_space_prefix") == 0 && vtype == 7) {
+            uint8_t v = 0;
+            fread(&v, 1, 1, f);
+            add_space_prefix_ = (v != 0);
         }
         // tokenizer.ggml.bos_token_id
         else if (strcmp(key, "tokenizer.ggml.bos_token_id") == 0 && vtype == 4) {
@@ -263,15 +290,21 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
                     uint64_t alen;
                     fread(&atype, 4, 1, f);
                     fread(&alen, 8, 1, f);
-                    // Skip array elements (rough)
-                    for (uint64_t a = 0; a < alen; a++) {
-                        if (atype == 8) {  // string array
+                    if (atype == 8) {  // string array: each is len + bytes
+                        for (uint64_t a = 0; a < alen; a++) {
                             uint64_t slen;
                             fread(&slen, 8, 1, f);
                             fseek(f, slen, SEEK_CUR);
-                        } else if (atype == 6) fseek(f, 4, SEEK_CUR);
-                        else if (atype == 4) fseek(f, 4, SEEK_CUR);
-                        else fseek(f, 4, SEEK_CUR);  // guess
+                        }
+                    } else {
+                        // Fixed-width element: size by GGUF type id so bool(7),
+                        // int8(0/1), int16(2/3), and 64-bit(10/11/12) arrays are
+                        // skipped correctly (a wrong guess here desyncs the whole
+                        // metadata stream — e.g. Gemma's bool sliding_window_pattern).
+                        int esz = (atype <= 1 || atype == 7) ? 1
+                                  : (atype <= 3)            ? 2
+                                  : (atype <= 6)            ? 4 : 8;
+                        fseek(f, (long)alen * esz, SEEK_CUR);
                     }
                     break;
                 }
@@ -322,9 +355,74 @@ bool Tokenizer::load_from_gguf(const std::string& path) {
     for (const auto& t : vocab)
         max_token_len_ = std::max(max_token_len_, (int)t.size());
 
-    fprintf(stderr, "[tokenizer] vocab=%zu, bos=%d(add=%d), eos=%d(add=%d), max_token_len=%d\n",
-            vocab.size(), bos_id, add_bos_, eos_id, add_eos_, max_token_len_);
+    // SPM detection: GGUF labels SentencePiece as "llama", but be robust — a
+    // vocabulary that carries unigram scores and no BPE merges is SPM regardless
+    // of the model-name string (Gemma 4's GGUF doesn't use the "llama" label).
+    if (!is_spm_ && !token_scores_.empty() && bpe_ranks_.empty()) {
+        is_spm_ = true;
+    }
+
+    fprintf(stderr,
+            "[tokenizer] vocab=%zu, bos=%d(add=%d), eos=%d(add=%d), "
+            "max_token_len=%d, spm=%d, scores=%zu\n",
+            vocab.size(), bos_id, add_bos_, eos_id, add_eos_, max_token_len_,
+            (int)is_spm_, token_scores_.size());
     return !vocab.empty();
+}
+
+// SentencePiece/unigram encode: Viterbi over piece scores with byte fallback.
+// Matches the GGUF "llama" (SPM) tokenizer used by Gemma. The segment is
+// normalized SPM-style (ASCII space -> ▁ U+2581, optional leading ▁) and then
+// segmented to maximize the sum of piece scores; an unmatched byte falls back
+// to its <0xNN> byte token (kept length-1 so the lattice stays connected).
+void Tokenizer::encode_spm(const std::string& text, std::vector<int>& out) const {
+    static const std::string kMeta = "\xe2\x96\x81";  // ▁ (U+2581)
+    std::string s;
+    s.reserve(text.size() + kMeta.size());
+    if (add_space_prefix_) s += kMeta;
+    for (char c : text) {
+        if (c == ' ') s += kMeta;
+        else s += c;
+    }
+
+    const int n = (int)s.size();
+    const float kNeg = -1e30f;
+    std::vector<float> best(n + 1, kNeg);
+    std::vector<int> back_id(n + 1, -1);
+    std::vector<int> back_pos(n + 1, -1);
+    best[0] = 0.0f;
+
+    for (int i = 0; i < n; ++i) {
+        if (best[i] <= kNeg) continue;
+        int max_len = std::min(max_token_len_, n - i);
+        for (int len = 1; len <= max_len; ++len) {
+            auto it = token_to_id_.find(s.substr(i, len));
+            if (it == token_to_id_.end()) continue;
+            float sc = best[i] + token_scores_[it->second];
+            if (sc > best[i + len]) {
+                best[i + len] = sc;
+                back_id[i + len] = it->second;
+                back_pos[i + len] = i;
+            }
+        }
+        // Byte fallback for the single byte at i.
+        char hex[8];
+        snprintf(hex, sizeof(hex), "<0x%02X>", (unsigned char)s[i]);
+        auto bf = token_to_id_.find(hex);
+        if (bf != token_to_id_.end()) {
+            float sc = best[i] + token_scores_[bf->second];
+            if (sc > best[i + 1]) {
+                best[i + 1] = sc;
+                back_id[i + 1] = bf->second;
+                back_pos[i + 1] = i;
+            }
+        }
+    }
+
+    if (best[n] <= kNeg) return;  // unreachable (no byte tokens) — skip
+    std::vector<int> rev;
+    for (int i = n; i > 0; i = back_pos[i]) rev.push_back(back_id[i]);
+    out.insert(out.end(), rev.rbegin(), rev.rend());
 }
 
 // BUG #8 FIX: O(max_token_len) per position instead of O(V)
@@ -435,7 +533,13 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
         }
 
 found_next_special:
-        encode_plain(text.substr(pos, next - pos));
+        {
+            std::string seg = text.substr(pos, next - pos);
+            if (is_spm_ && token_scores_.size() == vocab.size())
+                encode_spm(seg, tokens);
+            else
+                encode_plain(seg);
+        }
         pos = next;
     }
 

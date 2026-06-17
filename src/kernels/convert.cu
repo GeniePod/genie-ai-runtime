@@ -103,4 +103,35 @@ void fused_swiglu(half* output, const half* gate, const half* up,
         output, gate, up, rows, intermediate_dim);
 }
 
+// ── Fused GeGLU (Gemma) ─────────────────────────────────────────────────
+//
+// output = gelu_tanh(gate) * up
+// gelu_tanh(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
+// This is the "gelu_pytorch_tanh" approximation Gemma's FFN uses.
+
+__global__ void geglu_kernel(
+    half*       __restrict__ output,
+    const half* __restrict__ gate,
+    const half* __restrict__ up,
+    int rows, int dim)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * dim;
+    if (idx >= total) return;
+
+    float g = __half2float(gate[idx]);
+    float u = __half2float(up[idx]);
+    const float kSqrt2OverPi = 0.7978845608028654f;  // sqrt(2/pi)
+    float gelu = 0.5f * g * (1.0f + tanhf(kSqrt2OverPi * (g + 0.044715f * g * g * g)));
+    output[idx] = __float2half(gelu * u);
+}
+
+void fused_geglu(half* output, const half* gate, const half* up,
+                 int rows, int intermediate_dim, cudaStream_t stream) {
+    int total = rows * intermediate_dim;
+    int grid = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    geglu_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+        output, gate, up, rows, intermediate_dim);
+}
+
 }  // namespace jllm
