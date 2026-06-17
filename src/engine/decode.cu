@@ -1167,7 +1167,6 @@ void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
                       k_buf, lw.wk, lw.type_wk, KV_DIM,
                       v_buf, lw.wv, lw.type_wv, KV_DIM,
                       normed, H, stream_);
-    if (layer == 0) { cudaError_t e_ = cudaStreamSynchronize(stream_); if (e_) fprintf(stderr, "[g4dbg] L0 qkv: %s\n", cudaGetErrorString(e_)); }
 
     // 3a. Per-head Q/K RMSNorm.
     if (lw.q_norm) {
@@ -1214,7 +1213,6 @@ void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
                            kv_cache_.val_ptr(layer, 0), config_.n_heads,
                            config_.n_kv_heads, hd, pos + 1, scale,
                            gen_params_.kv_int8, k_scales, v_scales, stream_);
-    if (layer == 0) { cudaError_t e_ = cudaStreamSynchronize(stream_); if (e_) fprintf(stderr, "[g4dbg] L0 attn: %s\n", cudaGetErrorString(e_)); }
 
     // 3d. Output projection -> post-attention (sandwich) norm -> residual.
     half* wo_out = (half*)scratch_.get(H * sizeof(half));
@@ -1248,10 +1246,11 @@ void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
         half* g_in = (half*)scratch_.get(D * sizeof(half));
         half* g    = (half*)scratch_.get(D * sizeof(half));
         half* p    = (half*)scratch_.get(H * sizeof(half));
-        gemv_quant(g_in, lw.ple_gate, lw.type_ple_gate, x, D, H, stream_);
+        // inp_gate / proj are F32 (not K-quant), so use the dense GEMV.
+        gemv_dense(g_in, lw.ple_gate, lw.type_ple_gate, x, D, H, stream_);
         // fused_geglu(out, gate, up) = gelu_tanh(gate) * up.
         fused_geglu(g, g_in, gemma_ple_input_ + (int64_t)layer * D, 1, D, stream_);
-        gemv_quant(p, lw.ple_proj, lw.type_ple_proj, g, H, D, stream_);
+        gemv_dense(p, lw.ple_proj, lw.type_ple_proj, g, H, D, stream_);
         fused_rmsnorm_residual(p, p, nullptr, lw.ple_norm, 1, H,
                                config_.rms_eps, /*weight_fp32=*/true, stream_);
         vec_add(x, x, p, H, stream_);
@@ -1277,25 +1276,18 @@ void Engine::compute_gemma_ple_input(const half* inputs_embeds, int token,
     const int L = config_.n_layers;             // 35
     const int total = L * D;                     // 8960
 
-    auto G4CHK = [&](const char* s) {
-        cudaError_t e = cudaStreamSynchronize(stream_);
-        if (e != cudaSuccess) fprintf(stderr, "[g4dbg] %s: %s\n", s, cudaGetErrorString(e));
-    };
-
     // token_identity = per_layer_token_embd[token] * sqrt(D)  (dequant one row).
     half* tid = (half*)scratch_.get(total * sizeof(half));
     dequant_embedding(tid, mw.ple_embd, token, total, mw.ple_embd_type, stream_);
-    G4CHK("ple tid dequant");
     vec_scale(tid, total, sqrtf((float)D), stream_);
 
     // context = per_layer_proj_norm( (model_proj @ embed) / sqrt(H) ), per D-row.
-    gemv_quant(out, mw.ple_model_proj, mw.ple_model_proj_type, inputs_embeds,
+    // per_layer_model_proj is BF16 (not K-quant), so use the dense GEMV.
+    gemv_dense(out, mw.ple_model_proj, mw.ple_model_proj_type, inputs_embeds,
                total, H, stream_);
-    G4CHK("ple model_proj gemv");
     vec_scale(out, total, 1.0f / sqrtf((float)H), stream_);
     fused_rmsnorm_residual(out, out, nullptr, mw.ple_proj_norm, L, D,
                            config_.rms_eps, /*weight_fp32=*/true, stream_);
-    G4CHK("ple proj_norm");
 
     // out = (context + token_identity) * (1/sqrt(2)).
     vec_add(out, out, tid, total, stream_);
