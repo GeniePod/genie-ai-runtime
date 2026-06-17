@@ -215,6 +215,50 @@ static void dequant_q6k_row(float* out, const void* data, int token_id, int hidd
     }
 }
 
+// Q5_K block layout (matches llama.cpp): d, dmin (fp16), scales[12] (6-bit
+// packed, same as Q4_K), qh[32] (one high bit per value), qs[128] (low 4 bits).
+// Gemma's token_embd / per_layer_token_embd come Q5_K in the Q4_K_M build.
+struct embd_block_q5_K {
+    uint16_t d_raw;
+    uint16_t dmin_raw;
+    uint8_t  scales[12];
+    uint8_t  qh[32];
+    uint8_t  qs[128];
+};
+static_assert(sizeof(embd_block_q5_K) == 176, "");
+
+static void dequant_q5k_row(float* out, const void* data, int token_id, int hidden_dim) {
+    int blocks_per_row = hidden_dim / 256;
+    int block_bytes = 176;
+    const uint8_t* row_data = (const uint8_t*)data + (int64_t)token_id * blocks_per_row * block_bytes;
+
+    for (int b = 0; b < blocks_per_row; b++) {
+        const embd_block_q5_K* blk = (const embd_block_q5_K*)(row_data + b * block_bytes);
+        float dall = fp16_to_float(blk->d_raw);
+        float dmin = fp16_to_float(blk->dmin_raw);
+        const uint8_t* qh = blk->qh;
+
+        for (int il = 0; il < 4; il++) {
+            int is = 2 * il;
+            uint8_t sc1, m1, sc2, m2;
+            get_scale_min_k4_cpu(is + 0, blk->scales, sc1, m1);
+            get_scale_min_k4_cpu(is + 1, blk->scales, sc2, m2);
+            float d1 = dall * sc1, dm1 = dmin * m1;
+            float d2 = dall * sc2, dm2 = dmin * m2;
+            const uint8_t* q = blk->qs + 32 * il;
+            uint8_t u1 = 1 << (2 * il);
+            uint8_t u2 = 2 << (2 * il);
+            int out_base = b * 256 + 64 * il;
+            for (int l = 0; l < 32; l++) {
+                int hi1 = (qh[l] & u1) ? 16 : 0;
+                int hi2 = (qh[l] & u2) ? 16 : 0;
+                out[out_base + l]      = d1 * ((q[l] & 0xF) + hi1) - dm1;
+                out[out_base + l + 32] = d2 * ((q[l] >> 4)  + hi2) - dm2;
+            }
+        }
+    }
+}
+
 static void dequant_embedding(half* dst, const void* embd_data, int token_id,
                                int hidden_dim, int embd_type, cudaStream_t stream) {
     if (fast_embedding_enabled() && (embd_type == 12 || embd_type == 14) &&
@@ -236,8 +280,10 @@ static void dequant_embedding(half* dst, const void* embd_data, int token_id,
         return;
     }
 
-    float h_row[8192];  // max hidden_dim = 8192
-    half  h_fp16[8192];
+    // Sized for the largest row we dequant: Gemma's per_layer_token_embd is
+    // n_layers * ple_dim (e.g. 35*256 = 8960) wide, larger than any hidden_dim.
+    float h_row[16384];
+    half  h_fp16[16384];
 
     if (embd_type == 12) {
         // Q4_K (GGML_TYPE_Q4_K)
@@ -266,6 +312,11 @@ static void dequant_embedding(half* dst, const void* embd_data, int token_id,
             fprintf(stderr, "\n");
         }
         first = false;
+        for (int i = 0; i < hidden_dim; i++)
+            h_fp16[i] = __float2half(h_row[i]);
+    } else if (embd_type == 13) {
+        // Q5_K — Gemma's token_embd / per_layer_token_embd in Q4_K_M builds.
+        dequant_q5k_row(h_row, embd_data, token_id, hidden_dim);
         for (int i = 0; i < hidden_dim; i++)
             h_fp16[i] = __float2half(h_row[i]);
     } else if (embd_type == 0) {
