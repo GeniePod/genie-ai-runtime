@@ -891,9 +891,8 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
     // diverge; short prompts are unaffected.
     if (config_.arch == Arch::Gemma4) {
         fprintf(stderr,
-                "[engine] Gemma 4 (experimental): %d layers, head_dim "
-                "sliding=%d/global=%d, kv_shared=%d, ple=%d, softcap=%g. "
-                "Sliding-window masking not yet applied (ok for <=%d-token ctx).\n",
+                "[engine] Gemma 4: %d layers, head_dim sliding=%d/global=%d, "
+                "kv_shared=%d, ple=%d, softcap=%g, sliding_window=%d.\n",
                 config_.n_layers, config_.sliding_head_dim, config_.global_head_dim,
                 config_.n_kv_shared_layers, config_.ple_input_dim,
                 config_.spec.final_logit_softcap, config_.sliding_window);
@@ -1279,13 +1278,15 @@ void Engine::transformer_layer_gemma4(int layer, int pos, half* x) {
 
     // 3c. Flash attention (recipe scale = 1.0 for Gemma). Reads K/V from
     //     kv_layer (== layer for KV-owning layers, else the shared source).
+    //     Sliding layers mask to the last sliding_window keys; global = full.
     float scale = attention_scale(config_.spec, hd);
+    const int attn_window = lw.is_sliding ? config_.sliding_window : 0;
     float* k_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, false) : nullptr;
     float* v_scales = gen_params_.kv_int8 ? kv_cache_.kv_scale_ptr(kv_layer, 0, true)  : nullptr;
     flash_attention_decode(attn_out, q_buf, kv_cache_.key_ptr(kv_layer, 0),
                            kv_cache_.val_ptr(kv_layer, 0), config_.n_heads,
                            config_.n_kv_heads, hd, config_.head_dim, pos + 1, scale,
-                           gen_params_.kv_int8, k_scales, v_scales, stream_);
+                           gen_params_.kv_int8, k_scales, v_scales, attn_window, stream_);
 
     // 3d. Output projection -> post-attention (sandwich) norm -> residual.
     half* wo_out = (half*)scratch_.get(H * sizeof(half));
@@ -1425,7 +1426,7 @@ void Engine::transformer_layer_attn_compute(int layer, int pos,
                           kv_cache_.val_ptr(layer, 0),
                           config_.n_heads, config_.n_kv_heads, config_.head_dim,
                           config_.head_dim, pos + 1, scale, gen_params_.kv_int8,
-                          k_scales, v_scales, stream_);
+                          k_scales, v_scales, /*window=*/0, stream_);
 }
 
 void Engine::transformer_layer_attn_block(int layer, int pos, half* x_in,
@@ -1569,7 +1570,7 @@ void Engine::transformer_prefill(int layer, int start_pos, int n_tokens, half* x
             kv_cache_.key_ptr(layer, 0), kv_cache_.val_ptr(layer, 0),
             config_.n_heads, config_.n_kv_heads, config_.head_dim,
             config_.head_dim, N, start_pos, scale,
-            gen_params_.kv_int8, k_scales, v_scales, stream_);
+            gen_params_.kv_int8, k_scales, v_scales, /*window=*/0, stream_);
     }
 
     // ── Batched Wo + batched residual #1 (NEW in PR #16) ──────────────

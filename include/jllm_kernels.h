@@ -274,6 +274,7 @@ void flash_attention_decode(
     // nullptr in FP16 mode. Captured by KVCachePool::kv_scale_ptr(layer, ...).
     const float*   k_scales,
     const float*   v_scales,
+    int            window,     // Gemma sliding layers: attend to last `window` keys (0 = full)
     cudaStream_t   stream
 );
 
@@ -304,6 +305,7 @@ void flash_attention_prefill_batched(
     // signature above. nullptr in FP16 mode.
     const float*   k_scales,
     const float*   v_scales,
+    int            window,     // sliding-window size (0 = full attention)
     cudaStream_t   stream
 );
 

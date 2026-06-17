@@ -40,7 +40,8 @@ __global__ void flash_attention_decode_kernel(
     int n_heads, int n_kv_heads, int head_dim, int cache_head_dim, int seq_len,
     float scale, bool kv_int8,
     const float* __restrict__ k_scales,   // Path I3: [seq_len, n_kv_heads]
-    const float* __restrict__ v_scales)
+    const float* __restrict__ v_scales,
+    int window)   // Gemma sliding layers: attend only to last `window` keys (0 = full)
 {
     const int head = blockIdx.x;
     const int kv_head = head / (n_heads / n_kv_heads);  // GQA
@@ -79,6 +80,12 @@ __global__ void flash_attention_decode_kernel(
         // ── Step 1: Q × K^T for tile ────────────────────────────
         for (int t = tid; t < tile_len; t += blockDim.x) {
             int kv_pos = kv_start + t;
+            // Sliding-window mask: the query (at position seq_len-1) attends
+            // only to keys in [seq_len-window, seq_len-1]. Older keys are -inf.
+            if (window > 0 && kv_pos < seq_len - window) {
+                s_scores[t] = -INFINITY;
+                continue;
+            }
             float dot = 0.0f;
 
             for (int d = 0; d < head_dim; d++) {
@@ -176,7 +183,8 @@ __global__ void flash_attention_prefill_batched_kernel(
     int start_pos,
     float scale, bool kv_int8,
     const float* __restrict__ k_scales,   // Path I3
-    const float* __restrict__ v_scales)
+    const float* __restrict__ v_scales,
+    int window)   // sliding-window size (0 = full attention)
 {
     const int head    = blockIdx.x;
     const int token   = blockIdx.y;
@@ -213,6 +221,10 @@ __global__ void flash_attention_prefill_batched_kernel(
         // Q × K^T for tile
         for (int t = tid; t < tile_len; t += blockDim.x) {
             int kv_pos = kv_start + t;
+            if (window > 0 && kv_pos < seq_len - window) {
+                s_scores[t] = -INFINITY;
+                continue;
+            }
             float dot = 0.0f;
             for (int d = 0; d < head_dim; d++) {
                 float q_val = __half2float(q_local[d]);
@@ -291,7 +303,7 @@ void flash_attention_prefill_batched(
     int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
     int N, int start_pos,
     float scale, bool kv_int8,
-    const float* k_scales, const float* v_scales, cudaStream_t stream)
+    const float* k_scales, const float* v_scales, int window, cudaStream_t stream)
 {
     if (N <= 0) return;
     // Path I3 (#62): removed the `kv_int8 → N-sequential-decode` fallback
@@ -305,7 +317,7 @@ void flash_attention_prefill_batched(
                 q      + (int64_t)t * q_dim,
                 k_cache, v_cache,
                 n_heads, n_kv_heads, head_dim, cache_head_dim,
-                start_pos + t + 1, scale, kv_int8, k_scales, v_scales, stream);
+                start_pos + t + 1, scale, kv_int8, k_scales, v_scales, window, stream);
         }
         return;
     }
@@ -320,7 +332,7 @@ void flash_attention_prefill_batched(
     const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
     flash_attention_prefill_batched_kernel<<<grid, ATTN_BLOCK, smem, stream>>>(
         output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, cache_head_dim,
-        start_pos, scale, kv_int8, k_scales, v_scales);
+        start_pos, scale, kv_int8, k_scales, v_scales, window);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -333,7 +345,7 @@ void flash_attention_prefill_batched(
                 q      + (int64_t)t * q_dim,
                 k_cache, v_cache,
                 n_heads, n_kv_heads, head_dim, cache_head_dim,
-                start_pos + t + 1, scale, kv_int8, k_scales, v_scales, stream);
+                start_pos + t + 1, scale, kv_int8, k_scales, v_scales, window, stream);
         }
     }
 }
@@ -342,7 +354,7 @@ void flash_attention_decode(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int cache_head_dim, int seq_len,
     float scale, bool kv_int8,
-    const float* k_scales, const float* v_scales, cudaStream_t stream)
+    const float* k_scales, const float* v_scales, int window, cudaStream_t stream)
 {
     if (fast_attention_enabled()) {
         static bool logged = false;
@@ -354,7 +366,7 @@ void flash_attention_decode(
         const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
         flash_attention_decode_kernel<<<n_heads, ATTN_BLOCK, smem, stream>>>(
             output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, cache_head_dim,
-            seq_len, scale, kv_int8, k_scales, v_scales);
+            seq_len, scale, kv_int8, k_scales, v_scales, window);
 
         cudaError_t err = cudaGetLastError();
         if (err == cudaSuccess) {
@@ -392,6 +404,10 @@ void flash_attention_decode(
 
         float max_score = -FLT_MAX;
         for (int pos = 0; pos < seq_len; ++pos) {
+            if (window > 0 && pos < seq_len - window) {
+                scores[pos] = -INFINITY;
+                continue;
+            }
             const int kv_base = pos * kv_dim + kv_head * cache_head_dim;
             float dot = 0.0f;
             for (int d = 0; d < head_dim; ++d) {
