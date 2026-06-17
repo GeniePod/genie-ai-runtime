@@ -1993,75 +1993,68 @@ bool dequant_embedding_row(half* dst, const void* W, int ggml_type,
 // out[m] = sum_k W[m,k] * x[k]. The PLE model/gate/proj weights aren't K-quant
 // (per_layer_model_proj is BF16; inp_gate/proj are F32). Small + not on the hot
 // path, so a plain row-per-block reduction. wtype: 0=F32, 1=F16, 30=BF16.
+// Load one dense weight element: wtype 0=F32, 1=F16, 30=BF16.
+__device__ __forceinline__ float dense_weight(const void* W, int wtype, int64_t i) {
+    if (wtype == 0)      return ((const float*)W)[i];
+    else if (wtype == 1) return __half2float(((const half*)W)[i]);
+    uint32_t bits = (uint32_t)((const uint16_t*)W)[i] << 16;  // BF16
+    return __int_as_float(bits);
+}
+
+// Warp-per-row dense GEMV: one warp owns an output row, lanes stride over K and
+// reduce with __shfl (no shared-memory block reduction / __syncthreads). This
+// replaced a one-block-per-row design whose 8-step shared reduction left the
+// kernel ~96% occupied but memory-stall bound (ncu: 3.34 ms / ~8 GB/s on the
+// Gemma PLE BF16 model_proj). Used for the Gemma PLE projections.
 __global__ void gemv_dense_kernel(half* __restrict__ out, const void* __restrict__ W,
-                                  int wtype, const half* __restrict__ x, int M, int K) {
-    const int m = blockIdx.x;
-    if (m >= M) return;
-    const int tid = threadIdx.x;
-    const int64_t base = (int64_t)m * K;
+                                  int wtype, const half* __restrict__ x,
+                                  int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int64_t base = (int64_t)row * K;
     float acc = 0.0f;
-    for (int k = tid; k < K; k += blockDim.x) {
-        float w;
-        if (wtype == 0)      w = ((const float*)W)[base + k];
-        else if (wtype == 1) w = __half2float(((const half*)W)[base + k]);
-        else { uint32_t bits = (uint32_t)((const uint16_t*)W)[base + k] << 16; w = __int_as_float(bits); }
-        acc += w * __half2float(x[k]);
-    }
-    __shared__ float sm[256];
-    sm[tid] = acc;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sm[tid] += sm[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) out[m] = __float2half(sm[0]);
+    for (int k = lane; k < K; k += 32)
+        acc += dense_weight(W, wtype, base + k) * __half2float(x[k]);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = __float2half(acc);
 }
 
 void gemv_dense(half* out, const void* W, int wtype, const half* x,
                 int M, int K, cudaStream_t stream) {
     const void* Wd = resolve_weight_device_ptr(W);
-    gemv_dense_kernel<<<M, 256, 0, stream>>>(out, Wd, wtype, x, M, K);
+    const int rpb = gemv_rows_per_block();
+    const int grid = (M + rpb - 1) / rpb;
+    gemv_dense_kernel<<<grid, rpb * 32, 0, stream>>>(out, Wd, wtype, x, M, K, rpb);
 }
 
-// Batched dense GEMV: out[N×M] = x[N×K] · Wᵀ[K×M] for a dense (non-K-quant)
-// weight W[M×K] (wtype 0=F32, 1=F16, 30=BF16). One block per (token, row);
-// threads reduce over K. Used to batch the Gemma PLE projections across the
-// N prompt tokens during prefill. Reads the weight once per (token,row) — not
-// bandwidth-optimal, but the PLE matrices are tiny vs the K-quant projections.
+// Batched dense GEMV: out[N×M] = x[N×K] · Wᵀ[K×M], dense W[M×K] (wtype
+// 0=F32/1=F16/30=BF16). Warp-per-(row,token): grid.x over row groups, grid.y
+// over tokens. Batches the Gemma PLE projections across N prompt tokens.
 __global__ void gemm_dense_batched_kernel(half* __restrict__ out,
                                           const void* __restrict__ W, int wtype,
                                           const half* __restrict__ x,
-                                          int M, int N, int K) {
-    const int m = blockIdx.x;   // weight row / output feature
-    const int n = blockIdx.y;   // token
+                                          int M, int N, int K, int rows_per_block) {
+    const int m    = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int n    = blockIdx.y;
+    const int lane = threadIdx.x & 31;
     if (m >= M || n >= N) return;
-    const int tid = threadIdx.x;
     const int64_t wbase = (int64_t)m * K;
     const int64_t xbase = (int64_t)n * K;
     float acc = 0.0f;
-    for (int k = tid; k < K; k += blockDim.x) {
-        float w;
-        if (wtype == 0)      w = ((const float*)W)[wbase + k];
-        else if (wtype == 1) w = __half2float(((const half*)W)[wbase + k]);
-        else { uint32_t bits = (uint32_t)((const uint16_t*)W)[wbase + k] << 16; w = __int_as_float(bits); }
-        acc += w * __half2float(x[xbase + k]);
-    }
-    __shared__ float sm[256];
-    sm[tid] = acc;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) sm[tid] += sm[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) out[(int64_t)n * M + m] = __float2half(sm[0]);
+    for (int k = lane; k < K; k += 32)
+        acc += dense_weight(W, wtype, wbase + k) * __half2float(x[xbase + k]);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[(int64_t)n * M + m] = __float2half(acc);
 }
 
 void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
                         int M, int N, int K, cudaStream_t stream) {
     if (N == 1) { gemv_dense(out, W, wtype, x, M, K, stream); return; }
     const void* Wd = resolve_weight_device_ptr(W);
-    dim3 grid(M, N);
-    gemm_dense_batched_kernel<<<grid, 256, 0, stream>>>(out, Wd, wtype, x, M, N, K);
+    const int rpb = gemv_rows_per_block();
+    dim3 grid((M + rpb - 1) / rpb, N);
+    gemm_dense_batched_kernel<<<grid, rpb * 32, 0, stream>>>(out, Wd, wtype, x, M, N, K, rpb);
 }
 
 }  // namespace jllm
