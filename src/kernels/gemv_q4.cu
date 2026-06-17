@@ -521,6 +521,70 @@ __global__ void gemv_quant_pair_dp4a_kernel(
     }
 }
 
+// Unaligned 32-bit load via two 16-bit reads. block_q6_K is 210 bytes (even
+// but not a multiple of 4), so ql/qh in odd super-blocks are only 2-aligned;
+// a plain *(int*) there faults ("misaligned address"). Two uint16 reads are
+// safe (the stride and all offsets are even) and faster than four byte reads.
+__device__ __forceinline__ int load_int_u16(const void* p) {
+    const uint16_t* s = (const uint16_t*)p;
+    return (int)((uint32_t)s[0] | ((uint32_t)s[1] << 16));
+}
+
+// dp4a dot of one Q6_K weight row against the q8_1 activation. Each lane owns
+// 4-consecutive-weight groups (64 per super-block, strided by 32). Mirrors
+// llama.cpp vec_dot_q6_K_q8_1: vi = ((ql nibble) | (qh 2 bits << 4)) - 32,
+// then dp4a(vi, q8) * sub-scale, scaled by the super-block d.
+__device__ __forceinline__ float dot_q6k_row_q8_1(
+    const block_q6_K* __restrict__ row, const block_q8_1* __restrict__ xq,
+    int n_blocks, int lane) {
+    float acc = 0.0f;
+    for (int sb = 0; sb < n_blocks; sb++) {
+        const block_q6_K& blk = row[sb];
+        const float d = raw_fp16_to_float(blk.d_raw);
+        for (int gi = lane; gi < 64; gi += 32) {
+            const int p   = 4 * gi;            // weight position 0..252 (4-aligned)
+            const int n   = (p >= 128) ? 128 : 0;
+            const int ph  = p - n;             // 0..124
+            const int g   = ph >> 5;           // quant group 0..3
+            const int r   = ph & 31;           // 0..28
+            const uint8_t* ql_h = blk.ql + (n >> 1);     // (n/128)*64
+            const uint8_t* qh_h = blk.qh + (n >> 2);     // (n/128)*32
+            const int8_t*  sc_h = blk.scales + (n >> 4); // (n/128)*8
+            const int qlbyte = (ph < 64) ? ph : (ph - 64);
+            const int ql_int = load_int_u16(ql_h + qlbyte);
+            const int vil = (ph >= 64) ? ((ql_int >> 4) & 0x0F0F0F0F)
+                                       : (ql_int & 0x0F0F0F0F);
+            const int qh_int = load_int_u16(qh_h + r);
+            // Extract the 2 high bits (at bit 2g of each byte) into bits 4-5,
+            // masking BEFORE shifting so the 4 bytes don't contaminate each
+            // other (a plain `qh_int >> 2g` would shift across byte lanes).
+            const int shift = 2 * g;
+            const int sel = qh_int & (0x03030303 << shift);
+            const int vih = (shift <= 4 ? (sel << (4 - shift))
+                                        : (sel >> (shift - 4))) & 0x30303030;
+            const int vi  = __vsubss4(vil | vih, 0x20202020);
+            const block_q8_1& q8 = xq[sb * 8 + (p >> 5)];
+            const int q8_int = *(const int*)(q8.qs + (p & 31));
+            const int sc = sc_h[(r >> 4) + 2 * g];
+            const float d8 = raw_fp16_to_float(q8.d_raw);
+            acc += d * sc * (d8 * (float)__dp4a(vi, q8_int, 0));
+        }
+    }
+    return acc;
+}
+
+__global__ void gemv_q6k_dp4a_kernel(
+    half* __restrict__ y, const block_q6_K* __restrict__ W,
+    const block_q8_1* __restrict__ xq, int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int n_blocks = K / QK_K;
+    float acc = dot_q6k_row_q8_1(W + (int64_t)row * n_blocks, xq, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
 __global__ void gemv_q4k_kernel(
     half*              __restrict__ y,
     const block_q4_K*  __restrict__ W,
@@ -1117,10 +1181,19 @@ static bool gemv_quant_gpu(half* y, const void* W, int ggml_type,
             gemv_q5k_kernel<<<grid, block, 0, stream>>>(
                 y, (const block_q5_K*)W_device, x, M, K, rows_per_block);
             break;
-        case 14:
-            gemv_q6k_kernel<<<grid, block, 0, stream>>>(
-                y, (const block_q6_K*)W_device, x, M, K, rows_per_block);
+        case 14: {
+            // MMVQ dp4a path for Q6_K (e.g. ffn_down).
+            block_q8_1* xq = get_q8_1_scratch(K);
+            if (xq) {
+                quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+                gemv_q6k_dp4a_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q6_K*)W_device, xq, M, K, rows_per_block);
+            } else {
+                gemv_q6k_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q6_K*)W_device, x, M, K, rows_per_block);
+            }
             break;
+        }
         default:
             fprintf(stderr, "[GEMV] FATAL: unsupported GPU GGML type %d (M=%d K=%d)\n",
                     ggml_type, M, K);
