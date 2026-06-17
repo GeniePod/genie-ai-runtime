@@ -412,6 +412,9 @@ struct __attribute__((packed)) block_q8_1 {
 };
 static_assert(sizeof(block_q8_1) == 36, "block_q8_1 must be 36 bytes");
 
+// Lazy device scratch for the q8_1-quantized activation (defined below).
+static block_q8_1* get_q8_1_scratch(int K);
+
 // Quantize x[K] -> block_q8_1[K/32]. One warp per 32-block.
 __global__ void quantize_q8_1_kernel(const half* __restrict__ x,
                                      block_q8_1* __restrict__ y, int K) {
@@ -482,6 +485,40 @@ __global__ void gemv_q4k_f32_dp4a_kernel(
     float acc = dot_q4k_row_q8_1(W + (int64_t)row * n_blocks, xq, n_blocks, lane);
     acc = warp_reduce_sum(acc);
     if (lane == 0) y[row] = acc;
+}
+
+// Half-output dp4a Q4_K GEMV (single, e.g. attn_output).
+__global__ void gemv_q4k_dp4a_kernel(
+    half* __restrict__ y, const block_q4_K* __restrict__ W,
+    const block_q8_1* __restrict__ xq, int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int n_blocks = K / QK_K;
+    float acc = dot_q4k_row_q8_1(W + (int64_t)row * n_blocks, xq, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
+// Dual-output dp4a Q4_K GEMV sharing one q8_1 activation (gate + up).
+__global__ void gemv_quant_pair_dp4a_kernel(
+    half* __restrict__ y0, const block_q4_K* __restrict__ W0, int M0,
+    half* __restrict__ y1, const block_q4_K* __restrict__ W1, int M1,
+    const block_q8_1* __restrict__ xq, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M0 + M1) return;
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_q8_1(W0 + (int64_t)row * n_blocks, xq, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else {
+        const int lr = row - M0;
+        float acc = dot_q4k_row_q8_1(W1 + (int64_t)lr * n_blocks, xq, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[lr] = __float2half(acc);
+    }
 }
 
 __global__ void gemv_q4k_kernel(
@@ -1063,10 +1100,19 @@ static bool gemv_quant_gpu(half* y, const void* W, int ggml_type,
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
     switch (ggml_type) {
-        case 12:
-            gemv_q4k_kernel<<<grid, block, 0, stream>>>(
-                y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+        case 12: {
+            // MMVQ dp4a: quantize the activation once, then int8 dp4a vs Q4_K.
+            block_q8_1* xq = get_q8_1_scratch(K);
+            if (xq) {
+                quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+                gemv_q4k_dp4a_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, xq, M, K, rows_per_block);
+            } else {
+                gemv_q4k_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+            }
             break;
+        }
         case 13:
             gemv_q5k_kernel<<<grid, block, 0, stream>>>(
                 y, (const block_q5_K*)W_device, x, M, K, rows_per_block);
@@ -1171,6 +1217,21 @@ static bool gemv_quant_pair_gpu(
     const int rows_per_block = gemv_rows_per_block();
     const int block = rows_per_block * 32;
     const int grid = (M0 + M1 + rows_per_block - 1) / rows_per_block;
+
+    if (type0 == 12 && type1 == 12) {
+        // MMVQ dp4a: quantize the shared activation once, int8 dp4a both rows.
+        block_q8_1* xq = get_q8_1_scratch(K);
+        if (xq) {
+            quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+            gemv_quant_pair_dp4a_kernel<<<grid, block, 0, stream>>>(
+                y0, (const block_q4_K*)W0_device, M0,
+                y1, (const block_q4_K*)W1_device, M1, xq, K, rows_per_block);
+            cudaError_t e = cudaGetLastError();
+            if (e == cudaSuccess) return true;
+            fprintf(stderr, "[GEMV] dp4a pair launch failed: %s; falling back\n",
+                    cudaGetErrorString(e));
+        }
+    }
 
     if (type0 == 12 && type1 == 12 && q4k_uint32_loads_enabled()) {
         // Q4_K + Q4_K uint32 weight-load path (decode gate/up). Same env
