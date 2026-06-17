@@ -412,7 +412,7 @@ __global__ void gemv_q4k_kernel(
     if (row >= M) return;
 
     const int n_blocks = K / QK_K;
-    float acc = dot_q4k_row(W + (int64_t)row * n_blocks, x, n_blocks, lane);
+    float acc = dot_q4k_row_uint32(W + (int64_t)row * n_blocks, x, n_blocks, lane);
     acc = warp_reduce_sum(acc);
 
     if (lane == 0)
@@ -466,7 +466,7 @@ __global__ void gemv_q4k_f32_kernel(
     if (row >= M) return;
 
     const int n_blocks = K / QK_K;
-    float acc = dot_q4k_row(W + (int64_t)row * n_blocks, x, n_blocks, lane);
+    float acc = dot_q4k_row_uint32(W + (int64_t)row * n_blocks, x, n_blocks, lane);
     acc = warp_reduce_sum(acc);
 
     if (lane == 0)
