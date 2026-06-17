@@ -812,26 +812,17 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
             config_.vocab_size,
             config_.rms_eps, config_.rope_neox ? "neox" : "normal");
 
-    // Gemma 4 (#88): the frontend recognizes gemma4 and parses its hparams, but
-    // the forward pass is not implemented yet. Fail loud with the detected
-    // architecture instead of silently running it through the Llama/Qwen path
-    // (wrong RoPE / head dims / norms -> garbage). Lift once #92 + #93 land.
+    // Gemma 4 (#88): experimental dense forward + PLE (#92/#93). Sliding-window
+    // masking is not applied yet, so contexts beyond sliding_window (512) will
+    // diverge; short prompts are unaffected.
     if (config_.arch == Arch::Gemma4) {
         fprintf(stderr,
-                "[engine] Gemma 4 detected but not yet supported — refusing to run.\n"
-                "  layers=%d heads=%d kv_heads=%d hidden=%d ffn=%d vocab=%d\n"
-                "  head_dim: sliding=%d global=%d  sliding_window=%d pattern=%d\n"
-                "  rope_theta: global=%g sliding=%g  kv_shared_layers=%d\n"
-                "  ple_input_dim=%d  final_logit_softcap=%g\n"
-                "  Full support tracked in #88 (architecture #89, PLE #93).\n",
-                config_.n_layers, config_.n_heads, config_.n_kv_heads,
-                config_.hidden_dim, config_.intermediate_dim, config_.vocab_size,
-                config_.sliding_head_dim, config_.global_head_dim,
-                config_.sliding_window, config_.sliding_window_pattern,
-                config_.rope_theta, config_.rope_theta_swa,
+                "[engine] Gemma 4 (experimental): %d layers, head_dim "
+                "sliding=%d/global=%d, kv_shared=%d, ple=%d, softcap=%g. "
+                "Sliding-window masking not yet applied (ok for <=%d-token ctx).\n",
+                config_.n_layers, config_.sliding_head_dim, config_.global_head_dim,
                 config_.n_kv_shared_layers, config_.ple_input_dim,
-                config_.spec.final_logit_softcap);
-        return false;
+                config_.spec.final_logit_softcap, config_.sliding_window);
     }
 
     if (!load_and_map_weights(gguf_path, &weights_, &weights_size_,
@@ -1518,9 +1509,19 @@ int Engine::decode_step(int pos) {
         prof_t = now;
     }
 
+    // Gemma 4: compute the Per-Layer-Embedding input once from the scaled
+    // embedding (it depends on the token, so it can't be CUDA-graph captured).
+    gemma_ple_input_ = nullptr;
+    if (config_.arch == Arch::Gemma4 && config_.spec.per_layer_embeddings) {
+        gemma_ple_input_ = (half*)scratch_.get(
+            (int64_t)config_.n_layers * config_.ple_input_dim * sizeof(half));
+        compute_gemma_ple_input(x, last_token_, gemma_ple_input_);
+    }
+
     // All transformer layers
     for (int l = 0; l < config_.n_layers; l++) {
-        transformer_layer(l, pos, x);
+        if (config_.arch == Arch::Gemma4) transformer_layer_gemma4(l, pos, x);
+        else transformer_layer(l, pos, x);
     }
     if (profile) {
         cudaStreamSynchronize(stream_);
@@ -1619,6 +1620,9 @@ int Engine::decode_step(int pos) {
 void Engine::build_cuda_graph(int pos) {
     if (graph_captured_) return;
     if (!gen_params_.use_cuda_graph) return;
+    // Gemma 4's PLE recomputes per-token from the changing token, so the decode
+    // step can't be captured into a static graph — use the non-graph path.
+    if (config_.arch == Arch::Gemma4) return;
 
     fprintf(stderr, "[engine] Capturing CUDA graph...\n");
 
@@ -1962,7 +1966,7 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     const int M = N - prefill_start;
     stats.prefill_tokens = M;
 
-    if (M > 0 && batched_prefill_enabled() && batched_fits) {
+    if (M > 0 && config_.arch != Arch::Gemma4 && batched_prefill_enabled() && batched_fits) {
         // Path B (issue #12): layer-major prefill. Allocate one
         // [M × H] activation buffer (M = tokens to prefill this turn),
         // dequantize each new prompt embedding into it, then loop
@@ -2008,8 +2012,16 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
                               model_weights_.embd_type, stream_);
             scale_embedding(config_.spec, x, H, config_.hidden_dim, stream_);
-            for (int l = 0; l < config_.n_layers; l++)
-                transformer_layer(l, i, x);
+            gemma_ple_input_ = nullptr;
+            if (config_.arch == Arch::Gemma4 && config_.spec.per_layer_embeddings) {
+                gemma_ple_input_ = (half*)scratch_.get(
+                    (int64_t)config_.n_layers * config_.ple_input_dim * sizeof(half));
+                compute_gemma_ple_input(x, last_token_, gemma_ple_input_);
+            }
+            for (int l = 0; l < config_.n_layers; l++) {
+                if (config_.arch == Arch::Gemma4) transformer_layer_gemma4(l, i, x);
+                else transformer_layer(l, i, x);
+            }
             // Hang onto the last token's residual; the scratch pool has NOT
             // been reset between iterations within prefill, so this pointer
             // remains valid through the post-prefill sampling step below.
