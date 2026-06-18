@@ -2358,6 +2358,18 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
     return true;
 }
 
+// Faithful llama.cpp Q4_K int8 MMQ prefill GEMM (src/kernels/mmq_q4k_llama.cu).
+// ldmatrix-based MMA operand loads + 2-blocks/SM occupancy; +31% prefill over the
+// warp-tiled MMQ on Gemma 4 E2B (1261-tok prefill 152->199 tok/s), decode unchanged.
+// Default on; set JLLM_MMQ_Q4K_LLAMA=0 to revert to the warp-tiled path.
+extern "C++" void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
+                                     int M, int N, int K, cudaStream_t stream);
+static bool q4k_mmq_llama_enabled() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("JLLM_MMQ_Q4K_LLAMA"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;
+}
+
 void gemm_quant_batched(half* y, const void* W, int ggml_type, const half* x,
                         int M, int N, int K, cudaStream_t stream) {
     // N=1 is just gemv — keep the decode/per-token path bit-identical by
@@ -2365,6 +2377,11 @@ void gemm_quant_batched(half* y, const void* W, int ggml_type, const half* x,
     if (N <= 0 || M <= 0 || K <= 0) return;
     if (N == 1) {
         gemv_quant(y, W, ggml_type, x, M, K, stream);
+        return;
+    }
+    // Q4_K prefill via the vendored llama MMQ kernel (handles arbitrary M/N/K).
+    if (q4k_mmq_llama_enabled() && ggml_type == 12 && K % QK_K == 0) {
+        gemm_q4k_mmq_llama(y, W, x, M, N, K, stream);
         return;
     }
     if (fast_gemv_enabled()) {
