@@ -2369,6 +2369,14 @@ static bool q4k_mmq_llama_enabled() {
     if (e < 0) { const char* v = getenv("JLLM_MMQ_Q4K_LLAMA"); e = (v && v[0] == '0') ? 0 : 1; }
     return e;
 }
+// Faithful llama.cpp Q6_K int8 MMQ (src/kernels/mmq_q6k_llama.cu); default on.
+extern "C++" void gemm_q6k_mmq_llama(half* y, const void* W, const half* x,
+                                     int M, int N, int K, cudaStream_t stream);
+static bool q6k_mmq_llama_enabled() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("JLLM_MMQ_Q6K_LLAMA"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;
+}
 
 void gemm_quant_batched(half* y, const void* W, int ggml_type, const half* x,
                         int M, int N, int K, cudaStream_t stream) {
@@ -2379,9 +2387,13 @@ void gemm_quant_batched(half* y, const void* W, int ggml_type, const half* x,
         gemv_quant(y, W, ggml_type, x, M, K, stream);
         return;
     }
-    // Q4_K prefill via the vendored llama MMQ kernel (handles arbitrary M/N/K).
+    // Q4_K / Q6_K prefill via the vendored llama MMQ kernels (handle arbitrary M/N/K).
     if (q4k_mmq_llama_enabled() && ggml_type == 12 && K % QK_K == 0) {
         gemm_q4k_mmq_llama(y, W, x, M, N, K, stream);
+        return;
+    }
+    if (q6k_mmq_llama_enabled() && ggml_type == 14 && K % QK_K == 0) {
+        gemm_q6k_mmq_llama(y, W, x, M, N, K, stream);
         return;
     }
     if (fast_gemv_enabled()) {
