@@ -129,6 +129,10 @@ ModelConfig load_gguf_config(const std::string& path) {
     fprintf(stderr, "[gguf] Version %u, %lu tensors, %lu metadata entries\n",
             hdr.version, hdr.n_tensors, hdr.n_kv);
 
+    // Gemma 4 (#88): final-logit softcap is read here and folded into the
+    // recipe after the metadata loop (the recipe is built once arch is known).
+    float g4_final_softcap = 0.0f;
+
     // Read metadata key-value pairs
     // This is a simplified reader — production code should handle all GGUF types
     for (uint64_t i = 0; i < hdr.n_kv && i < 256; i++) {
@@ -163,14 +167,27 @@ ModelConfig load_gguf_config(const std::string& path) {
         fread(&vtype, sizeof(vtype), 1, f);
 
         // Parse based on type
-        if (vtype == 4) {  // GGUF_TYPE_UINT32
+        if (vtype == 4 || vtype == 5) {  // GGUF_TYPE_UINT32 / INT32 (both 4B)
             uint32_t val;
             fread(&val, sizeof(val), 1, f);
 
-            if (strstr(key, "block_count"))        cfg.n_layers = val;
+            // Gemma 4 per-attention-type / PLE hparams (#88). Match the longer
+            // keys before their shorter prefixes — the reader uses strstr
+            // (substring), so "key_length_swa" must be tested before
+            // "key_length", "sliding_window_pattern" before "sliding_window",
+            // and "embedding_length_per_layer_input" before "embedding_length".
+            if (strstr(key, "attention.key_length_swa") ||
+                strstr(key, "attention.value_length_swa")) cfg.sliding_head_dim = val;
+            else if (strstr(key, "attention.sliding_window_pattern")) cfg.sliding_window_pattern = val;
+            else if (strstr(key, "attention.sliding_window")) cfg.sliding_window = val;
+            else if (strstr(key, "attention.shared_kv_layers")) cfg.n_kv_shared_layers = val;
+            else if (strstr(key, "embedding_length_per_layer_input")) cfg.ple_input_dim = val;
+            else if (strstr(key, "block_count"))   cfg.n_layers = val;
             else if (strstr(key, "head_count_kv")) cfg.n_kv_heads = val;
             else if (strstr(key, "head_count"))    cfg.n_heads = val;
-            else if (strstr(key, "attention.key_length")) cfg.head_dim = val;
+            // For Gemma 4 the non-SWA key_length is the full/global head dim;
+            // it also seeds head_dim for the Llama/Qwen path (unchanged there).
+            else if (strstr(key, "attention.key_length")) { cfg.head_dim = val; cfg.global_head_dim = val; }
             else if (strstr(key, "attention.value_length")) cfg.head_dim = val;
             else if (strstr(key, "embedding_length")) cfg.hidden_dim = val;
             else if (strstr(key, "feed_forward_length")) cfg.intermediate_dim = val;
@@ -179,9 +196,11 @@ ModelConfig load_gguf_config(const std::string& path) {
         } else if (vtype == 6) {  // GGUF_TYPE_FLOAT32
             float val;
             fread(&val, sizeof(val), 1, f);
-            if (strstr(key, "rope.freq_base")) cfg.rope_theta = val;
+            if (strstr(key, "rope.freq_base_swa")) cfg.rope_theta_swa = val;  // gemma4 local
+            else if (strstr(key, "rope.freq_base")) cfg.rope_theta = val;
             else if (strstr(key, "layer_norm_rms_epsilon") ||
                      strstr(key, "rms_norm_eps")) cfg.rms_eps = val;
+            else if (strstr(key, "final_logit_softcapping")) g4_final_softcap = val;
         } else if (vtype == 8) {  // GGUF_TYPE_STRING
             uint64_t str_len;
             fread(&str_len, sizeof(str_len), 1, f);
@@ -192,19 +211,57 @@ ModelConfig load_gguf_config(const std::string& path) {
             } else if (strstr(key, "general.architecture")) {
                 std::string arch(str_len, '\0');
                 fread(&arch[0], 1, str_len, f);
+                cfg.arch_name = arch;
                 cfg.rope_neox =
                     arch == "qwen" || arch == "qwen2" || arch == "qwen3" ||
                     arch == "qwen2moe" || arch == "qwen3moe" ||
                     arch == "gemma" || arch == "gemma2" || arch == "gemma3" ||
+                    arch == "gemma4" || arch == "gemma4-assistant" ||
                     arch == "phi2" || arch == "phi3" || arch == "gptneox" ||
                     arch == "olmo" || arch == "olmo2";
             } else {
                 fseek(f, str_len, SEEK_CUR);
             }
+        } else if (vtype == 9) {  // GGUF_TYPE_ARRAY
+            // Gemma 4 stores several hparams per-layer as arrays. Skip every
+            // array by its true element size (a wrong guess desyncs the whole
+            // metadata stream), capturing the ones we need along the way.
+            uint32_t atype;
+            uint64_t alen;
+            fread(&atype, 4, 1, f);
+            fread(&alen, 8, 1, f);
+            bool want_ff  = strstr(key, "feed_forward_length") != nullptr;
+            bool want_swp = strstr(key, "sliding_window_pattern") != nullptr;
+            bool want_kv  = strstr(key, "head_count_kv") != nullptr;
+            if (atype == 8) {  // string array
+                for (uint64_t a = 0; a < alen; a++) {
+                    uint64_t sl; fread(&sl, 8, 1, f); fseek(f, sl, SEEK_CUR);
+                }
+            } else {
+                int esz = (atype <= 1 || atype == 7) ? 1
+                          : (atype <= 3)            ? 2
+                          : (atype <= 6)            ? 4 : 8;
+                if ((want_ff || want_swp || want_kv) && (esz == 1 || esz == 4)) {
+                    for (uint64_t a = 0; a < alen; a++) {
+                        long long v = 0;
+                        if (esz == 1) { unsigned char b; fread(&b, 1, 1, f); v = b; }
+                        else          { uint32_t u; fread(&u, 4, 1, f); v = (int32_t)u; }
+                        if (want_ff)  cfg.ff_per_layer.push_back((int)v);
+                        if (want_swp) cfg.layer_is_sliding.push_back((int)(v != 0));
+                        if (want_kv && a == 0) cfg.n_kv_heads = (int)v;
+                    }
+                } else {
+                    fseek(f, (long)alen * esz, SEEK_CUR);
+                }
+            }
         } else {
-            // Skip unknown types (need proper GGUF parser for production)
-            // For now, try to skip common sizes
-            fseek(f, 8, SEEK_CUR);  // rough skip
+            // Other scalar types: skip by true width. The old fixed 8-byte skip
+            // desynced the whole stream on, e.g., INT32 (vtype 5) or bool
+            // (vtype 7) values such as general.sampling.top_k.
+            int sz = (vtype <= 1 || vtype == 7) ? 1
+                     : (vtype <= 3)            ? 2
+                     : (vtype <= 6)            ? 4 : 8;
+            fseek(f, sz, SEEK_CUR);
         }
     }
 
@@ -216,6 +273,38 @@ ModelConfig load_gguf_config(const std::string& path) {
     if (cfg.rope_theta == 0.0f) cfg.rope_theta = 10000.0f;
     if (cfg.max_seq_len == 0) cfg.max_seq_len = 2048;
     if (cfg.n_kv_heads == 0) cfg.n_kv_heads = cfg.n_heads;
+
+    // Resolve architecture family + forward recipe (#88, #89). The default
+    // recipe (LlamaQwen) reproduces the original hardcoded behavior exactly;
+    // Gemma 4 selects its divergent knobs. The recipe is consumed by the
+    // forward pass — currently gated in Engine::load until #92/#93 land.
+    if (cfg.arch_name == "gemma4" || cfg.arch_name == "gemma4-assistant") {
+        cfg.arch                      = Arch::Gemma4;
+        cfg.spec.arch                 = Arch::Gemma4;
+        cfg.spec.ffn_activation       = FfnActivation::GeluGeGLU;
+        cfg.spec.scale_embeddings     = true;
+        cfg.spec.attn_scale           = 1.0f;   // Gemma 4 query scaling = 1.0 (verify vs HF in #92)
+        cfg.spec.final_logit_softcap  = g4_final_softcap;
+        cfg.spec.post_attn_norm       = true;
+        cfg.spec.post_ffn_norm        = true;
+        cfg.spec.per_layer_head_dim   = (cfg.global_head_dim > 0 &&
+                                         cfg.sliding_head_dim > 0 &&
+                                         cfg.global_head_dim != cfg.sliding_head_dim);
+        cfg.spec.dual_rope            = (cfg.rope_theta_swa > 0.0f);
+        cfg.spec.sliding_window       = (cfg.sliding_window > 0);
+        cfg.spec.kv_shared_layers     = cfg.n_kv_shared_layers;
+        cfg.spec.per_layer_embeddings = (cfg.ple_input_dim > 0);
+        // feed_forward_length is a per-layer array; the scalar handler never
+        // fired. Use the largest (double-wide) value so scratch buffers fit
+        // every layer; the forward indexes ff_per_layer per layer.
+        if (!cfg.ff_per_layer.empty()) {
+            int mx = 0;
+            for (int v : cfg.ff_per_layer) mx = std::max(mx, v);
+            cfg.intermediate_dim = mx;
+        }
+    } else {
+        cfg.arch = Arch::LlamaQwen;
+    }
 
     fclose(f);
 
@@ -630,6 +719,28 @@ bool load_and_map_weights(const std::string& path, void** blob, int64_t* blob_si
                 lw.rms_ffn = ptr;
                 lw.rms_type = (ti.type == 0) ? 0 : 1;
             }
+            // Gemma 4: sandwich norms, PLE per-layer tensors, and layer scale.
+            else if (strstr(ti.name, "post_attention_norm.weight")) {
+                lw.post_attn_norm = ptr;
+            }
+            else if (strstr(ti.name, "post_ffw_norm.weight")) {
+                lw.post_ffn_norm = ptr;
+            }
+            else if (strstr(ti.name, "post_norm.weight")) {
+                lw.ple_norm = ptr;
+            }
+            else if (strstr(ti.name, "inp_gate.weight")) {
+                lw.ple_gate = ptr; lw.type_ple_gate = ti.type;
+            }
+            else if (strstr(ti.name, ".proj.weight")) {
+                lw.ple_proj = ptr; lw.type_ple_proj = ti.type;
+            }
+            else if (strstr(ti.name, "layer_output_scale.weight")) {
+                lw.layer_scale = ptr;
+                // Scalar [1] F32 in the host-mmapped blob; read it once so the
+                // forward can do a plain scalar multiply (x *= layer_scale_val).
+                if (ti.type == 0) lw.layer_scale_val = *(const float*)ptr;
+            }
             else continue;
             mapped++;
         }
@@ -648,6 +759,30 @@ bool load_and_map_weights(const std::string& path, void** blob, int64_t* blob_si
             mw->output = ptr;
             mw->output_type = ti.type;
             mapped++;
+        }
+        else if (strcmp(ti.name, "per_layer_token_embd.weight") == 0) {
+            mw->ple_embd = ptr; mw->ple_embd_type = ti.type; mapped++;
+        }
+        else if (strcmp(ti.name, "per_layer_model_proj.weight") == 0) {
+            mw->ple_model_proj = ptr; mw->ple_model_proj_type = ti.type; mapped++;
+        }
+        else if (strcmp(ti.name, "per_layer_proj_norm.weight") == 0) {
+            mw->ple_proj_norm = ptr; mapped++;
+        }
+    }
+
+    // Gemma 4: fill per-layer geometry (head dim, ffn width, RoPE base, attn
+    // type) from the parsed per-layer tables so the forward can index per layer.
+    if (cfg.arch == Arch::Gemma4) {
+        for (int l = 0; l < cfg.n_layers; l++) {
+            auto& lw = mw->layers[l];
+            bool sliding = (l < (int)cfg.layer_is_sliding.size())
+                               ? cfg.layer_is_sliding[l] != 0 : true;
+            lw.is_sliding     = sliding;
+            lw.head_dim_l     = sliding ? cfg.sliding_head_dim : cfg.global_head_dim;
+            lw.rope_theta_l   = sliding ? cfg.rope_theta_swa : cfg.rope_theta;
+            lw.intermediate_l = (l < (int)cfg.ff_per_layer.size())
+                                    ? cfg.ff_per_layer[l] : cfg.intermediate_dim;
         }
     }
 

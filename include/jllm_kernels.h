@@ -71,6 +71,21 @@ void gemv_quant(
     cudaStream_t   stream
 );
 
+// K-quant GEMV with fused residual add:
+//   y = W*x + residual
+// Used by decode Wo and W_down exits to remove one vec_add launch and one
+// hidden-vector read/write pass per residual.
+void gemv_quant_add(
+    half*          y,
+    const void*    W,
+    int            ggml_type,
+    const half*    x,
+    const half*    residual,
+    int            M,
+    int            K,
+    cudaStream_t   stream
+);
+
 // Combined K-quant GEMV dispatchers for projections that share the same
 // activation vector. These reduce decode launch overhead for Q/K/V and
 // gate/up without changing math.
@@ -182,6 +197,35 @@ void fused_swiglu(
     cudaStream_t   stream
 );
 
+// ── Fused GeGLU (Gemma) ──────────────────────────────────────────────────
+// output = gelu_tanh(gate) * up   (the "gelu_pytorch_tanh" approximation).
+// Same shape/contract as fused_swiglu; selected per ArchSpec::ffn_activation.
+void fused_geglu(
+    half*          output,
+    const half*    gate,
+    const half*    up,
+    int            rows,
+    int            intermediate_dim,
+    cudaStream_t   stream
+);
+
+// In-place scalar multiply of a half vector (Gemma embedding scale x*=sqrt(d)).
+void vec_scale(half* x, int n, float s, cudaStream_t stream);
+
+// In-place final-logit soft-cap on FP32 logits: x = cap * tanh(x / cap) (Gemma).
+void logit_softcap(float* x, int n, float cap, cudaStream_t stream);
+
+// Dense GEMV for non-K-quant weights — wtype 0=F32, 1=F16, 30=BF16. Used for the
+// Gemma PLE projections (per_layer_model_proj is BF16; inp_gate/proj are F32).
+void gemv_dense(half* out, const void* W, int wtype, const half* x,
+                int M, int K, cudaStream_t stream);
+
+// Batched dense GEMV: out[N×M] = x[N×K] · Wᵀ[K×M], dense weight W[M×K]
+// (wtype 0=F32, 1=F16, 30=BF16). Batches the Gemma PLE projections across the
+// N prompt tokens in batched prefill; routes to gemv_dense when N==1.
+void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
+                        int M, int N, int K, cudaStream_t stream);
+
 // ── Rotary Position Embedding ────────────────────────────────────────────
 // Applied in-place to Q and K before attention.
 //
@@ -246,11 +290,17 @@ void flash_attention_decode(
     const void*    v_cache,    // [seq_len × n_kv_heads × head_dim]
     int            n_heads,
     int            n_kv_heads, // GQA: n_heads / n_kv_heads = group size
-    int            head_dim,
+    int            head_dim,   // active per-head vector length (Gemma sliding=256)
+    int            cache_head_dim, // KV cache slot per-head stride (Gemma=512)
     int            seq_len,    // current sequence length
     float          scale,      // 1/sqrt(head_dim)
     bool           kv_int8,    // true = INT8 KV cache
-    const float*   kv_scales,  // per-head scales if kv_int8 (else nullptr)
+    // Path I3 (#62): per-(pos, kv_head) scales — indexed as
+    // k_scales[kv_pos × n_kv_heads + kv_head] and similarly for v.
+    // nullptr in FP16 mode. Captured by KVCachePool::kv_scale_ptr(layer, ...).
+    const float*   k_scales,
+    const float*   v_scales,
+    int            window,     // Gemma sliding layers: attend to last `window` keys (0 = full)
     cudaStream_t   stream
 );
 
@@ -271,12 +321,17 @@ void flash_attention_prefill_batched(
     const void*    v_cache,
     int            n_heads,
     int            n_kv_heads,
-    int            head_dim,
+    int            head_dim,       // active per-head vector length
+    int            cache_head_dim, // KV cache slot per-head stride
     int            N,          // number of query tokens
     int            start_pos,  // absolute position of token 0 in the cache
     float          scale,
     bool           kv_int8,
-    const float*   kv_scales,
+    // Path I3 (#62): per-(pos, kv_head) layer scale regions; see decode
+    // signature above. nullptr in FP16 mode.
+    const float*   k_scales,
+    const float*   v_scales,
+    int            window,     // sliding-window size (0 = full attention)
     cudaStream_t   stream
 );
 

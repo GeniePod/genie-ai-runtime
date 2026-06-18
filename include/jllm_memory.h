@@ -94,11 +94,9 @@ private:
 
 // ── KV Cache Pool — pre-allocated, no runtime malloc ─────────────────────
 //
-// Key insight: on Jetson unified memory, we allocate KV cache with
-// cudaMallocHost (pinned). This gives:
-//   - GPU can read it directly (zero-copy, no cudaMemcpy)
-//   - CPU can read it directly (for debugging, export)
-//   - No page fault overhead (pinned = not swappable)
+// Key insight: the fast KV cache is only used by CUDA kernels, so it can live
+// in a plain cudaMalloc allocation. This avoids managed-memory bookkeeping
+// pressure after device-resident weights are loaded.
 //
 // For longer context: overflow to unpinned CPU memory (slower GPU access
 // via page faults, but doesn't OOM).
@@ -134,10 +132,59 @@ public:
     // Reset for new conversation
     void clear();
 
+    // Path F (#45) accessors for serialization of the GPU-resident
+    // fast pool. The overflow CPU pool is intentionally excluded —
+    // conversations that have spilled past the fast pool cap won't
+    // be saved in v1; that's a deliberate scope cut. F5 may revisit.
+    const Config& config()         const { return cfg_; }
+    void*         gpu_pool_ptr()   const { return gpu_pool_; }
+    int64_t       gpu_pool_bytes() const {
+        return (int64_t)cfg_.n_layers * cfg_.max_context * entry_bytes();
+    }
+
+    // Path F3b: packed-on-disk size when only `used_tokens` are populated.
+    // Per layer we keep used_tokens keys + used_tokens values, so the
+    // packed body is roughly used_tokens / max_context of the full pool.
+    int64_t packed_used_bytes(int used_tokens) const {
+        if (used_tokens <= 0) return 0;
+        return (int64_t)cfg_.n_layers * used_tokens * entry_bytes();
+    }
+
+    // Path F3b: gather the populated portion (positions [0, used_tokens)
+    // of every layer) into a host buffer for serialization. dst must be
+    // at least packed_used_bytes(used_tokens) bytes. Lays out
+    // per-layer: [keys 0..used_tokens-1][values 0..used_tokens-1].
+    bool gather_used_to_host(void* dst, int used_tokens) const;
+
+    // Path F3b (used by F4): scatter a packed body back into the GPU
+    // pool. zero_remaining = true memsets positions [used_tokens,
+    // max_context) of each layer to 0 first; F4 will pass true to make
+    // sure stale state from prior turns doesn't leak into attention.
+    bool scatter_from_host(const void* src, int used_tokens,
+                           bool zero_remaining);
+
+    // Path I phase I1 (#62): per-(layer, pos, K-or-V, kv_head) scale
+    // storage for INT8 KV. Only allocated when cfg.kv_type_bytes == 1
+    // (FP16 mode stores full-precision values in the KV pool and
+    // doesn't need scales). Sized as:
+    //
+    //     2 × n_layers × max_context × n_kv_heads × sizeof(float)
+    //
+    // Layout mirrors the KV pool: per layer there's a K-half
+    // ([max_context × n_kv_heads] scales) followed by a V-half. Insert
+    // at decode writes one row (n_kv_heads floats) per (layer, pos,
+    // K-or-V); reads at attention can iterate per-head across positions.
+    //
+    // Returns nullptr in FP16 mode — caller must respect
+    // config().kv_type_bytes before dereferencing.
+    float*  kv_scale_ptr(int layer, int pos, bool is_value);
+    int64_t kv_scales_bytes() const;
+
 private:
     Config cfg_ = {};
-    void*  gpu_pool_ = nullptr;   // cudaMallocManaged — CPU/GPU visible
-    void*  cpu_pool_ = nullptr;   // malloc — overflow, slower GPU access
+    void*  gpu_pool_ = nullptr;     // cudaMalloc — GPU-visible fast pool
+    void*  cpu_pool_ = nullptr;     // malloc — overflow, slower GPU access
+    float* kv_scales_ = nullptr;    // Path I1: per-head INT8 scales (FP16 mode: nullptr)
     int    used_tokens_ = 0;
     int    gpu_tokens_ = 0;
 

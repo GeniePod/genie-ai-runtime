@@ -3,6 +3,7 @@
 
 #include "jllm_kernels.h"
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +24,79 @@ static bool debug_kernels_enabled() {
 static bool fast_gemv_enabled() {
     static const bool enabled = [] {
         const char* v = getenv("JLLM_FAST_GEMV");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Path C: vectorized weight loads for the Q4_K family of decode gemv
+// kernels (Wo / gate-up pair / QKV triple). Lane T reads four packed
+// q-bytes (one uint32 from blk.qs) instead of one byte, eliminating
+// the il inner loop and folding scales into per-lane constants. See
+// dot_q4k_row_uint32 below for the new lane layout.
+//
+// Default-on after #25 / #26 / #27 each shipped bit-identical output
+// against the byte path on Qwen3-4B and cumulatively pushed decode
+// from 7.5 → 8.9 tok/s (+18.7%) on Jetson Orin Nano Super. Set
+// JLLM_Q4K_UINT32_LOADS=0 to opt back into the byte-by-byte kernels
+// (e.g. for an A/B comparison or if a future model trips an
+// alignment assumption).
+static bool q4k_uint32_loads_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_Q4K_UINT32_LOADS");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Path E (#33): tensor-core MMQ kernel for Q4_K prefill GEMM. Replaces
+// gemm_quant_batched_q4k_kernel's scalar FMAs with
+// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 against a 16×32 FP16
+// staging tile dequantized into shared memory. Two iterations:
+//
+//   - E3 (#36): naive port. ~74 GFLOPS standalone on Wo; integrated
+//     regressed prefill 27 % (#37, closed). 139 regs/thread, 32×
+//     redundant per-(row, sub-block) scale arithmetic across the warp.
+//
+//   - E4 (#38): per-(row, sub-block) scale precompute into shared
+//     memory + drop `#pragma unroll` on the dequant inner row loop.
+//     96 regs, ≥ 210 GFLOPS on every Qwen3-4B prefill shape, ~245
+//     GFLOPS aggregate — about 2× the scalar baseline. This PR
+//     integrates E4's kernel.
+//
+// Default-on after #39 shipped +70.8 % prefill (16.6 → 28.3 tok/s) on
+// Jetson Orin Nano Super 8 GB with sensibly-identical output text vs
+// alpha.6 scalar path. Set JLLM_MMQ_Q4K=0 to opt back into the scalar
+// batched Q4_K kernel (same grammar as JLLM_BATCHED_PREFILL and
+// JLLM_Q4K_UINT32_LOADS).
+static bool mmq_q4k_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_MMQ_Q4K");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Path E6: int8 tensor-core MMQ for Q4_K prefill. Replaces the E5 f16
+// mma.m16n8k16 (dequant->fp16) with mma.m16n8k32.s8.s8.s32 on raw nibbles x
+// q8_1 activations (per-sub-block d/dm applied in a float epilogue). ~2x the
+// f16 kernel on Orin (validated in tests/test_mmq_q4k_int8.cu). Default on;
+// set JLLM_MMQ_Q4K_I8=0 to fall back to the E5 f16 MMA path.
+static bool mmq_q4k_i8_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_MMQ_Q4K_I8");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Path E6 for Q6_K (ffn_down): int8 tensor-core MMQ. Q6_K's per-16-element
+// scales use mma.m16n8k16.s8.s8.s32 (one MMA per 16-wide scale group) on
+// (q6-32) s8 weights x q8_1 activations, scaled by d*scale*d8 (no min term —
+// Q6_K is symmetric). Default on; JLLM_MMQ_Q6K_I8=0 -> scalar batched kernel.
+static bool mmq_q6k_i8_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_MMQ_Q6K_I8");
         return !v || strcmp(v, "0") != 0;
     }();
     return enabled;
@@ -56,8 +130,8 @@ static const void* resolve_weight_device_ptr(const void* W) {
 static int gemv_rows_per_block() {
     static const int rows = [] {
         const char* v = getenv("JLLM_GEMV_ROWS");
-        int r = v ? atoi(v) : 8;
-        if (r != 4 && r != 8) r = 8;
+        int r = v ? atoi(v) : 4;
+        if (r != 4 && r != 8) r = 4;
         return r;
     }();
     return rows;
@@ -156,6 +230,85 @@ __device__ __forceinline__ float dot_q4k_row(
 
             acc += w_lo * __half2float(x[k_lo]);
             acc += w_hi * __half2float(x[k_hi]);
+        }
+    }
+
+    return acc;
+}
+
+// uint32-load variant of dot_q4k_row.
+//
+// Lane partitioning (new):
+//   il       = lane >> 3           (which 32-byte qs sub-block: 0..3)
+//   sub_base = (lane & 7) << 2     (byte offset within il: 0,4,...,28)
+//   Each lane reads four contiguous q-bytes as one uint32 from
+//   blk.qs + 32*il + sub_base, eliminating the il inner loop. Eight
+//   FMAs per block per lane — same total as the byte-by-byte path,
+//   but issued as one ld.global.b32 + 8 ld.global.b16 instead of
+//   four ld.global.b8 + 8 ld.global.b16. Plus zero inner-loop control.
+//
+// Per warp instruction:
+//   weight: 32 lanes × 4 bytes = 128 bytes = 1 L1 line covering full qs
+//   x:      32 lanes × 2 halves × 4 sub-positions = 256 halves = 4 L1 lines
+//   compared to byte path (4 inner iters):
+//   weight: 4 × (32 × 1 byte) = 4 partial-line transactions
+//   x:      4 × (32 × 2 halves) = same 4 lines but issued 4x
+//
+// The cache-line accesses for weights drop from 4 → 1 per block (the
+// hypothesis behind #19's Q4_K-vs-Q6_K arithmetic-intensity gap).
+//
+// Float ordering: each lane's accumulator now sums 8 FMAs that touch
+// K-positions [64*il+sub_base, 64*il+sub_base+4) low + [+32, +36) high
+// instead of [lane, +32, +64, +96, +128, +160, +192, +224]. Reduction
+// across 32 lanes still covers the full block but the addition order
+// differs, so bit-equality with dot_q4k_row is not guaranteed (same
+// caveat as #24's split-K).
+__device__ __forceinline__ float dot_q4k_row_uint32(
+    const block_q4_K* __restrict__ row_blocks,
+    const half*       __restrict__ x,
+    int n_blocks,
+    int lane)
+{
+    const int il       = lane >> 3;
+    const int sub_base = (lane & 7) << 2;
+
+    float acc = 0.0f;
+
+    for (int b = 0; b < n_blocks; b++) {
+        const block_q4_K& blk = row_blocks[b];
+        const float dall = raw_fp16_to_float(blk.d_raw);
+        const float dmin = raw_fp16_to_float(blk.dmin_raw);
+        const int k_base = b * QK_K;
+
+        // Scales for this lane's il — constant across the 4 packed bytes.
+        const int is = 2 * il;
+        uint8_t sc1, m1, sc2, m2;
+        get_scale_min_k4(is + 0, blk.scales, sc1, m1);
+        get_scale_min_k4(is + 1, blk.scales, sc2, m2);
+
+        const float d1  = dall * sc1;
+        const float dm1 = dmin * m1;
+        const float d2  = dall * sc2;
+        const float dm2 = dmin * m2;
+
+        // One uint32 load: 4 packed q-bytes.
+        // blk.qs starts at byte 16 of block_q4_K (after d_raw + dmin_raw +
+        // scales[12]); 32*il is 32-aligned; sub_base is 4-aligned → the
+        // computed address is at least 4-aligned, so the uint32 access is
+        // legal even on strict-alignment ARM64.
+        const uint32_t qv32 =
+            *(const uint32_t*)(blk.qs + 32 * il + sub_base);
+
+        const int k_lo_base = k_base + 64 * il + sub_base;
+        // k_hi_base = k_lo_base + 32
+
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            const uint8_t qb = (uint8_t)(qv32 >> (s * 8));
+            const float w_lo = d1 * (qb & 0xF) - dm1;
+            const float w_hi = d2 * (qb >> 4)  - dm2;
+            acc += w_lo * __half2float(x[k_lo_base + s]);
+            acc += w_hi * __half2float(x[k_lo_base + s + 32]);
         }
     }
 
@@ -274,6 +427,208 @@ __device__ __forceinline__ float warp_reduce_sum(float acc) {
     return acc;
 }
 
+// ── MMVQ (int8 dp4a) path ────────────────────────────────────────────────
+// Quantize the activation to int8 (q8_1) and dot it against Q4_K weights with
+// __dp4a, avoiding the per-element float dequant of the weights (the decode
+// compute bottleneck). Mirrors llama.cpp's vec_dot_q4_K_q8_1.
+struct __attribute__((packed)) block_q8_1 {
+    uint16_t d_raw;     // FP16 scale = max(|x|)/127
+    uint16_t s_raw;     // FP16 d * sum(qs)  (the min-term scale)
+    int8_t   qs[32];
+};
+static_assert(sizeof(block_q8_1) == 36, "block_q8_1 must be 36 bytes");
+
+// Lazy device scratch for the q8_1-quantized activation (defined below).
+static block_q8_1* get_q8_1_scratch(int K);
+
+// Quantize x[K] -> block_q8_1[K/32]. One warp per 32-block.
+__global__ void quantize_q8_1_kernel(const half* __restrict__ x,
+                                     block_q8_1* __restrict__ y, int K) {
+    const int b = blockIdx.x;
+    const int i = threadIdx.x;            // 0..31
+    const int k = b * 32 + i;
+    float v = (k < K) ? __half2float(x[k]) : 0.0f;
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, o));
+    const float d = amax / 127.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = __float2int_rn(v * id);
+    q = max(-127, min(127, q));
+    int sumq = q;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sumq += __shfl_xor_sync(0xFFFFFFFF, sumq, o);
+    y[b].qs[i] = (int8_t)q;
+    if (i == 0) {
+        y[b].d_raw = __half_as_ushort(__float2half(d));
+        y[b].s_raw = __half_as_ushort(__float2half(d * (float)sumq));
+    }
+}
+
+void quantize_q8_1(const half* x, void* y, int K, cudaStream_t stream) {
+    quantize_q8_1_kernel<<<K / QK_K * 8, 32, 0, stream>>>(x, (block_q8_1*)y, K);
+}
+
+// dp4a dot of one Q4_K weight row against the q8_1 activation. Lane strides
+// over the 8*n_blocks sub-blocks (32 quants each); warp-sum-reduce the caller.
+__device__ __forceinline__ float dot_q4k_row_q8_1(
+    const block_q4_K* __restrict__ row, const block_q8_1* __restrict__ xq,
+    int n_blocks, int lane) {
+    const int n_sub = n_blocks * 8;
+    float acc = 0.0f;
+    for (int s = lane; s < n_sub; s += 32) {
+        const int sbk = s >> 3;          // super-block index
+        const int j   = s & 7;           // sub-block 0..7
+        const int il  = j >> 1;          // which 32-byte qs group (0..3)
+        const bool hi = j & 1;           // high nibble?
+        const block_q4_K& blk = row[sbk];
+        uint8_t sc, m;
+        get_scale_min_k4(j, blk.scales, sc, m);
+        const int* qsi = (const int*)(blk.qs + 32 * il);
+        const int* q8i = (const int*)(xq[s].qs);
+        int dot = 0;
+        #pragma unroll
+        for (int n = 0; n < 8; n++) {
+            const int w4 = hi ? ((qsi[n] >> 4) & 0x0F0F0F0F) : (qsi[n] & 0x0F0F0F0F);
+            dot = __dp4a(w4, q8i[n], dot);
+        }
+        const float dall = raw_fp16_to_float(blk.d_raw);
+        const float dmin = raw_fp16_to_float(blk.dmin_raw);
+        const float d8   = raw_fp16_to_float(xq[s].d_raw);
+        const float s8   = raw_fp16_to_float(xq[s].s_raw);
+        acc += dall * sc * (d8 * dot) - dmin * m * s8;
+    }
+    return acc;
+}
+
+__global__ void gemv_q4k_f32_dp4a_kernel(
+    float* __restrict__ y, const block_q4_K* __restrict__ W,
+    const block_q8_1* __restrict__ xq, int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int n_blocks = K / QK_K;
+    float acc = dot_q4k_row_q8_1(W + (int64_t)row * n_blocks, xq, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
+
+// Half-output dp4a Q4_K GEMV (single, e.g. attn_output).
+__global__ void gemv_q4k_dp4a_kernel(
+    half* __restrict__ y, const block_q4_K* __restrict__ W,
+    const block_q8_1* __restrict__ xq, int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int n_blocks = K / QK_K;
+    float acc = dot_q4k_row_q8_1(W + (int64_t)row * n_blocks, xq, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
+// Dual-output dp4a Q4_K GEMV sharing one q8_1 activation (gate + up).
+__global__ void gemv_quant_pair_dp4a_kernel(
+    half* __restrict__ y0, const block_q4_K* __restrict__ W0, int M0,
+    half* __restrict__ y1, const block_q4_K* __restrict__ W1, int M1,
+    const block_q8_1* __restrict__ xq, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M0 + M1) return;
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_q8_1(W0 + (int64_t)row * n_blocks, xq, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else {
+        const int lr = row - M0;
+        float acc = dot_q4k_row_q8_1(W1 + (int64_t)lr * n_blocks, xq, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[lr] = __float2half(acc);
+    }
+}
+
+// Unaligned 32-bit load via two 16-bit reads. block_q6_K is 210 bytes (even
+// but not a multiple of 4), so ql/qh in odd super-blocks are only 2-aligned;
+// a plain *(int*) there faults ("misaligned address"). Two uint16 reads are
+// safe (the stride and all offsets are even) and faster than four byte reads.
+__device__ __forceinline__ int load_int_u16(const void* p) {
+    const uint16_t* s = (const uint16_t*)p;
+    return (int)((uint32_t)s[0] | ((uint32_t)s[1] << 16));
+}
+
+// 4 packed (q6-32) int8 for positions 4*gi..4*gi+3 of a Q6_K block. Shared by
+// the decode dp4a dot and the prefill int8-MMA tile build. The scale for
+// element k is blk.scales[k >> 4] (contiguous 16-element groups).
+__device__ __forceinline__ int q6_unpack4(const block_q6_K& blk, int gi) {
+    const int p = 4 * gi, n = (p >= 128) ? 128 : 0, ph = p - n;
+    const int g = ph >> 5, r = ph & 31;
+    const uint8_t* ql_h = blk.ql + (n >> 1);
+    const uint8_t* qh_h = blk.qh + (n >> 2);
+    const int qlbyte = (ph < 64) ? ph : (ph - 64);
+    const int ql_int = load_int_u16(ql_h + qlbyte);
+    const int vil = (ph >= 64) ? ((ql_int >> 4) & 0x0F0F0F0F) : (ql_int & 0x0F0F0F0F);
+    const int qh_int = load_int_u16(qh_h + r);
+    const int shift = 2 * g;
+    const int sel = qh_int & (0x03030303 << shift);
+    const int vih = (shift <= 4 ? (sel << (4 - shift)) : (sel >> (shift - 4))) & 0x30303030;
+    return __vsubss4(vil | vih, 0x20202020);
+}
+
+// dp4a dot of one Q6_K weight row against the q8_1 activation. Each lane owns
+// 4-consecutive-weight groups (64 per super-block, strided by 32). Mirrors
+// llama.cpp vec_dot_q6_K_q8_1: vi = ((ql nibble) | (qh 2 bits << 4)) - 32,
+// then dp4a(vi, q8) * sub-scale, scaled by the super-block d.
+__device__ __forceinline__ float dot_q6k_row_q8_1(
+    const block_q6_K* __restrict__ row, const block_q8_1* __restrict__ xq,
+    int n_blocks, int lane) {
+    float acc = 0.0f;
+    for (int sb = 0; sb < n_blocks; sb++) {
+        const block_q6_K& blk = row[sb];
+        const float d = raw_fp16_to_float(blk.d_raw);
+        for (int gi = lane; gi < 64; gi += 32) {
+            const int p   = 4 * gi;            // weight position 0..252 (4-aligned)
+            const int n   = (p >= 128) ? 128 : 0;
+            const int ph  = p - n;             // 0..124
+            const int g   = ph >> 5;           // quant group 0..3
+            const int r   = ph & 31;           // 0..28
+            const uint8_t* ql_h = blk.ql + (n >> 1);     // (n/128)*64
+            const uint8_t* qh_h = blk.qh + (n >> 2);     // (n/128)*32
+            const int8_t*  sc_h = blk.scales + (n >> 4); // (n/128)*8
+            const int qlbyte = (ph < 64) ? ph : (ph - 64);
+            const int ql_int = load_int_u16(ql_h + qlbyte);
+            const int vil = (ph >= 64) ? ((ql_int >> 4) & 0x0F0F0F0F)
+                                       : (ql_int & 0x0F0F0F0F);
+            const int qh_int = load_int_u16(qh_h + r);
+            // Extract the 2 high bits (at bit 2g of each byte) into bits 4-5,
+            // masking BEFORE shifting so the 4 bytes don't contaminate each
+            // other (a plain `qh_int >> 2g` would shift across byte lanes).
+            const int shift = 2 * g;
+            const int sel = qh_int & (0x03030303 << shift);
+            const int vih = (shift <= 4 ? (sel << (4 - shift))
+                                        : (sel >> (shift - 4))) & 0x30303030;
+            const int vi  = __vsubss4(vil | vih, 0x20202020);
+            const block_q8_1& q8 = xq[sb * 8 + (p >> 5)];
+            const int q8_int = *(const int*)(q8.qs + (p & 31));
+            const int sc = sc_h[(r >> 4) + 2 * g];
+            const float d8 = raw_fp16_to_float(q8.d_raw);
+            acc += d * sc * (d8 * (float)__dp4a(vi, q8_int, 0));
+        }
+    }
+    return acc;
+}
+
+__global__ void gemv_q6k_dp4a_kernel(
+    half* __restrict__ y, const block_q6_K* __restrict__ W,
+    const block_q8_1* __restrict__ xq, int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int n_blocks = K / QK_K;
+    float acc = dot_q6k_row_q8_1(W + (int64_t)row * n_blocks, xq, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) y[row] = __float2half(acc);
+}
+
 __global__ void gemv_q4k_kernel(
     half*              __restrict__ y,
     const block_q4_K*  __restrict__ W,
@@ -285,7 +640,7 @@ __global__ void gemv_q4k_kernel(
     if (row >= M) return;
 
     const int n_blocks = K / QK_K;
-    float acc = dot_q4k_row(W + (int64_t)row * n_blocks, x, n_blocks, lane);
+    float acc = dot_q4k_row_uint32(W + (int64_t)row * n_blocks, x, n_blocks, lane);
     acc = warp_reduce_sum(acc);
 
     if (lane == 0)
@@ -339,7 +694,7 @@ __global__ void gemv_q4k_f32_kernel(
     if (row >= M) return;
 
     const int n_blocks = K / QK_K;
-    float acc = dot_q4k_row(W + (int64_t)row * n_blocks, x, n_blocks, lane);
+    float acc = dot_q4k_row_uint32(W + (int64_t)row * n_blocks, x, n_blocks, lane);
     acc = warp_reduce_sum(acc);
 
     if (lane == 0)
@@ -568,6 +923,56 @@ __device__ __forceinline__ float dot_quant_row_t(
     }
 }
 
+template<int Type>
+__global__ void gemv_quant_add_typed_kernel(
+    half*        __restrict__ y,
+    const void*  __restrict__ W,
+    const half*  __restrict__ x,
+    const half*  __restrict__ residual,
+    int M,
+    int K,
+    int rows_per_block)
+{
+    const int row = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+
+    const int n_blocks = K / QK_K;
+    float acc = dot_quant_row_t<Type>(W, row, n_blocks, x, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        const half projected = __float2half(acc);
+        y[row] = __float2half(__half2float(projected) +
+                              __half2float(residual[row]));
+    }
+}
+
+// Q4_K-only variant of gemv_quant_add_typed_kernel using
+// dot_q4k_row_uint32 (uint32 weight loads, no il inner loop).
+// Same block shape and grid as the byte path, drop-in dispatch from
+// gemv_quant_add_gpu's case 12 when JLLM_Q4K_UINT32_LOADS is set.
+__global__ void gemv_quant_add_uint32_q4k_kernel(
+    half*             __restrict__ y,
+    const block_q4_K* __restrict__ W,
+    const half*       __restrict__ x,
+    const half*       __restrict__ residual,
+    int M, int K, int rows_per_block)
+{
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+
+    const int n_blocks = K / QK_K;
+    float acc = dot_q4k_row_uint32(
+        W + (int64_t)row * n_blocks, x, n_blocks, lane);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) {
+        const half projected = __float2half(acc);
+        y[row] = __float2half(__half2float(projected) +
+                              __half2float(residual[row]));
+    }
+}
+
 template<int Type0, int Type1>
 __global__ void gemv_quant_pair_typed_kernel(
     half*        __restrict__ y0,
@@ -596,6 +1001,135 @@ __global__ void gemv_quant_pair_typed_kernel(
         acc = dot_quant_row_t<Type1>(W1, local_row, n_blocks, x, lane);
         acc = warp_reduce_sum(acc);
         if (lane == 0) y1[local_row] = __float2half(acc);
+    }
+}
+
+// Q4_K + Q4_K dual-output variant using dot_q4k_row_uint32 (the same
+// uint32-weight-load helper added for the Wo path in #25). Used for
+// decode gate/up, which is ~44% of decode wall-clock on Qwen3-4B per
+// #19. Both outputs use the same `x`, so the inner dot helper's work
+// is per-row and identical to the single-output case.
+__global__ void gemv_quant_pair_uint32_q4k_kernel(
+    half*             __restrict__ y0,
+    const block_q4_K* __restrict__ W0,
+    int M0,
+    half*             __restrict__ y1,
+    const block_q4_K* __restrict__ W1,
+    int M1,
+    const half*       __restrict__ x,
+    int K,
+    int rows_per_block)
+{
+    const int row     = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+    const int total_M = M0 + M1;
+    if (row >= total_M) return;
+
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_uint32(
+            W0 + (int64_t)row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else {
+        const int local_row = row - M0;
+        float acc = dot_q4k_row_uint32(
+            W1 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[local_row] = __float2half(acc);
+    }
+}
+
+// Q4_K + Q4_K + Q4_K triple-output uint32 kernel. Used by QKV when all
+// three matrices are Q4_K (some model configs). Same pattern as the
+// pair kernel: warp owns one row of W0/W1/W2 based on row range, all
+// three use dot_q4k_row_uint32.
+__global__ void gemv_quant_triple_uint32_q4k_kernel(
+    half*             __restrict__ y0,
+    const block_q4_K* __restrict__ W0,
+    int M0,
+    half*             __restrict__ y1,
+    const block_q4_K* __restrict__ W1,
+    int M1,
+    half*             __restrict__ y2,
+    const block_q4_K* __restrict__ W2,
+    int M2,
+    const half*       __restrict__ x,
+    int K,
+    int rows_per_block)
+{
+    const int row     = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+    const int total_M = M0 + M1 + M2;
+    if (row >= total_M) return;
+
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_uint32(
+            W0 + (int64_t)row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else if (row < M0 + M1) {
+        const int local_row = row - M0;
+        float acc = dot_q4k_row_uint32(
+            W1 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[local_row] = __float2half(acc);
+    } else {
+        const int local_row = row - M0 - M1;
+        float acc = dot_q4k_row_uint32(
+            W2 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y2[local_row] = __float2half(acc);
+    }
+}
+
+// Q4_K + Q4_K + Q6_K triple-output kernel. This is the Qwen3-4B case
+// (Wq, Wk are Q4_K; Wv is Q6_K). The Q4_K rows take the uint32 path;
+// the Q6_K rows still go through the byte-by-byte dot_q6k_row helper
+// because we haven't written a uint32 variant for Q6_K yet (Q6_K
+// already runs at 30-40% of peak — less room to win, different block
+// layout). The block of 32 rows is heterogeneous: some warps in a
+// block run dot_q4k_row_uint32 and others run dot_q6k_row. That's
+// fine — warps are independent and the lane mapping for each helper
+// is self-contained.
+__global__ void gemv_quant_triple_uint32_q4k_q4k_q6k_kernel(
+    half*             __restrict__ y0,
+    const block_q4_K* __restrict__ W0,
+    int M0,
+    half*             __restrict__ y1,
+    const block_q4_K* __restrict__ W1,
+    int M1,
+    half*             __restrict__ y2,
+    const block_q6_K* __restrict__ W2,
+    int M2,
+    const half*       __restrict__ x,
+    int K,
+    int rows_per_block)
+{
+    const int row     = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane    = threadIdx.x & 31;
+    const int total_M = M0 + M1 + M2;
+    if (row >= total_M) return;
+
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_q4k_row_uint32(
+            W0 + (int64_t)row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else if (row < M0 + M1) {
+        const int local_row = row - M0;
+        float acc = dot_q4k_row_uint32(
+            W1 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[local_row] = __float2half(acc);
+    } else {
+        const int local_row = row - M0 - M1;
+        float acc = dot_q6k_row(
+            W2 + (int64_t)local_row * n_blocks, x, n_blocks, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y2[local_row] = __float2half(acc);
     }
 }
 
@@ -674,18 +1208,36 @@ static bool gemv_quant_gpu(half* y, const void* W, int ggml_type,
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
     switch (ggml_type) {
-        case 12:
-            gemv_q4k_kernel<<<grid, block, 0, stream>>>(
-                y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+        case 12: {
+            // MMVQ dp4a: quantize the activation once, then int8 dp4a vs Q4_K.
+            block_q8_1* xq = get_q8_1_scratch(K);
+            if (xq) {
+                quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+                gemv_q4k_dp4a_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, xq, M, K, rows_per_block);
+            } else {
+                gemv_q4k_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+            }
             break;
+        }
         case 13:
             gemv_q5k_kernel<<<grid, block, 0, stream>>>(
                 y, (const block_q5_K*)W_device, x, M, K, rows_per_block);
             break;
-        case 14:
-            gemv_q6k_kernel<<<grid, block, 0, stream>>>(
-                y, (const block_q6_K*)W_device, x, M, K, rows_per_block);
+        case 14: {
+            // MMVQ dp4a path for Q6_K (e.g. ffn_down).
+            block_q8_1* xq = get_q8_1_scratch(K);
+            if (xq) {
+                quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+                gemv_q6k_dp4a_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q6_K*)W_device, xq, M, K, rows_per_block);
+            } else {
+                gemv_q6k_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q6_K*)W_device, x, M, K, rows_per_block);
+            }
             break;
+        }
         default:
             fprintf(stderr, "[GEMV] FATAL: unsupported GPU GGML type %d (M=%d K=%d)\n",
                     ggml_type, M, K);
@@ -700,6 +1252,21 @@ static bool gemv_quant_gpu(half* y, const void* W, int ggml_type,
     return true;
 }
 
+// Lazy device scratch for the q8_1-quantized activation (one row of K).
+static block_q8_1* get_q8_1_scratch(int K) {
+    static block_q8_1* buf = nullptr;
+    static int cap_blocks = 0;
+    const int nb = K / 32;
+    if (nb > cap_blocks) {
+        if (buf) cudaFree(buf);
+        if (cudaMalloc(&buf, (size_t)nb * sizeof(block_q8_1)) != cudaSuccess) {
+            buf = nullptr; cap_blocks = 0; return nullptr;
+        }
+        cap_blocks = nb;
+    }
+    return buf;
+}
+
 static bool gemv_quant_gpu_f32(float* y, const void* W, int ggml_type,
                                const half* x, int M, int K, cudaStream_t stream) {
     const void* W_device = resolve_weight_device_ptr(W);
@@ -712,10 +1279,20 @@ static bool gemv_quant_gpu_f32(float* y, const void* W, int ggml_type,
     const int grid = (M + rows_per_block - 1) / rows_per_block;
 
     switch (ggml_type) {
-        case 12:
-            gemv_q4k_f32_kernel<<<grid, block, 0, stream>>>(
-                y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+        case 12: {
+            // MMVQ dp4a path: quantize the activation to int8 (q8_1) once, then
+            // dot it against the Q4_K weights with __dp4a (no float dequant).
+            block_q8_1* xq = get_q8_1_scratch(K);
+            if (xq) {
+                quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+                gemv_q4k_f32_dp4a_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, xq, M, K, rows_per_block);
+            } else {
+                gemv_q4k_f32_kernel<<<grid, block, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, x, M, K, rows_per_block);
+            }
             break;
+        }
         case 13:
             gemv_q5k_f32_kernel<<<grid, block, 0, stream>>>(
                 y, (const block_q5_K*)W_device, x, M, K, rows_per_block);
@@ -759,6 +1336,41 @@ static bool gemv_quant_pair_gpu(
     const int grid = (M0 + M1 + rows_per_block - 1) / rows_per_block;
 
     if (type0 == 12 && type1 == 12) {
+        // MMVQ dp4a: quantize the shared activation once, int8 dp4a both rows.
+        block_q8_1* xq = get_q8_1_scratch(K);
+        if (xq) {
+            quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+            gemv_quant_pair_dp4a_kernel<<<grid, block, 0, stream>>>(
+                y0, (const block_q4_K*)W0_device, M0,
+                y1, (const block_q4_K*)W1_device, M1, xq, K, rows_per_block);
+            cudaError_t e = cudaGetLastError();
+            if (e == cudaSuccess) return true;
+            fprintf(stderr, "[GEMV] dp4a pair launch failed: %s; falling back\n",
+                    cudaGetErrorString(e));
+        }
+    }
+
+    if (type0 == 12 && type1 == 12 && q4k_uint32_loads_enabled()) {
+        // Q4_K + Q4_K uint32 weight-load path (decode gate/up). Same env
+        // var as the residual-fused Wo path so a single flag covers
+        // every uint32-accelerated Q4_K caller.
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[GEMV] Q4_K uint32 pair weight-load path enabled\n");
+            logged = true;
+        }
+        gemv_quant_pair_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
+            y0, (const block_q4_K*)W0_device, M0,
+            y1, (const block_q4_K*)W1_device, M1,
+            x, K, rows_per_block);
+        cudaError_t err_sk = cudaGetLastError();
+        if (err_sk == cudaSuccess) return true;
+        fprintf(stderr, "[GEMV] Q4_K uint32 pair launch failed: %s; falling back\n",
+                cudaGetErrorString(err_sk));
+        // Fall through to the typed byte-load kernel below.
+    }
+
+    if (type0 == 12 && type1 == 12) {
         gemv_quant_pair_typed_kernel<12, 12><<<grid, block, 0, stream>>>(
             y0, W0_device, M0, y1, W1_device, M1, x, K, rows_per_block);
     } else {
@@ -795,6 +1407,37 @@ static bool gemv_quant_triple_gpu(
     const int block = rows_per_block * 32;
     const int grid = (M0 + M1 + M2 + rows_per_block - 1) / rows_per_block;
 
+    // Q4_K uint32 triple paths — same env-var family as #25 / #26.
+    if (q4k_uint32_loads_enabled() &&
+        type0 == 12 && type1 == 12 && (type2 == 12 || type2 == 14)) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr,
+                    "[GEMV] Q4_K uint32 triple weight-load path enabled (V=%s)\n",
+                    type2 == 14 ? "Q6_K (byte path)" : "Q4_K");
+            logged = true;
+        }
+        if (type2 == 12) {
+            gemv_quant_triple_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
+                y0, (const block_q4_K*)W0_device, M0,
+                y1, (const block_q4_K*)W1_device, M1,
+                y2, (const block_q4_K*)W2_device, M2,
+                x, K, rows_per_block);
+        } else { // type2 == 14
+            gemv_quant_triple_uint32_q4k_q4k_q6k_kernel<<<grid, block, 0, stream>>>(
+                y0, (const block_q4_K*)W0_device, M0,
+                y1, (const block_q4_K*)W1_device, M1,
+                y2, (const block_q6_K*)W2_device, M2,
+                x, K, rows_per_block);
+        }
+        cudaError_t err_uint32 = cudaGetLastError();
+        if (err_uint32 == cudaSuccess) return true;
+        fprintf(stderr,
+                "[GEMV] Q4_K uint32 triple launch failed: %s; falling back\n",
+                cudaGetErrorString(err_uint32));
+        // Fall through to the typed byte-load kernel below.
+    }
+
     if (type0 == 12 && type1 == 12 && type2 == 14) {
         gemv_quant_triple_typed_kernel<12, 12, 14><<<grid, block, 0, stream>>>(
             y0, W0_device, M0, y1, W1_device, M1, y2, W2_device, M2,
@@ -819,6 +1462,62 @@ static bool gemv_quant_triple_gpu(
     return true;
 }
 
+static bool gemv_quant_add_gpu(half* y, const void* W, int ggml_type,
+                               const half* x, const half* residual,
+                               int M, int K, cudaStream_t stream) {
+    const void* W_device = resolve_weight_device_ptr(W);
+    if (!W_device || !supported_gpu_type(ggml_type)) {
+        return false;
+    }
+
+    const int rows_per_block = gemv_rows_per_block();
+    const int block = rows_per_block * 32;
+    const int grid = (M + rows_per_block - 1) / rows_per_block;
+
+    // Q4_K only — uint32 weight loads, opt-in via JLLM_Q4K_UINT32_LOADS.
+    // On Q5_K / Q6_K the per-byte loop already runs at higher arithmetic
+    // intensity per byte; vectorizing those is a separate exercise.
+    if (ggml_type == 12 && q4k_uint32_loads_enabled()) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[GEMV] Q4_K uint32 weight-load path enabled\n");
+            logged = true;
+        }
+        gemv_quant_add_uint32_q4k_kernel<<<grid, block, 0, stream>>>(
+            y, (const block_q4_K*)W_device, x, residual, M, K, rows_per_block);
+        cudaError_t err = cudaGetLastError();
+        if (err == cudaSuccess) return true;
+        fprintf(stderr, "[GEMV] Q4_K uint32 launch failed: %s; falling back\n",
+                cudaGetErrorString(err));
+        // Fall through to the byte-load typed kernel below.
+    }
+
+    switch (ggml_type) {
+        case 12:
+            gemv_quant_add_typed_kernel<12><<<grid, block, 0, stream>>>(
+                y, W_device, x, residual, M, K, rows_per_block);
+            break;
+        case 13:
+            gemv_quant_add_typed_kernel<13><<<grid, block, 0, stream>>>(
+                y, W_device, x, residual, M, K, rows_per_block);
+            break;
+        case 14:
+            gemv_quant_add_typed_kernel<14><<<grid, block, 0, stream>>>(
+                y, W_device, x, residual, M, K, rows_per_block);
+            break;
+        default:
+            return false;
+    }
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[GEMV] add GPU launch failed: %s\n",
+                cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 // ── Batched K-quant GEMM (prefill path) ─────────────────────────────────
 //
 // y[N×M] = x[N×K] · Wᵀ[K×M] where W is Q4_K/Q5_K/Q6_K.
@@ -832,7 +1531,12 @@ static bool gemv_quant_triple_gpu(
 // Each thread stores a fixed-size acc[MAX_BATCH] register array; the
 // host dispatcher chunks N > MAX_BATCH into multiple kernel launches.
 
-constexpr int GEMM_MAX_BATCH = 32;
+// Sized just above the typical chat-template-wrapped prompt length we serve
+// from GenieClaw (N ≈ 18 for a single user turn). The token-loop is
+// #pragma-unrolled, so every iteration past N is predicated-off but still
+// consumes issue slots — shrinking the unroll factor cuts that waste.
+// Longer prompts get chunked by the host dispatcher.
+constexpr int GEMM_MAX_BATCH = 20;
 
 // The token-loop inside the kernel is #pragma-unrolled so the compiler can
 // keep acc[] in registers — a runtime-bounded loop with dynamic indexing
@@ -1023,6 +1727,427 @@ __global__ void gemm_quant_batched_q6k_kernel(
     }
 }
 
+// Path E E5: multi-warp cooperative MMQ Q4_K kernel. Replaces the E4
+// single-warp variant. 4 warps per CUDA block share a single
+// dequanted 16×32 FP16 A-tile across 4 contiguous N-stripes (8 tokens
+// each). Dequant amortized 4× vs E4; register count 96 → 39; all
+// Qwen3-4B prefill shapes uniform around ~407 GFLOPS (vs E4's 210–276).
+//
+// Validated standalone in #41 (test_mmq_q4k_multiwarp.cu).
+// Grid: (ceil(N / MMQ_Q4K_BLOCK_N), ceil(M / MMQ_Q4K_TILE_M), 1).
+// Block: 4 warps × 32 threads = 128 threads.
+
+constexpr int MMQ_Q4K_TILE_M  = 16;
+constexpr int MMQ_Q4K_TILE_N  = 8;
+constexpr int MMQ_Q4K_N_WARPS = 4;
+constexpr int MMQ_Q4K_BLOCK_N = MMQ_Q4K_TILE_N * MMQ_Q4K_N_WARPS;   // 32
+
+__global__ void gemm_mmq_q4k_kernel(half*             __restrict__ y,
+                                    const block_q4_K* __restrict__ W,
+                                    const half*       __restrict__ x,
+                                    int M, int N, int K)
+{
+    const int row_base     = blockIdx.y * MMQ_Q4K_TILE_M;
+    const int blk_tok_base = blockIdx.x * MMQ_Q4K_BLOCK_N;
+    if (row_base >= M) return;
+
+    const int t_id    = threadIdx.x;          // 0..127
+    const int warp_id = t_id >> 5;            // 0..3
+    const int lane    = t_id & 31;
+    const int groupID = lane >> 2;
+    const int tinG    = lane &  3;
+
+    const int tok_base = blk_tok_base + warp_id * MMQ_Q4K_TILE_N;
+
+    const int n_blocks = K / QK_K;
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    __shared__ half  A_tile[MMQ_Q4K_TILE_M][32];
+    __shared__ float per_d [MMQ_Q4K_TILE_M][8];
+    __shared__ float per_dm[MMQ_Q4K_TILE_M][8];
+
+    for (int b = 0; b < n_blocks; b++) {
+        // Step 1: 128 (d, dm) pairs across 128 threads, 1 entry each.
+        {
+            const int row = t_id >> 3;        // 0..15
+            const int sb  = t_id &  7;        // 0..7
+            const int g_row = row_base + row;
+            float d = 0.0f, dm = 0.0f;
+            if (g_row < M) {
+                const block_q4_K& blk = W[(int64_t)g_row * n_blocks + b];
+                const float dall = raw_fp16_to_float(blk.d_raw);
+                const float dmin = raw_fp16_to_float(blk.dmin_raw);
+                uint8_t sc, mn;
+                get_scale_min_k4(sb, blk.scales, sc, mn);
+                d  = dall * sc;
+                dm = dmin * mn;
+            }
+            per_d [row][sb] = d;
+            per_dm[row][sb] = dm;
+        }
+        __syncthreads();
+
+        // Step 2: 8 sub-blocks × {cooperative dequant, 4 MMAs}.
+        for (int sb = 0; sb < 8; sb++) {
+            const int il     = sb >> 1;
+            const int parity = sb &  1;
+
+            // Cooperative dequant: 128 threads × 4 elements = 512 = 16×32.
+            // Thread t covers row = t/8, cols (t&7)*4 + [0..3] — keeps
+            // each thread on one row across its 4 cols.
+            {
+                const int row    = t_id >> 3;
+                const int col_4  = (t_id & 7) << 2;
+                const int g_row  = row_base + row;
+                float d = 0.0f, dm = 0.0f;
+                const block_q4_K* blk_ptr = nullptr;
+                if (g_row < M) {
+                    blk_ptr = &W[(int64_t)g_row * n_blocks + b];
+                    d  = per_d [row][sb];
+                    dm = per_dm[row][sb];
+                }
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    const int col = col_4 + s;
+                    if (g_row < M) {
+                        const uint8_t qb = blk_ptr->qs[32 * il + col];
+                        const float val  = parity
+                            ? (d * (qb >> 4)  - dm)
+                            : (d * (qb & 0xF) - dm);
+                        A_tile[row][col] = __float2half(val);
+                    } else {
+                        A_tile[row][col] = __float2half(0.0f);
+                    }
+                }
+            }
+            __syncthreads();
+
+            const int k_block_base = b * QK_K + sb * 32;
+
+            #pragma unroll
+            for (int km = 0; km < 2; km++) {
+                const int ka = km * 16;
+
+                half2 a0_h = *reinterpret_cast<const half2*>(&A_tile[groupID    ][ka + tinG * 2]);
+                half2 a1_h = *reinterpret_cast<const half2*>(&A_tile[groupID + 8][ka + tinG * 2]);
+                half2 a2_h = *reinterpret_cast<const half2*>(&A_tile[groupID    ][ka + tinG * 2 + 8]);
+                half2 a3_h = *reinterpret_cast<const half2*>(&A_tile[groupID + 8][ka + tinG * 2 + 8]);
+
+                uint32_t a0 = *reinterpret_cast<uint32_t*>(&a0_h);
+                uint32_t a1 = *reinterpret_cast<uint32_t*>(&a1_h);
+                uint32_t a2 = *reinterpret_cast<uint32_t*>(&a2_h);
+                uint32_t a3 = *reinterpret_cast<uint32_t*>(&a3_h);
+
+                const int g_tok = tok_base + groupID;
+                const int k_pos = k_block_base + ka;
+
+                uint32_t b0, b1;
+                if (g_tok < N) {
+                    half2 b0_h = *reinterpret_cast<const half2*>(&x[(int64_t)g_tok * K + k_pos + tinG * 2]);
+                    half2 b1_h = *reinterpret_cast<const half2*>(&x[(int64_t)g_tok * K + k_pos + tinG * 2 + 8]);
+                    b0 = *reinterpret_cast<uint32_t*>(&b0_h);
+                    b1 = *reinterpret_cast<uint32_t*>(&b1_h);
+                } else {
+                    b0 = 0;
+                    b1 = 0;
+                }
+
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0, %1, %2, %3}, "
+                    "{%4, %5, %6, %7}, "
+                    "{%8, %9}, "
+                    "{%0, %1, %2, %3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+                      "r"(b0), "r"(b1)
+                );
+            }
+            __syncthreads();
+        }
+    }
+
+    const int tok0  = tok_base + tinG * 2;
+    const int tok1  = tok_base + tinG * 2 + 1;
+    const int row_a = row_base + groupID;
+    const int row_b = row_base + groupID + 8;
+
+    if (row_a < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_a] = __float2half(d0);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_a] = __float2half(d1);
+    }
+    if (row_b < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_b] = __float2half(d2);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_b] = __float2half(d3);
+    }
+}
+
+// Lazy scratch for the q8_1-quantized [N][K] activation matrix (N*K/32 blocks).
+static block_q8_1* get_q8_1_scratch_batched(int total_blocks) {
+    static block_q8_1* buf = nullptr;
+    static int cap_blocks = 0;
+    if (total_blocks > cap_blocks) {
+        if (buf) cudaFree(buf);
+        if (cudaMalloc(&buf, (size_t)total_blocks * sizeof(block_q8_1)) != cudaSuccess) {
+            buf = nullptr; cap_blocks = 0; return nullptr;
+        }
+        cap_blocks = total_blocks;
+    }
+    return buf;
+}
+
+// Path E6: int8 tensor-core MMQ Q4_K prefill GEMM. Same tiling as the E5 f16
+// kernel (16x32 M/N per block, 4 warps), but one mma.m16n8k32.s8.s8.s32 per
+// 32-wide sub-block on raw nibbles x q8_1 activations, with the Q4_K (d,dm)
+// and q8_1 (d8,s8) scales applied in a float epilogue. A-fragment layout and
+// the epilogue mapping validated in tests/test_mmq_q4k_int8.cu.
+__global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
+                                       const block_q4_K* __restrict__ W,
+                                       const block_q8_1* __restrict__ XQ,
+                                       int M, int N, int K)
+{
+    const int row_base     = blockIdx.y * MMQ_Q4K_TILE_M;
+    const int blk_tok_base = blockIdx.x * MMQ_Q4K_BLOCK_N;
+    if (row_base >= M) return;
+
+    const int t_id    = threadIdx.x;
+    const int warp_id = t_id >> 5;
+    const int lane    = t_id & 31;
+    const int groupID = lane >> 2;
+    const int tinG    = lane &  3;
+
+    const int tok_base = blk_tok_base + warp_id * MMQ_Q4K_TILE_N;
+    const int n_blocks = K / QK_K;
+    const int nsb      = n_blocks * 8;            // q8_1 sub-blocks along K
+
+    const int tok0 = tok_base + tinG * 2;
+    const int tok1 = tok0 + 1;
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    // cp.async double-buffered raw Q4_K tile: the next K-block streams into
+    // shared while the int8 tensor cores work the current one. block_q4_K is
+    // 144 B = 9x16 and blocks sit at 144*k (16-aligned) in the weight array,
+    // so the async copy is 16-byte-aligned. 16B-align the shared buffer too.
+    __align__(16) __shared__ block_q4_K Wsh[2][MMQ_Q4K_TILE_M];
+    __shared__ int8_t A_tile[MMQ_Q4K_TILE_M][32];
+    __shared__ float  per_d [MMQ_Q4K_TILE_M][8];
+    __shared__ float  per_dm[MMQ_Q4K_TILE_M][8];
+
+    auto prefetch = [&](int buf, int blk_idx) {
+        for (int ci = t_id; ci < MMQ_Q4K_TILE_M * 9; ci += blockDim.x) {
+            const int row = ci / 9, c16 = ci % 9, g_row = row_base + row;
+            const char* src = (const char*)((g_row < M)
+                ? &W[(int64_t)g_row * n_blocks + blk_idx] : &W[0]) + c16 * 16;
+            __pipeline_memcpy_async((char*)&Wsh[buf][row] + c16 * 16, src, 16);
+        }
+        __pipeline_commit();
+    };
+    prefetch(0, 0);
+
+    for (int b = 0; b < n_blocks; b++) {
+        if (b + 1 < n_blocks) prefetch((b + 1) & 1, b + 1);
+        __pipeline_wait_prior(b + 1 < n_blocks ? 1 : 0);
+        __syncthreads();
+        const block_q4_K* Wb = Wsh[b & 1];
+        {
+            const int row = t_id >> 3;
+            const int sb  = t_id &  7;
+            const int g_row = row_base + row;
+            float d = 0.0f, dm = 0.0f;
+            if (g_row < M) {
+                const block_q4_K& blk = Wb[row];
+                const float dall = raw_fp16_to_float(blk.d_raw);
+                const float dmin = raw_fp16_to_float(blk.dmin_raw);
+                uint8_t sc, mn;
+                get_scale_min_k4(sb, blk.scales, sc, mn);
+                d  = dall * sc;
+                dm = dmin * mn;
+            }
+            per_d [row][sb] = d;
+            per_dm[row][sb] = dm;
+        }
+        __syncthreads();
+
+        for (int sb = 0; sb < 8; sb++) {
+            const int il     = sb >> 1;
+            const int parity = sb &  1;
+
+            // Cooperative unpack of raw 4-bit nibbles -> int8 [0..15].
+            {
+                const int row   = t_id >> 3;
+                const int col_4 = (t_id & 7) << 2;
+                const int g_row = row_base + row;
+                #pragma unroll
+                for (int s = 0; s < 4; s++) {
+                    const int col = col_4 + s;
+                    int8_t q = 0;
+                    if (g_row < M) {
+                        const uint8_t qb = Wb[row].qs[32 * il + col];
+                        q = (int8_t)(parity ? (qb >> 4) : (qb & 0xF));
+                    }
+                    A_tile[row][col] = q;
+                }
+            }
+            __syncthreads();
+
+            const int gsb = b * 8 + sb;
+
+            // A fragment (m16n8k32 s8 layout, validated): rows {gid, gid+8}
+            // paired across k_lo (4t..+3) / k_hi (16+4t..+3).
+            const int a0 = *reinterpret_cast<const int*>(&A_tile[groupID    ][4 * tinG     ]);
+            const int a1 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][4 * tinG     ]);
+            const int a2 = *reinterpret_cast<const int*>(&A_tile[groupID    ][16 + 4 * tinG]);
+            const int a3 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][16 + 4 * tinG]);
+
+            // B fragment: q8_1 of token (tok_base+groupID).
+            const int g_tok = tok_base + groupID;
+            int bb0 = 0, bb1 = 0;
+            if (g_tok < N) {
+                const block_q8_1* q = &XQ[(int64_t)g_tok * nsb + gsb];
+                bb0 = *reinterpret_cast<const int*>(q->qs + 4 * tinG);
+                bb1 = *reinterpret_cast<const int*>(q->qs + 16 + 4 * tinG);
+            }
+
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bb0), "r"(bb1)
+            );
+
+            const float dA  = per_d [groupID    ][sb];
+            const float dmA = per_dm[groupID    ][sb];
+            const float dB  = per_d [groupID + 8][sb];
+            const float dmB = per_dm[groupID + 8][sb];
+            float d8_0 = 0.0f, s8_0 = 0.0f, d8_1 = 0.0f, s8_1 = 0.0f;
+            if (tok0 < N) {
+                d8_0 = raw_fp16_to_float(XQ[(int64_t)tok0 * nsb + gsb].d_raw);
+                s8_0 = raw_fp16_to_float(XQ[(int64_t)tok0 * nsb + gsb].s_raw);
+            }
+            if (tok1 < N) {
+                d8_1 = raw_fp16_to_float(XQ[(int64_t)tok1 * nsb + gsb].d_raw);
+                s8_1 = raw_fp16_to_float(XQ[(int64_t)tok1 * nsb + gsb].s_raw);
+            }
+            d0 += dA * d8_0 * (float)c0 - dmA * s8_0;
+            d1 += dA * d8_1 * (float)c1 - dmA * s8_1;
+            d2 += dB * d8_0 * (float)c2 - dmB * s8_0;
+            d3 += dB * d8_1 * (float)c3 - dmB * s8_1;
+            __syncthreads();
+        }
+    }
+
+    const int row_a = row_base + groupID;
+    const int row_b = row_base + groupID + 8;
+    if (row_a < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_a] = __float2half(d0);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_a] = __float2half(d1);
+    }
+    if (row_b < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_b] = __float2half(d2);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_b] = __float2half(d3);
+    }
+}
+
+// Path E6 Q6_K: int8 tensor-core MMQ for the ffn_down prefill GEMM. One
+// mma.m16n8k16.s8.s8.s32 per 16-wide Q6_K scale group, (q6-32) s8 weights x
+// q8_1 activations, scaled by d*scale*d8 in a float epilogue (no min term).
+// Validated in tests/test_mmq_q6k_int8.cu.
+__global__ void gemm_mmq_q6k_i8_kernel(half*             __restrict__ y,
+                                       const block_q6_K* __restrict__ W,
+                                       const block_q8_1* __restrict__ XQ,
+                                       int M, int N, int K)
+{
+    const int row_base     = blockIdx.y * MMQ_Q4K_TILE_M;
+    const int blk_tok_base = blockIdx.x * MMQ_Q4K_BLOCK_N;
+    if (row_base >= M) return;
+
+    const int t_id    = threadIdx.x;
+    const int warp_id = t_id >> 5;
+    const int lane    = t_id & 31;
+    const int groupID = lane >> 2;
+    const int tinG    = lane &  3;
+
+    const int tok_base = blk_tok_base + warp_id * MMQ_Q4K_TILE_N;
+    const int n_blocks = K / QK_K;
+    const int nsb      = n_blocks * 8;            // q8_1 (32-elt) sub-blocks
+    const int tok0 = tok_base + tinG * 2;
+    const int tok1 = tok0 + 1;
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+    __shared__ int8_t A_tile[MMQ_Q4K_TILE_M][16];
+    __shared__ float  per_dsc[MMQ_Q4K_TILE_M][16];   // d_row * scales_row[j]
+
+    for (int b = 0; b < n_blocks; b++) {
+        {
+            const int row = t_id >> 3;
+            const int two = t_id & 7;
+            const int g_row = row_base + row;
+            float d = 0.0f; const block_q6_K* bp = nullptr;
+            if (g_row < M) { bp = &W[(int64_t)g_row * n_blocks + b]; d = raw_fp16_to_float(bp->d_raw); }
+            #pragma unroll
+            for (int hpart = 0; hpart < 2; hpart++) {
+                const int j = two + 8 * hpart;
+                per_dsc[row][j] = (g_row < M) ? d * (float)bp->scales[j] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        for (int j = 0; j < 16; j++) {
+            if (t_id < 64) {
+                const int row = t_id >> 2;
+                const int gilocal = t_id & 3;
+                const int g_row = row_base + row;
+                int vi = 0;
+                if (g_row < M) vi = q6_unpack4(W[(int64_t)g_row * n_blocks + b], 4 * j + gilocal);
+                *reinterpret_cast<int*>(&A_tile[row][4 * gilocal]) = vi;
+            }
+            __syncthreads();
+
+            const int a0 = *reinterpret_cast<const int*>(&A_tile[groupID    ][4 * tinG]);
+            const int a1 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][4 * tinG]);
+
+            const int g_tok = tok_base + groupID;
+            const int qsb = b * 8 + (j >> 1);
+            const int qoff = (j & 1) * 16;
+            int bb0 = 0;
+            if (g_tok < N)
+                bb0 = *reinterpret_cast<const int*>(XQ[(int64_t)g_tok * nsb + qsb].qs + qoff + 4 * tinG);
+
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};\n"
+                : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                : "r"(a0), "r"(a1), "r"(bb0));
+
+            const float dscA = per_dsc[groupID    ][j];
+            const float dscB = per_dsc[groupID + 8][j];
+            float d8_0 = 0.0f, d8_1 = 0.0f;
+            if (tok0 < N) d8_0 = raw_fp16_to_float(XQ[(int64_t)tok0 * nsb + qsb].d_raw);
+            if (tok1 < N) d8_1 = raw_fp16_to_float(XQ[(int64_t)tok1 * nsb + qsb].d_raw);
+            d0 += dscA * d8_0 * (float)c0;
+            d1 += dscA * d8_1 * (float)c1;
+            d2 += dscB * d8_0 * (float)c2;
+            d3 += dscB * d8_1 * (float)c3;
+            __syncthreads();
+        }
+    }
+
+    const int row_a = row_base + groupID;
+    const int row_b = row_base + groupID + 8;
+    if (row_a < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_a] = __float2half(d0);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_a] = __float2half(d1);
+    }
+    if (row_b < M) {
+        if (tok0 < N) y[(int64_t)tok0 * M + row_b] = __float2half(d2);
+        if (tok1 < N) y[(int64_t)tok1 * M + row_b] = __float2half(d3);
+    }
+}
+
 static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
                                    const half* x, int M, int N, int K,
                                    cudaStream_t stream) {
@@ -1034,6 +2159,93 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
     const int rows_per_block = gemv_rows_per_block();
     const int block = rows_per_block * 32;
     const int grid = (M + rows_per_block - 1) / rows_per_block;
+
+    // Path E E5: Q4_K only, default on. Multi-warp cooperative
+    // variant — 4 warps share one dequanted A-tile across 4 N-stripes.
+    // Set JLLM_MMQ_Q4K=0 to opt back into the scalar batched Q4_K
+    // kernel below. Falls through to the scalar kernel on any
+    // cudaError (mirrors the Path C fallback after the #29 Q6_K
+    // crash). Q5_K / Q6_K continue through the existing scalar
+    // batched kernels.
+    if (ggml_type == 12 && mmq_q4k_enabled()) {
+        dim3 mmq_grid((N + MMQ_Q4K_BLOCK_N - 1) / MMQ_Q4K_BLOCK_N,
+                      (M + MMQ_Q4K_TILE_M  - 1) / MMQ_Q4K_TILE_M,  1);
+
+        // Path E6: int8 tensor-core MMQ (default). Quantize the [N][K]
+        // activation to q8_1, then mma.m16n8k32.s8.s8.s32 — ~2x the f16 path.
+        if (mmq_q4k_i8_enabled() && (K % 32 == 0)) {
+            static bool announced = false;
+            if (!announced) {
+                announced = true;
+                fprintf(stderr,
+                        "[GEMM] Path E6 int8-MMA Q4_K tensor-core kernel active "
+                        "(default on; set JLLM_MMQ_Q4K_I8=0 to use the f16 path)\n");
+            }
+            const int total_blocks = N * (K / 32);
+            block_q8_1* xq = get_q8_1_scratch_batched(total_blocks);
+            if (xq) {
+                quantize_q8_1_kernel<<<total_blocks, 32, 0, stream>>>(
+                    x, xq, N * K);
+                gemm_mmq_q4k_i8_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
+                    y, (const block_q4_K*)W_device, xq, M, N, K);
+                cudaError_t err = cudaGetLastError();
+                if (err == cudaSuccess) {
+                    return true;
+                }
+                fprintf(stderr,
+                        "[GEMM] int8-MMA Q4_K launch failed (%s), falling back "
+                        "to f16 MMA\n", cudaGetErrorString(err));
+            }
+        }
+
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr,
+                    "[GEMM] Path E MMQ Q4_K tensor-core kernel active "
+                    "(multi-warp f16, default on; set JLLM_MMQ_Q4K=0 to "
+                    "disable)\n");
+        }
+        gemm_mmq_q4k_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
+            y, (const block_q4_K*)W_device, x, M, N, K);
+        cudaError_t err = cudaGetLastError();
+        if (err == cudaSuccess) {
+            return true;
+        }
+        fprintf(stderr,
+                "[GEMM] MMQ Q4_K launch failed (%s), falling back to "
+                "scalar batched kernel\n",
+                cudaGetErrorString(err));
+    }
+
+    // Path E6 Q6_K (ffn_down): int8 tensor-core MMQ replacing the scalar
+    // batched Q6_K kernel — the #1 prefill cost. Quantize x->q8_1, then
+    // one mma.m16n8k16.s8.s8.s32 per 16-wide scale group.
+    if (ggml_type == 14 && mmq_q6k_i8_enabled() && (K % 32 == 0)) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr,
+                    "[GEMM] Path E6 int8-MMA Q6_K tensor-core kernel active "
+                    "(default on; set JLLM_MMQ_Q6K_I8=0 to use the scalar path)\n");
+        }
+        const int total_blocks = N * (K / 32);
+        block_q8_1* xq = get_q8_1_scratch_batched(total_blocks);
+        if (xq) {
+            dim3 mmq_grid((N + MMQ_Q4K_BLOCK_N - 1) / MMQ_Q4K_BLOCK_N,
+                          (M + MMQ_Q4K_TILE_M  - 1) / MMQ_Q4K_TILE_M,  1);
+            quantize_q8_1_kernel<<<total_blocks, 32, 0, stream>>>(x, xq, N * K);
+            gemm_mmq_q6k_i8_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
+                y, (const block_q6_K*)W_device, xq, M, N, K);
+            cudaError_t err = cudaGetLastError();
+            if (err == cudaSuccess) {
+                return true;
+            }
+            fprintf(stderr,
+                    "[GEMM] int8-MMA Q6_K launch failed (%s), falling back to "
+                    "scalar batched kernel\n", cudaGetErrorString(err));
+        }
+    }
 
     switch (ggml_type) {
         case 12:
@@ -1264,6 +2476,36 @@ void gemv_quant(half* y, const void* W, int ggml_type, const half* x,
     }
 }
 
+void gemv_quant_add(half* y, const void* W, int ggml_type, const half* x,
+                    const half* residual, int M, int K, cudaStream_t stream) {
+    if (fast_gemv_enabled()) {
+        if (gemv_quant_add_gpu(y, W, ggml_type, x, residual, M, K, stream)) {
+            return;
+        }
+    }
+
+    cudaStreamSynchronize(stream);
+
+    std::vector<half> h_x(K);
+    std::vector<half> h_residual(M);
+    std::vector<float> h_y_f32;
+    std::vector<half> h_y(M);
+    cudaMemcpy(h_x.data(), x, K * sizeof(half), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_residual.data(), residual, M * sizeof(half), cudaMemcpyDeviceToHost);
+
+    if (!gemv_quant_cpu(h_y_f32, W, ggml_type, h_x, M, K)) {
+        cudaMemsetAsync(y, 0, M * sizeof(half), stream);
+        return;
+    }
+
+    for (int i = 0; i < M; i++) {
+        const half projected = __float2half(h_y_f32[i]);
+        h_y[i] = __float2half(__half2float(projected) +
+                              __half2float(h_residual[i]));
+    }
+    cudaMemcpy(y, h_y.data(), M * sizeof(half), cudaMemcpyHostToDevice);
+}
+
 void gemv_quant_pair(
     half* y0, const void* W0, int ggml_type0, int M0,
     half* y1, const void* W1, int ggml_type1, int M1,
@@ -1353,6 +2595,74 @@ bool dequant_embedding_row(half* dst, const void* W, int ggml_type,
         return false;
     }
     return true;
+}
+
+// ── Dense GEMV for F32 / F16 / BF16 weights (Gemma PLE projections) ───────
+// out[m] = sum_k W[m,k] * x[k]. The PLE model/gate/proj weights aren't K-quant
+// (per_layer_model_proj is BF16; inp_gate/proj are F32). Small + not on the hot
+// path, so a plain row-per-block reduction. wtype: 0=F32, 1=F16, 30=BF16.
+// Load one dense weight element: wtype 0=F32, 1=F16, 30=BF16.
+__device__ __forceinline__ float dense_weight(const void* W, int wtype, int64_t i) {
+    if (wtype == 0)      return ((const float*)W)[i];
+    else if (wtype == 1) return __half2float(((const half*)W)[i]);
+    uint32_t bits = (uint32_t)((const uint16_t*)W)[i] << 16;  // BF16
+    return __int_as_float(bits);
+}
+
+// Warp-per-row dense GEMV: one warp owns an output row, lanes stride over K and
+// reduce with __shfl (no shared-memory block reduction / __syncthreads). This
+// replaced a one-block-per-row design whose 8-step shared reduction left the
+// kernel ~96% occupied but memory-stall bound (ncu: 3.34 ms / ~8 GB/s on the
+// Gemma PLE BF16 model_proj). Used for the Gemma PLE projections.
+__global__ void gemv_dense_kernel(half* __restrict__ out, const void* __restrict__ W,
+                                  int wtype, const half* __restrict__ x,
+                                  int M, int K, int rows_per_block) {
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const int64_t base = (int64_t)row * K;
+    float acc = 0.0f;
+    for (int k = lane; k < K; k += 32)
+        acc += dense_weight(W, wtype, base + k) * __half2float(x[k]);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[row] = __float2half(acc);
+}
+
+void gemv_dense(half* out, const void* W, int wtype, const half* x,
+                int M, int K, cudaStream_t stream) {
+    const void* Wd = resolve_weight_device_ptr(W);
+    const int rpb = gemv_rows_per_block();
+    const int grid = (M + rpb - 1) / rpb;
+    gemv_dense_kernel<<<grid, rpb * 32, 0, stream>>>(out, Wd, wtype, x, M, K, rpb);
+}
+
+// Batched dense GEMV: out[N×M] = x[N×K] · Wᵀ[K×M], dense W[M×K] (wtype
+// 0=F32/1=F16/30=BF16). Warp-per-(row,token): grid.x over row groups, grid.y
+// over tokens. Batches the Gemma PLE projections across N prompt tokens.
+__global__ void gemm_dense_batched_kernel(half* __restrict__ out,
+                                          const void* __restrict__ W, int wtype,
+                                          const half* __restrict__ x,
+                                          int M, int N, int K, int rows_per_block) {
+    const int m    = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int n    = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    if (m >= M || n >= N) return;
+    const int64_t wbase = (int64_t)m * K;
+    const int64_t xbase = (int64_t)n * K;
+    float acc = 0.0f;
+    for (int k = lane; k < K; k += 32)
+        acc += dense_weight(W, wtype, wbase + k) * __half2float(x[xbase + k]);
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) out[(int64_t)n * M + m] = __float2half(acc);
+}
+
+void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
+                        int M, int N, int K, cudaStream_t stream) {
+    if (N == 1) { gemv_dense(out, W, wtype, x, M, K, stream); return; }
+    const void* Wd = resolve_weight_device_ptr(W);
+    const int rpb = gemv_rows_per_block();
+    dim3 grid((M + rpb - 1) / rpb, N);
+    gemm_dense_batched_kernel<<<grid, rpb * 32, 0, stream>>>(out, Wd, wtype, x, M, N, K, rpb);
 }
 
 }  // namespace jllm

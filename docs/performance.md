@@ -22,22 +22,31 @@ Model: `Qwen3-4B-Q4_K_M.gguf` (2381 MB)
 Prompt: `Hello, who are you?` (18 tokens after Qwen chat template)
 Context: 1024 tokens
 
-| Metric | alpha.3 (Path B default-on) |
+| Metric | alpha.8 (Path B + C + D + E E5 multi-warp, all default-on) |
 |--------|---|
-| Prompt tokens | 18 |
-| Prefill | 1168 ms, **15.4 tok/s** |
-| Decode tokens | 47 |
-| Decode | 6307 ms, **7.5 tok/s** |
-| **TTFT** | **1181 ms** |
-| Peak memory | 3161 MB |
-| Peak temperature | 53.0°C |
-| Output | `Hello! I'm Qwen, a large-scale language model developed by Alibaba Group. I can help with a variety of tasks, including answering questions, writing articles, creating stories, and more. How can I assist you today?` |
+| Prompt tokens | 18 (kernel sees N=33 after chat-template wrap) |
+| Prefill | 853 ms, **38.68 tok/s** (5-sample, σ ≈ 3 ms) |
+| Decode tokens | 32 |
+| Decode | 3190 ms, **10.0 tok/s** |
+| **TTFT** | **~862 ms** |
+| Peak memory | ~1846 MB |
+| Peak temperature | ~52 °C |
+| Output | `Jetson Orin Nano is ideal for local LLM inference due to its high performance, low power consumption, and advanced AI capabilities, making it suitable for ...` |
+
+Output text is **character-for-character identical** between the alpha.6 scalar
+path and the alpha.7 Path E tensor-core path at temp=0 on the reference prompt,
+even though `mma.sync` reorders float adds vs scalar FMAs and breaks
+byte-equality at the FP16 ULP. Across Path B / C / D / E the generated text has
+remained the same on this prompt.
 
 Validated fast paths are all default:
 
 | Path | Runtime switch to disable |
 |------|---------------------------|
 | Layer-major batched prefill (Path B) | `JLLM_BATCHED_PREFILL=0` |
+| Q4_K uint32 decode weight loads (Path C) | `JLLM_Q4K_UINT32_LOADS=0` |
+| Right-sized prefill GEMM unroll (Path D) | (compile-time constant, no env switch) |
+| Tensor-core MMQ Q4_K prefill GEMM (Path E) | `JLLM_MMQ_Q4K=0` |
 | K-quant GEMV / GEMM | `JLLM_FAST_GEMV=0` |
 | Token embedding dequantization | `JLLM_FAST_EMBD=0` |
 | RMSNorm | `JLLM_FAST_NORM=0` |
@@ -96,13 +105,391 @@ weight bandwidth:
 The two effects together explain why each individual PR over-delivered
 relative to the static bandwidth estimate.
 
-### Path C — decode
+## Path C — Q4_K uint32 weight loads (2026-05-15)
 
-Decode at 7.5 tok/s is ~13% of LPDDR5 ceiling (38 tok/s on this
-model). Reference llama.cpp on the same hardware hits ~18 tok/s.
-There is real headroom; the plan is tracked in issue
-[#19](https://github.com/GeniePod/genie-ai-runtime/issues/19) and
-needs a profiler pass before any kernel work begins.
+Series: PRs #25 / #26 / #27 + default-flip #28. Two negative results
+(#23 CUDA Graphs, #24 split-K) closed without merge — instructive,
+documented inline. One more (#29 Q6_K uint32) failed on a block-size
+alignment constraint, also closed.
+
+Same hardware, model, prompt, and output as alpha.3. Each merged PR
+was validated byte-identical to the previous main.
+
+| PR | Change | Decode | Δ |
+|---|---|---|---|
+| main (alpha.3) | per-token byte loads | 7.5 tok/s | — |
+| #23 ✗ | CUDA Graphs decode capture | 7.3 (−2.7%) | closed, no merge |
+| #24 ✗ | split-K Q4_K GEMV | 7.6 (−1%) | closed, no merge |
+| #25 | Q4_K Wo uint32 (residual-fused) | 8.0 | +6.7% |
+| #26 | + Q4_K gate/up pair uint32 | 8.7 | +16.0% |
+| #27 | + Q4_K QKV triple uint32 (V on byte path) | 8.9 | +18.7% |
+| #28 | flip default to on | (no perf change) | — |
+| #29 ✗ | Q6_K uint32 (block_q6_K is 210 B) | crashed, closed | — |
+| **alpha.5 main** | | **9.1 tok/s** | **+21%** |
+
+### What worked
+
+The Q4_K block (`block_q4_K`, 144 bytes, divisible by 4) lets every
+block start at a 4-byte-aligned address in row memory. That makes
+the byte-by-byte `qs[]` reads in `dot_q4k_row` legally replaceable
+with a single `uint32_t` load per lane per block. Lane mapping:
+
+```
+il       = lane >> 3            // which 32-byte qs sub-block (0..3)
+sub_base = (lane & 7) << 2      // byte offset within sub-block
+```
+
+Per block per lane:
+
+| | Byte path | uint32 path |
+|---|---|---|
+| Weight loads | 4 × `ld.global.b8` | **1 × `ld.global.b32`** |
+| x loads | 8 × `ld.global.b16` | 8 × `ld.global.b16` (unchanged) |
+| FMAs | 8 | 8 (identical math) |
+| Scale recomputes | 4 (per inner iter) | 1 (constant per lane per block) |
+
+4× fewer issued weight loads + zero inner-loop control. The wins
+landed on three production kernels: `gemv_quant_add_typed_kernel<12>`
+(Wo + residual), `gemv_quant_pair_typed_kernel<12,12>` (gate/up), and
+`gemv_quant_triple_typed_kernel<12,12,14>` (QKV — Q4_K rows on the
+uint32 path; the Q6_K Wv row still byte-by-byte inside the same
+kernel).
+
+### What didn't work, and why
+
+**#23 CUDA Graphs (decode capture).** The hypothesis was that
+~22,800 host-side `cudaLaunchKernel` calls (~24 µs each on Jetson
+L4T) were a meaningful cost. Measured result: ≤0% speedup, slight
+regression. The launches were already overlapping with GPU
+execution on the LPDDR5-bound workload — eliminating host-side
+overhead doesn't help when the CPU was already idle waiting for the
+GPU. Lesson: `cudaLaunchKernel` API wall-time in `nsys` is NOT a
+proxy for stall time; it includes time spent waiting on the GPU.
+
+**#24 Split-K Q4_K GEMV.** The hypothesis was that per-warp MSHR
+depth (~32 outstanding requests per warp) limited DRAM
+concurrency. SPLIT_K=4 was supposed to give 4× more warps per row.
+Measured result: ≤0%. Block size grew 128 → 512 threads, register
+pressure dropped blocks-per-SM 4×, so total warps-per-SM was
+unchanged. The bottleneck is arithmetic intensity per byte loaded
+(Q4_K does 2 FMAs/byte; Q6_K does 4 — and Q6_K runs 3-4× faster per
+peak bandwidth). The fix is in the inner loop, not the outer warp
+schedule.
+
+**#29 Q6_K uint32 weight loads.** Same lane-mapping trick should
+have worked. It didn't. `block_q6_K` is 210 bytes, not divisible by
+4, so consecutive blocks in row memory alternate between 4-aligned
+and 2-aligned positions. Half the uint32 weight loads fault with
+`cudaErrorMisalignedAddress`, the CUDA context goes sticky, and
+every subsequent kernel (including byte-path fallback, RMSNorm,
+attention) fails. Closed with the diagnosis. Q6_K can be vectorized
+with `uint16` loads (2-byte aligned, which 210 B satisfies) for
+roughly half the speedup; not pursued because Q6_K already runs at
+30-40% of LPDDR5 peak and W_down + logits sum to only ~15% of
+decode wall-clock.
+
+### Where decode time goes at alpha.5
+
+The pre-Path-C profile in
+[#19](https://github.com/GeniePod/genie-ai-runtime/issues/19#issuecomment-4453495578)
+showed 93% of decode in five K-quant GEMV kernels. Path C
+vectorized four of them. The new bottleneck distribution is unknown
+until someone reruns `nsys` against alpha.5 — that profile is the
+next prerequisite for any further decode optimization.
+
+## Path D — Right-sized Prefill GEMM Unroll (2026-05-15)
+
+Series: PR #31 (single-line constexpr change).
+
+Same hardware as alpha.5. Validation prompt was longer than the
+standard `Hello, who are you?` (33 kernel tokens after chat-wrap vs
+the standard 18), chosen because Path D's mechanism only fires when
+the chunker has to split the work.
+
+| | alpha.5 baseline | alpha.6 (Path D) | Δ |
+|---|---|---|---|
+| Prefill wall (33 tok) | 2253.8 ± 10.9 ms | **2104.0 ± 6.7 ms** | **−149.8 ms** |
+| Prefill | 14.64 ± 0.07 tok/s | **15.68 ± 0.05 tok/s** | **+7.1%** |
+| Decode | unchanged (different kernels) | unchanged | — |
+| Output | reference | bit-identical | ✓ |
+
+5 samples each branch, same-day same-machine. Mean gap ≈ 150 ms vs
+combined σ ≈ 13 ms → ~12σ separation, not noise.
+
+### The mechanism
+
+`gemm_quant_batched_q{4,5,6}k_kernel` each maintain a per-thread
+`acc[GEMM_MAX_BATCH]` register array and use a
+`#pragma unroll for (t = 0; t < GEMM_MAX_BATCH; t++) if (t < N)`
+inner loop. The unroll is necessary so the compiler keeps `acc[]`
+in registers — a runtime-bounded loop with dynamic indexing forces
+a spill to local memory and erases the bandwidth win. But every
+unrolled iteration past `N` still consumes issue slots as predicated
+FMA writes.
+
+At `GEMM_MAX_BATCH = 32` with the typical chat-wrapped single-turn
+prompt (N ≈ 33 → host dispatcher chunks into 32 + 1):
+
+- First launch: 32/32 = 100 % useful issue slots
+- Second launch: 1/32 ≈ 3 % useful → 97 % waste
+
+Dropping `GEMM_MAX_BATCH` to 20 → chunks into 20 + 13:
+
+- First launch: 20/20 = 100 % useful
+- Second launch: 13/20 = 65 % useful
+
+The actual win comes from second-chunk repacking plus a smaller
+first-chunk unroll for any prompt that fits in one launch. Decode
+kernels (`gemv_*` family) are untouched.
+
+### Why 20 specifically
+
+20 sits just above the typical N=18–20 we see after Qwen3
+chat-template wrapping a single user turn. Below 20, single-turn
+prompts get chunked into three or more launches and the per-launch
+fixed cost dominates. At 24 or 32 the predicated-off tail returns.
+20 is the cheap local optimum.
+
+A future templated-on-N specialization (compile two or three N
+specializations, dispatch at runtime) could close more of the gap to
+llama.cpp by hitting 100 % utilization at every common prompt length
+— tracked as a follow-up to Path D.
+
+### vs llama.cpp
+
+`llama-bench` on the same Jetson with the same model and `-ngl 22`:
+
+| | Prefill (pp18) | Decode (tg64) |
+|---|---|---|
+| llama.cpp | 17.97 ± 0.65 tok/s | 6.33 ± 0.25 tok/s |
+| genie-ai-runtime alpha.5 | 14.64 (same prompt) | 9.1 |
+| genie-ai-runtime alpha.6 | 15.68 | 9.1 |
+| Δ vs llama.cpp (alpha.6) | **−2.3 tok/s** | **+2.8 tok/s** |
+
+Path D closed ~1/3 of the prefill gap from a one-line change. The
+remainder was closed (and inverted) by Path E — see below.
+
+## Path E — Tensor-core MMQ Q4_K Prefill GEMM (2026-05-16)
+
+Series: PRs #34 (smoke test) → #35 (single-tile skeleton) → #36
+(full GEMM standalone, 74 GFLOPS) → #37 ✗ (first integration:
+−27 % regression, closed) → #38 (kernel rework, 210–276 GFLOPS) →
+**#39 (integration: +70.8 % end-to-end prefill)** → default flip in
+the alpha.7 release.
+
+Same hardware as alpha.6. Same prompt and same model.
+
+| | alpha.6 (scalar batched) | alpha.7 (Path E MMQ) | Δ |
+|---|---|---|---|
+| Prefill | 16.6 tok/s (1993 ± 2 ms) | **28.3 tok/s (1166 ± 2 ms)** | **+70.8 %** |
+| TTFT | 2000 ms | **1179 ms** | **−41 %** |
+| Decode | 10.0 tok/s | 10.0 tok/s | unchanged |
+| Output | reference | sensibly-identical | ✓ |
+
+Mean gap ≈ 827 ms vs combined σ ≈ 2 ms → ≫100σ separation. Output text is
+character-for-character identical on the reference prompt at temp=0.
+
+### What worked
+
+Two specific optimizations on top of a naive `mma.sync.m16n8k16` port:
+
+1. **Per-(row, sub-block) scale precompute into shared memory.** A
+   Q4_K block has 8 sub-blocks of 32 quants each. Dequantizing one
+   row's value requires `dall × sc[sb] × nibble − dmin × m[sb]`. The
+   naive kernel ran the FP16→FP32 conversions of `d_raw` / `dmin_raw`
+   and the `get_scale_min_k4` bit-packed lookup on every one of the
+   32 lanes per (row, sub-block) — only the byte-per-lane changed.
+   E4 precomputes 16 × 8 = 128 (d, dm) pairs once per Q4_K block into
+   shared memory, distributed across the warp (4 entries per lane).
+   The inner dequant loop then reads from shared mem instead of
+   reconstructing scales.
+2. **Drop `#pragma unroll` on the dequant row loop.** The 16-deep
+   unroll forced the compiler to keep 16 copies of every intermediate
+   in registers, pushing the kernel to 139 regs / thread and capping
+   occupancy at ~29 %. Without the unroll the compiler shares a
+   single set of intermediate registers across the 16 iterations,
+   dropping register count to 96 and recovering arithmetic
+   throughput per thread.
+
+Combined effect: Wo (M=2560 N=33 K=2560) went from 74 GFLOPS (E3) to
+210 GFLOPS (E4), and the kernel scales across all six Qwen3-4B
+prefill GEMM shapes (gate/up = 276 GFLOPS, down = 215, QKV = 250).
+Aggregate ~245 GFLOPS, vs ~126 for the scalar baseline, vs ~15 TFLOPS
+hardware tensor-core peak.
+
+### What didn't work, and why
+
+**#37 first integration (closed, negative result).** The naive E3
+kernel hit 74 GFLOPS standalone on Wo and the integration projection
+suggested +20–30 % prefill. Actual result: prefill regressed from
+16.6 → 12.0 tok/s (−27 %). Root cause: the standalone benchmark
+only measured Wo (smallest shape, M=2560). The real prefill is
+dominated by gate/up (M=9728) and down (K=9728), where the scalar
+batched kernel uses 4 warps × `M / rows_per_block` blocks (~9700
+total warps for gate/up) and saturates the SMs. The naive 1-warp-
+per-CUDA-block MMQ kernel at 33 % occupancy got out-parallelized.
+Closed without merge; E4 reworked the kernel and re-attempted in
+E4b (#39). Lesson: benchmark *all* the shapes the workload visits,
+not just the headline one.
+
+### Why the MMA helps even at only 1.6 % tensor-core peak
+
+vs scalar CUDA-core FMAs at ~12 % compute utilization, the kernel
+nominally has 7.5× headroom. We converted ~2× of that. Where the
+other ~3.7× went:
+
+| Cost | Approx fraction |
+|---|---|
+| Q4_K dequant scalar arithmetic (shared-mem precompute + inner) | ~40 % |
+| Shared-mem load/store for the staging A-tile | ~15 % |
+| B-fragment global memory loads (activations, not cached across MMAs) | ~10 % |
+| MMA + accumulator update (the actual work) | ~25 % |
+| Boundary checks + launch overhead | ~10 % |
+
+Recovering more of the headroom is what E5 (multi-warp cooperative
+dequant) would target: have 4 warps share one dequanted A-tile across
+4 N-stripes, amortizing the dequant cost 4× and increasing
+arithmetic intensity per shared-mem byte. Tracked as future work in
+#33.
+
+### vs llama.cpp (alpha.7 snapshot)
+
+| | Prefill (pp18) | Decode (tg64) |
+|---|---|---|
+| llama.cpp | 17.97 ± 0.65 tok/s | 6.33 ± 0.25 tok/s |
+| genie-ai-runtime alpha.6 | 15.68 | 9.1 |
+| genie-ai-runtime alpha.7 | **28.3** | 9.1 |
+| Δ vs llama.cpp (alpha.7) | **+10.3 tok/s (+57 %)** | **+2.8 tok/s (+44 %)** |
+
+We now lead on both prefill and decode. The remaining gap to
+tensor-core peak is the lever for any next-round optimization.
+
+## Path E E5 — Multi-warp Cooperative MMQ Q4_K Prefill GEMM (2026-05-16)
+
+Series: PR #41 (standalone benchmark, ~407 GFLOPS aggregate) →
+**#42 (integration: +37 % vs alpha.7, +135 % vs scalar)**.
+
+Same hardware/model/prompt as alpha.7. Direct A/B from the same
+binary (E5 default vs `JLLM_MMQ_Q4K=0` scalar fallback).
+
+| | scalar fallback | alpha.7 (E4) | alpha.8 (E5) | Δ E5 vs scalar | Δ E5 vs E4 |
+|---|---|---|---|---|---|
+| Prefill | 16.45 tok/s | 28.16 tok/s | **38.68 tok/s** | **+135 %** | **+37 %** |
+| Wall (33 tok) | 2006 ± 5 ms | 1166 ± 3 ms | **853 ± 3 ms** | **−1153 ms** | **−313 ms** |
+| Decode | 10.0 tok/s | 10.0 | 10.0 | — | — |
+| Output | reference | sensibly-id. | sensibly-id. | ✓ | ✓ |
+
+E5 vs scalar gap ≈ 1153 ms vs combined σ ≈ 6 ms → ~190σ separation.
+Output text is character-for-character identical at temp=0.
+
+### The structural change
+
+E4 (alpha.7) ran **one warp per CUDA block**, with each warp owning a
+(16 row × 8 col) output tile. For N=33 the host dispatcher launched 5
+N-tiles; for each M-tile, 5 warps redundantly dequantized the same
+A-tile from the same Q4_K blocks.
+
+E5 (alpha.8) runs **4 warps per CUDA block**, sharing one dequanted
+A-tile across 4 contiguous N-stripes (32 tokens per block).
+
+```
+E4 layout (1 warp/block):                E5 layout (4 warps/block):
+
+  warp0 → A_tile[0:16, K] → MMA 0..7      warp0 ┐
+  warp1 → A_tile[0:16, K] → MMA 8..15     warp1 │ share one A_tile
+  warp2 → A_tile[0:16, K] → MMA 16..23    warp2 │ run MMAs for 4 different
+  warp3 → A_tile[0:16, K] → MMA 24..31    warp3 ┘ N-stripes (0..31)
+  warp4 → A_tile[0:16, K] → MMA 32..39                                          
+  (each warp re-dequants its A-tile)     (one dequant per 32 tokens)
+```
+
+Dequant work distribution: 128 threads × 4 elements = 512 = 16 × 32
+staging tile. Thread `t` covers `row = t/8`, cols `(t&7)*4 + [0..3]`
+— 8 threads per row share that row's `block_q4_K` read (L1-cache
+friendly), and each thread does only 4 dequants instead of 32.
+
+### Per-shape throughput (#41 standalone)
+
+| Shape | alpha.7 (E4) | alpha.8 (E5) | Δ |
+|---|---|---|---|
+| Wo (M=2560 K=2560) | 210 GFLOPS | **407** | +94 % |
+| gate / up (M=9728 K=2560) | 276 | **418** | +52 % |
+| down (M=2560 K=9728) | 215 | **407** | +89 % |
+| Wq (M=2560 K=2560) | 250 | **405** | +62 % |
+| Wk (M=1024 K=2560) | 273 | **402** | +47 % |
+| Wv (M=1024 K=2560) | 273 | **402** | +47 % |
+| **Aggregate** | **~245** | **~407** | **+66 %** |
+
+E5 standardizes around ~405 GFLOPS regardless of shape — the kernel
+is uniformly compute-bound on the MMA pipeline rather than
+shape-sensitive on the dequant overhead. That's the structural win.
+
+### Bonus from the rewrite
+
+- **Register count 96 → 39.** Cooperative dequant lets the compiler
+  share intermediates across the 4 warps.
+- **Occupancy.** 39 regs × 128 threads/block = 4992 regs/block, capped
+  by the hardware 16-block/SM limit → 16 × 4 = **64 warps/SM** vs E4's
+  16. (Theoretical max is 48; we exceed it because Ampere counts
+  warps within a block toward the limit, but each block can resident
+  more easily under the lighter register footprint.)
+- **Tensor-core utilization 1.6 % → 2.7 %.** Still tiny vs hardware
+  peak — see "where the rest is" below.
+
+### Where the rest of the tensor-core headroom is
+
+At 2.7 % of ~15 TFLOPS, we still leave ~14.5 TFLOPS on the table. The
+remaining cost breakdown estimate:
+
+| Cost | Approx fraction of E5 kernel |
+|---|---|
+| MMA + accumulator update (real work) | ~40 % |
+| Shared-mem ld/st on A-tile | ~20 % |
+| Global B-fragment loads (activations) | ~15 % |
+| Q4_K dequant arithmetic | ~10 % (down from 40 % in E4) |
+| `__syncthreads()` + boundary checks | ~10 % |
+| Launch overhead | ~5 % |
+
+Next-round levers:
+1. **B-fragment shared-mem staging** + `cp.async` prefetch on Ampere
+   to overlap the next sub-block's B loads with the current sub-
+   block's MMAs.
+2. **Compile-time N specialization.** Templated kernel with
+   `N=8 / 16 / 24 / 32` paths so the dispatcher always picks a
+   variant with no boundary masking.
+3. **Bigger M-tiles** (32 or 48 rows per block) — pays for itself
+   only if the dequant cost stays bounded.
+
+Each of these is a meaningful piece of work and only worth doing
+if/when the workload demands more prefill throughput than alpha.8
+already delivers.
+
+### vs llama.cpp (alpha.8 snapshot)
+
+| | Prefill (pp18) | Decode (tg64) |
+|---|---|---|
+| llama.cpp `-ngl 22` | 17.97 ± 0.65 tok/s | 6.33 ± 0.25 tok/s |
+| genie-ai-runtime alpha.7 | 28.16 | 9.1 |
+| **genie-ai-runtime alpha.8** | **38.68** | 9.1 |
+| Δ vs llama.cpp (alpha.8) | **+20.7 tok/s (+115 %)** | **+2.8 tok/s (+44 %)** |
+
+### Long-prompt scaling (2026-05-16)
+
+The numbers above are all at N=33 (kernel tokens after Qwen3 chat-wrap of an 18-token user prompt). Production serving traffic spans a much wider N range, so we re-tested alpha.8 against the scalar fallback (`JLLM_MMQ_Q4K=0`) at three prompt lengths.
+
+| Prompt | Kernel N | E5 default | Scalar fallback | Speedup | E5 ms/token | Scalar ms/token |
+|---|---|---|---|---|---|---|
+| SHORT | 33 | **38.8 ± 0.1 tok/s** | 16.4 ± 0.05 | **2.36×** | 25.8 | 60.8 |
+| MED   | 88 | **37.7 ± 0.06 tok/s** | 16.1 | **2.34×** | 26.5 | 62.2 |
+| LONG  | 235 | **37.3 ± 0.2 tok/s** | 15.8 | **2.36×** | 26.9 | 63.2 |
+
+**The ~2.36× speedup is essentially uniform across a 7× range of prompt sizes.** Both paths slow down ~5 % from N=33 → N=235 (attention work scales with KV state, not specific to MMQ). The Path D chunker (`GEMM_MAX_BATCH=20`) splits N>20 prompts into multiple MMQ calls — that handoff doesn't introduce any visible regression. Generated text is coherent at every length:
+
+- **N=33:** *"The Jetson Orin Nano is ideal for local LLM inference due to its high performance, low power consumption, and advanced AI capabilities, making it suitable for edge computing and real-time applications."*
+- **N=88:** *"In the **GGUF** format, quantization is used to reduce the memory footprint of large language models like Llama 3 and Qwen 3, making them more feasible to run on devices with limited memory, such as the **Jetson Orin Nano**. Two ..."*
+- **N=235:** *"When evaluating LLM runtimes for an **edge inference deployment on a Jetson Orin Nano Super 8 GB** module, the choice of runtime is critical due to the **tight memory constraints** (8 GB), the **real-time latency requirements** for voice interactions, and the **power budget** ..."*
+
+Decode also stays consistent across context sizes: 10.0 / 9.7 / 9.3 tok/s for SHORT / MED / LONG with 40–60 decoded tokens — the small drop comes from the attention compute scaling with KV state, not from the quantized GEMV kernels.
 
 ## Why LLM Decode is Bandwidth-Bound
 

@@ -8,7 +8,7 @@
 #include <signal.h>
 
 namespace jllm {
-void run_server(Engine& engine, int port);
+void run_server(Engine& engine, int port, bool default_kv_int8);
 }
 
 static jllm::Engine* g_engine = nullptr;
@@ -30,6 +30,13 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "-c") == 0 && i+1 < argc) context = atoi(argv[++i]);
         else if (strcmp(argv[i], "--int8-kv") == 0) kv_int8 = true;
         else if (strcmp(argv[i], "--fp16-kv") == 0) kv_int8 = false;
+        else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
+#ifndef JLLM_VERSION
+#define JLLM_VERSION "dev"
+#endif
+            fprintf(stdout, "genie-ai-runtime / jetson-llm-server %s\n", JLLM_VERSION);
+            return 0;
+        }
         else if (strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
                 "jetson-llm-server — OpenAI-compatible LLM API for Jetson\n\n"
@@ -37,8 +44,11 @@ int main(int argc, char** argv) {
                 "  -m PATH      GGUF model (required)\n"
                 "  -p PORT      HTTP port (default: 8080)\n"
                 "  -c INT       Context length (0 = auto from memory)\n"
-                "  --int8-kv    Use experimental INT8 KV cache\n"
-                "  --fp16-kv    Use FP16 KV cache (default)\n\n"
+                "  --int8-kv    Use INT8 KV cache (default flipped on CLI in alpha.12;\n"
+                "               server keeps FP16 default so /v1 requests with\n"
+                "               conversation_id continue to persist — Path F v2\n"
+                "               doesn't carry INT8 scales yet, see issue #67).\n"
+                "  --fp16-kv    Use FP16 KV cache (default for the server).\n\n"
                 "Endpoints:\n"
                 "  GET  /health                  Jetson system health\n"
                 "  GET  /v1/models               List loaded model\n"
@@ -76,7 +86,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Start server
-    jllm::run_server(engine, port);
+    // Start server. Pass the load-time kv_int8 so per-request GenParams
+    // built inside the handlers default to the matching format — see
+    // http_server.cpp comment for why a mismatch here corrupts decode.
+    jllm::run_server(engine, port, kv_int8);
     return 0;
 }

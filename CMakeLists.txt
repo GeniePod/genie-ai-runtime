@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(jetson-llm LANGUAGES C CXX CUDA)
+project(jetson-llm VERSION 1.0.0 LANGUAGES C CXX CUDA)
+
+# Compile-time JLLM_VERSION string for CLI / server --version output.
+add_compile_definitions(JLLM_VERSION="${PROJECT_VERSION}")
 
 # ── Jetson ONLY — no x86, no discrete GPU, no Windows ────────────────────
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
@@ -76,7 +79,14 @@ set(ENGINE_SRC
     src/engine/model.cpp
     src/engine/decode.cu
     src/engine/sample.cpp
+    src/engine/grammar.cpp
     src/engine/tokenizer.cpp
+)
+
+# Path F (#45): persistent KV cache I/O. On-disk format from PR #46;
+# F3 hooks save into Engine::generate() turn-end; F4 will add load.
+set(PERSISTENCE_SRC
+    src/persistence/kv_cache_file.cpp
 )
 
 set(SERVER_SRC
@@ -85,7 +95,7 @@ set(SERVER_SRC
 
 # ── Library ──────────────────────────────────────────────────────────────
 add_library(jetson_llm_core STATIC
-    ${MEMORY_SRC} ${JETSON_SRC} ${KERNEL_SRC} ${ENGINE_SRC}
+    ${MEMORY_SRC} ${JETSON_SRC} ${KERNEL_SRC} ${ENGINE_SRC} ${PERSISTENCE_SRC}
 )
 target_include_directories(jetson_llm_core PUBLIC include)
 target_link_libraries(jetson_llm_core PUBLIC
@@ -105,11 +115,54 @@ if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
     set_property(TARGET jetson-llm PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
-# ── Server binary ────────────────────────────────────────────────────────
-add_executable(jetson-llm-server src/main_server.cpp ${SERVER_SRC})
-target_link_libraries(jetson-llm-server PRIVATE jetson_llm_core)
-if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
-    set_property(TARGET jetson-llm-server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+# ── Optional server binary ───────────────────────────────────────────────
+# The standalone HTTP server is OFF by default. genie-ai-runtime ships as
+# an embeddable engine (jetson_llm_core + the CLI); the web/HTTP layer
+# lives in genie-claw, which links jetson_llm_core directly. Enable with
+# -DJLLM_BUILD_SERVER=ON for standalone REST deployments or A/B testing
+# against llama-server. Skipping it also skips the FetchContent network
+# pull, so the default build is offline once dependencies are vendored
+# by JetPack / apt.
+option(JLLM_BUILD_SERVER
+    "Build the standalone jetson-llm-server REST binary (default OFF — genie-claw embeds the engine directly; turn ON for standalone HTTP)"
+    OFF)
+
+if(JLLM_BUILD_SERVER)
+    # cpp-httplib + nlohmann/json — same stack llama.cpp's server uses.
+    # Both header-only and MIT-licensed. Pulled at configure time via
+    # FetchContent so we don't carry ~50 K lines of vendor code in this
+    # repo; cached under build/_deps after first configure (subsequent
+    # builds are offline). First-time configure needs network access on
+    # the host doing the build.
+    include(FetchContent)
+    FetchContent_Declare(
+        httplib
+        GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+        GIT_TAG        v0.15.3
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_Declare(
+        nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG        v3.11.3
+        GIT_SHALLOW    TRUE
+    )
+    set(JSON_BuildTests OFF CACHE INTERNAL "")
+    set(JSON_Install    OFF CACHE INTERNAL "")
+    FetchContent_MakeAvailable(httplib nlohmann_json)
+
+    add_executable(jetson-llm-server src/main_server.cpp ${SERVER_SRC})
+    target_link_libraries(jetson-llm-server PRIVATE
+        jetson_llm_core
+        httplib::httplib
+        nlohmann_json::nlohmann_json
+    )
+    if(JLLM_IPO_SUPPORTED AND CMAKE_BUILD_TYPE STREQUAL "Release")
+        set_property(TARGET jetson-llm-server PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif()
+    message(STATUS "jetson-llm-server: ENABLED (cpp-httplib + nlohmann/json via FetchContent)")
+else()
+    message(STATUS "jetson-llm-server: disabled (pass -DJLLM_BUILD_SERVER=ON to enable)")
 endif()
 
 # ── Tests ────────────────────────────────────────────────────────────────
@@ -118,6 +171,11 @@ add_executable(test_memory tests/test_memory.cpp)
 target_link_libraries(test_memory PRIVATE jetson_llm_core)
 add_test(NAME memory COMMAND test_memory)
 
+# #86: GBNF grammar engine — pure host C++, no GPU needed to run.
+add_executable(test_grammar tests/test_grammar.cpp)
+target_link_libraries(test_grammar PRIVATE jetson_llm_core)
+add_test(NAME grammar COMMAND test_grammar)
+
 add_executable(test_kernels tests/test_kernels.cu)
 target_link_libraries(test_kernels PRIVATE jetson_llm_core)
 add_test(NAME kernels COMMAND test_kernels)
@@ -125,3 +183,110 @@ add_test(NAME kernels COMMAND test_kernels)
 add_executable(test_model_load tests/test_model_load.cpp)
 target_link_libraries(test_model_load PRIVATE jetson_llm_core)
 # Run with: ./build/test_model_load model.gguf
+
+# Path E phase E1 smoke test: validate `mma.sync.m16n8k16` on SM 8.7.
+# Standalone — does not link jetson_llm_core, intentionally so the smoke
+# test can compile and run even if the runtime is broken.
+add_executable(test_mma_smoke tests/test_mma_smoke.cu)
+target_link_libraries(test_mma_smoke PRIVATE CUDA::cudart)
+add_test(NAME mma_smoke COMMAND test_mma_smoke)
+
+# Path E phase E2: minimal Q4_K dequant + tensor-core MMQ tile.
+# Standalone for the same reason as E1 — exercises the math + fragment
+# layout in isolation before integration into the prefill dispatcher.
+add_executable(test_mmq_q4k_tile tests/test_mmq_q4k_tile.cu)
+target_link_libraries(test_mmq_q4k_tile PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_tile COMMAND test_mmq_q4k_tile)
+
+# Path E phase E3: full-size Q4_K MMQ GEMM kernel (arbitrary M / N / K).
+# Standalone, runs a small correctness check + a Qwen3-4B Wo shape
+# throughput benchmark. No engine integration yet — that lands in E3b.
+add_executable(test_mmq_q4k_gemm tests/test_mmq_q4k_gemm.cu)
+target_link_libraries(test_mmq_q4k_gemm PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_gemm COMMAND test_mmq_q4k_gemm)
+
+# Path E phase E4: MMQ Q4_K kernel with per-(row, sb) scale precompute
+# and the `#pragma unroll` removed from the dequant row loop. Targets
+# register pressure (139 → ~50–60) and per-lane redundant arithmetic
+# (32× → 1× for scale recomputes). Benchmarks the full set of Qwen3-4B
+# prefill GEMM shapes (Wo, gate/up, down, QKV) so we can see whether
+# the speedup holds across the integrated mix, not just on Wo.
+add_executable(test_mmq_q4k_precompute tests/test_mmq_q4k_precompute.cu)
+target_link_libraries(test_mmq_q4k_precompute PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_precompute COMMAND test_mmq_q4k_precompute)
+
+# Path E phase E5: multi-warp cooperative MMQ Q4_K kernel. 4 warps per
+# CUDA block share one dequanted 16x32 A-tile across 4 N-stripes. Per
+# the alpha.7 perf doc dequant is ~40 % of kernel time → 4× amortization
+# predicts a 1.43× kernel speedup. Standalone bench mirrors E4's so the
+# GFLOPS numbers are directly comparable.
+add_executable(test_mmq_q4k_multiwarp tests/test_mmq_q4k_multiwarp.cu)
+target_link_libraries(test_mmq_q4k_multiwarp PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_multiwarp COMMAND test_mmq_q4k_multiwarp)
+
+# Path E phase E6: int8 tensor-core MMQ Q4_K kernel. Replaces the E5 f16
+# mma.m16n8k16 (dequant->fp16) with mma.m16n8k32.s8.s8.s32 on raw nibbles x
+# q8_1 activations, scales applied in a float epilogue. Validates against an
+# int8 reference (tight) and reports the q8_1 quant error vs the fp16 ref.
+add_executable(test_mmq_q4k_int8 tests/test_mmq_q4k_int8.cu)
+target_link_libraries(test_mmq_q4k_int8 PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_int8 COMMAND test_mmq_q4k_int8)
+
+# Path E6 Q6_K: int8 tensor-core MMQ for the ffn_down GEMM. mma.m16n8k16
+# (per 16-wide Q6_K scale group) on (q6-32) s8 weights x q8_1 activations,
+# d*scale*d8 epilogue (no min term). Validates vs an int8 reference.
+add_executable(test_mmq_q6k_int8 tests/test_mmq_q6k_int8.cu)
+target_link_libraries(test_mmq_q6k_int8 PRIVATE CUDA::cudart)
+add_test(NAME mmq_q6k_int8 COMMAND test_mmq_q6k_int8)
+
+# cp.async double-buffering for the int8-MMA Q4_K kernel: prefetch the next
+# K-block's weight tile into shared while the tensor cores work the current
+# one. Compares the baseline int8 kernel vs the cp.async-pipelined version.
+add_executable(test_mmq_q4k_cpasync tests/test_mmq_q4k_cpasync.cu)
+target_link_libraries(test_mmq_q4k_cpasync PRIVATE CUDA::cudart)
+add_test(NAME mmq_q4k_cpasync COMMAND test_mmq_q4k_cpasync)
+
+# cp.async for the int8-MMA Q6_K (ffn_down) kernel. Q6_K's 210 B block is not
+# 16-aligned in the weight array, so cp.async needs the weights repacked into a
+# padded 224 B (=14x16) stride first; this test validates that approach and
+# measures the gain (reference for a future engine integration).
+add_executable(test_mmq_q6k_cpasync tests/test_mmq_q6k_cpasync.cu)
+target_link_libraries(test_mmq_q6k_cpasync PRIVATE CUDA::cudart)
+add_test(NAME mmq_q6k_cpasync COMMAND test_mmq_q6k_cpasync)
+
+# Path F phase F1: KV cache serialization round-trip. Standalone test
+# that exercises the on-disk format (header + body) we'll use in F3 to
+# persist per-conversation KV state. No engine integration yet.
+add_executable(test_kv_serialize tests/test_kv_serialize.cu)
+target_link_libraries(test_kv_serialize PRIVATE CUDA::cudart)
+add_test(NAME kv_serialize COMMAND test_kv_serialize)
+
+# Path I phase I1 (#62): per-head INT8 scale storage in KVCachePool.
+# Allocation + accessor layout test. Engine wiring lands in I2/I3.
+add_executable(test_kv_scale_storage tests/test_kv_scale_storage.cu)
+target_link_libraries(test_kv_scale_storage PRIVATE jetson_llm_core)
+add_test(NAME kv_scale_storage COMMAND test_kv_scale_storage)
+
+# Path I phase I2 (#62): FP16 → INT8 conversion + per-head scale
+# capture via KVCachePool::kv_scale_ptr. Validates kernel correctness
+# (uninit row_max + nullptr scale_out fixes) AND the engine-style
+# call shape (rows=n_kv_heads, cols=head_dim).
+add_executable(test_kv_int8_convert tests/test_kv_int8_convert.cu)
+target_link_libraries(test_kv_int8_convert PRIVATE jetson_llm_core)
+add_test(NAME kv_int8_convert COMMAND test_kv_int8_convert)
+
+# Tiled flash-attention reference: one warp per query, K/V tiles reused from
+# shared across the query tile (vs the engine's one-query-per-block O(N^2)
+# memory). Validated vs a naive reference; 4-6x faster. Basis for the engine
+# port (int8 KV + head-dim templating).
+add_executable(test_flash_tiled tests/test_flash_tiled.cu)
+target_link_libraries(test_flash_tiled PRIVATE CUDA::cudart)
+add_test(NAME flash_tiled COMMAND test_flash_tiled)
+
+# Tensor-core flash-attention reference (wmma): S=Q@K^T and O=P@V via 16x16x16
+# f16 MMA, online softmax in shared. Validates the TC building blocks (correct
+# vs naive, max_abs 5e-4). First version keeps O in shared -> occupancy-bound;
+# the high-occupancy version (O in registers) is the remaining work.
+add_executable(test_flash_tc tests/test_flash_tc.cu)
+target_link_libraries(test_flash_tc PRIVATE CUDA::cudart)
+add_test(NAME flash_tc COMMAND test_flash_tc)

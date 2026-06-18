@@ -1,13 +1,13 @@
 // kv_cache.cpp — Pre-allocated KV cache with GPU/CPU tiering
 //
 // On Jetson unified memory:
-//   cudaMallocHost → pinned DRAM, GPU reads at full bandwidth, CPU can also read
-//   malloc         → pageable DRAM, GPU reads via page faults (slower, but doesn't OOM)
+//   cudaMalloc     → GPU-visible DRAM without managed-memory bookkeeping
+//   malloc         → pageable DRAM, CPU-side overflow storage
 //
 // Strategy:
-//   - "Fast pool" (cudaMallocHost): recent tokens, GPU reads at ~102 GB/s
-//   - "Overflow pool" (malloc): old tokens, GPU reads via page faults (~50 GB/s)
-//   - When fast pool full: evict oldest to overflow (just a memcpy within same DRAM)
+//   - "Fast pool" (cudaMalloc): recent tokens, GPU kernels read/write directly
+//   - "Overflow pool" (malloc): old tokens, copied back only if overflow is used
+//   - When fast pool full: evict oldest to overflow
 
 #include "jllm_memory.h"
 #include <cuda_runtime.h>
@@ -26,20 +26,23 @@ bool KVCachePool::init(const Config& cfg) {
     fprintf(stderr, "[kv_cache] Allocating fast pool: %ld MB (%d tokens)\n",
             fast_bytes / (1024*1024), cfg.max_context);
 
-    // Fast pool: unified memory (GPU + CPU access via same pointer,
-    // page-migration on demand). Same rationale as ScratchPool — on
-    // Tegra, cudaMallocHost's host pointer is NOT automatically GPU-
-    // visible without explicit mapping flags + a separate device-pointer
-    // lookup, and the symptom of getting that wrong is "kernel writes go
-    // nowhere visible to the CPU." cudaMallocManaged gives a single
-    // pointer that works from both sides.
-    cudaError_t err = cudaMallocManaged(&gpu_pool_, fast_bytes);
+    // Fast pool: device allocation. The KV cache is consumed by CUDA kernels
+    // and device-to-device copies; keeping it out of managed memory avoids
+    // UM bookkeeping and is easier to fit after device-resident weights.
+    cudaError_t err = cudaMalloc(&gpu_pool_, fast_bytes);
     if (err != cudaSuccess) {
-        fprintf(stderr, "[kv_cache] FATAL: cudaMallocManaged failed: %s\n",
+        fprintf(stderr, "[kv_cache] FATAL: cudaMalloc failed: %s\n",
                 cudaGetErrorString(err));
         return false;
     }
-    memset(gpu_pool_, 0, fast_bytes);
+    err = cudaMemset(gpu_pool_, 0, fast_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[kv_cache] FATAL: cudaMemset failed: %s\n",
+                cudaGetErrorString(err));
+        cudaFree(gpu_pool_);
+        gpu_pool_ = nullptr;
+        return false;
+    }
 
     // Overflow pool: regular malloc (optional)
     if (cfg.overflow_context > 0 && overflow_bytes > 0) {
@@ -54,15 +57,38 @@ bool KVCachePool::init(const Config& cfg) {
         }
     }
 
+    // Path I1: per-head INT8 scale storage. Only needed in INT8 mode;
+    // FP16 mode skips this allocation entirely.
+    if (cfg.kv_type_bytes == 1) {
+        const int64_t scales_bytes = kv_scales_bytes();
+        fprintf(stderr,
+                "[kv_cache] Allocating per-head INT8 scales: %ld KB "
+                "(%d layers × 2 K/V × %d ctx × %d kv_heads × 4 B)\n",
+                scales_bytes / 1024,
+                cfg.n_layers, cfg.max_context, cfg.n_kv_heads);
+        cudaError_t serr = cudaMalloc(&kv_scales_, (size_t)scales_bytes);
+        if (serr != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] WARNING: scales cudaMalloc failed (%s); "
+                            "INT8 KV will fall back to FP16 path\n",
+                    cudaGetErrorString(serr));
+            kv_scales_ = nullptr;
+            // Best-effort: don't fail init just because scales didn't fit.
+            // The engine should detect kv_scales_ == nullptr and not enable INT8.
+        } else {
+            cudaMemset(kv_scales_, 0, (size_t)scales_bytes);
+        }
+    }
+
     used_tokens_ = 0;
     gpu_tokens_ = 0;
     return true;
 }
 
 void KVCachePool::destroy() {
-    // cudaFree pairs with cudaMallocManaged (NOT cudaFreeHost).
-    if (gpu_pool_) { cudaFree(gpu_pool_); gpu_pool_ = nullptr; }
-    if (cpu_pool_) { free(cpu_pool_); cpu_pool_ = nullptr; }
+    // cudaFree pairs with cudaMalloc.
+    if (gpu_pool_)  { cudaFree(gpu_pool_);  gpu_pool_  = nullptr; }
+    if (cpu_pool_)  { free(cpu_pool_);      cpu_pool_  = nullptr; }
+    if (kv_scales_) { cudaFree(kv_scales_); kv_scales_ = nullptr; }   // Path I1
     used_tokens_ = 0;
     gpu_tokens_ = 0;
 }
@@ -109,13 +135,14 @@ void KVCachePool::evict(int n_tokens) {
         char* src = (char*)gpu_pool_ + l * (int64_t)cfg_.max_context * eb;
         char* dst = (char*)cpu_pool_ + l * (int64_t)cfg_.overflow_context * eb;
 
-        // Copy oldest n_tokens to overflow
-        memcpy(dst, src, n_tokens * eb);
+        // Copy oldest n_tokens to overflow.
+        cudaMemcpy(dst, src, n_tokens * eb, cudaMemcpyDeviceToHost);
 
         // Shift remaining in fast pool
         int remaining = gpu_tokens_ - n_tokens;
         if (remaining > 0) {
-            memmove(src, src + n_tokens * eb, remaining * eb);
+            cudaMemcpy(src, src + n_tokens * eb, remaining * eb,
+                       cudaMemcpyDeviceToDevice);
         }
     }
 
@@ -127,6 +154,130 @@ void KVCachePool::evict(int n_tokens) {
 void KVCachePool::clear() {
     used_tokens_ = 0;
     gpu_tokens_ = 0;
+}
+
+// Path F3b: per-layer gather of the populated portion into a packed
+// host buffer. dst layout:
+//
+//   per layer l in [0, n_layers):
+//     [ used_tokens × eb/2 key bytes  ]
+//     [ used_tokens × eb/2 value bytes ]
+//
+// where eb = entry_bytes() = 2 × n_kv_heads × head_dim × kv_type_bytes.
+// Within each layer slab in gpu_pool_, keys live at offset
+// [layer × max_context × eb, ...) and values follow at offset + max_context × eb/2.
+bool KVCachePool::gather_used_to_host(void* dst, int used_tokens) const {
+    if (!gpu_pool_ || used_tokens <= 0) return false;
+    if (used_tokens > cfg_.max_context) return false;
+
+    const int64_t eb       = entry_bytes();
+    const int64_t half_eb  = eb / 2;
+    const int64_t layer_in_stride  = (int64_t)cfg_.max_context * eb;
+    const int64_t layer_out_stride = (int64_t)used_tokens * eb;
+    const int64_t key_used_bytes   = (int64_t)used_tokens * half_eb;
+
+    uint8_t* d = static_cast<uint8_t*>(dst);
+    for (int l = 0; l < cfg_.n_layers; l++) {
+        const uint8_t* src_keys = static_cast<const uint8_t*>(gpu_pool_)
+                                  + l * layer_in_stride;
+        const uint8_t* src_vals = src_keys + (int64_t)cfg_.max_context * half_eb;
+
+        uint8_t* dst_keys = d + l * layer_out_stride;
+        uint8_t* dst_vals = dst_keys + key_used_bytes;
+
+        cudaError_t err;
+        err = cudaMemcpy(dst_keys, src_keys, key_used_bytes,
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] gather: layer %d keys D2H: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaMemcpy(dst_vals, src_vals, key_used_bytes,
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] gather: layer %d vals D2H: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool KVCachePool::scatter_from_host(const void* src, int used_tokens,
+                                    bool zero_remaining)
+{
+    if (!gpu_pool_ || used_tokens <= 0) return false;
+    if (used_tokens > cfg_.max_context) return false;
+
+    const int64_t eb               = entry_bytes();
+    const int64_t half_eb          = eb / 2;
+    const int64_t layer_out_stride = (int64_t)cfg_.max_context * eb;
+    const int64_t layer_in_stride  = (int64_t)used_tokens * eb;
+    const int64_t key_used_bytes   = (int64_t)used_tokens * half_eb;
+    const int64_t key_unused_bytes = (int64_t)(cfg_.max_context - used_tokens) * half_eb;
+
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    for (int l = 0; l < cfg_.n_layers; l++) {
+        uint8_t* dst_keys = static_cast<uint8_t*>(gpu_pool_) + l * layer_out_stride;
+        uint8_t* dst_vals = dst_keys + (int64_t)cfg_.max_context * half_eb;
+
+        const uint8_t* src_keys = s + l * layer_in_stride;
+        const uint8_t* src_vals = src_keys + key_used_bytes;
+
+        cudaError_t err;
+        err = cudaMemcpy(dst_keys, src_keys, key_used_bytes,
+                         cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] scatter: layer %d keys H2D: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaMemcpy(dst_vals, src_vals, key_used_bytes,
+                         cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[kv_cache] scatter: layer %d vals H2D: %s\n",
+                    l, cudaGetErrorString(err));
+            return false;
+        }
+        if (zero_remaining && key_unused_bytes > 0) {
+            err = cudaMemset(dst_keys + key_used_bytes, 0, key_unused_bytes);
+            if (err != cudaSuccess) return false;
+            err = cudaMemset(dst_vals + key_used_bytes, 0, key_unused_bytes);
+            if (err != cudaSuccess) return false;
+        }
+    }
+    used_tokens_ = used_tokens;
+    gpu_tokens_  = used_tokens;
+    return true;
+}
+
+// Path I phase I1 (#62): per-head INT8 scale accessors.
+
+int64_t KVCachePool::kv_scales_bytes() const {
+    if (cfg_.kv_type_bytes != 1) return 0;
+    return 2LL * cfg_.n_layers
+              * cfg_.max_context
+              * cfg_.n_kv_heads
+              * (int64_t)sizeof(float);
+}
+
+float* KVCachePool::kv_scale_ptr(int layer, int pos, bool is_value) {
+    if (!kv_scales_) return nullptr;
+    if (cfg_.kv_type_bytes != 1) return nullptr;
+    if (layer < 0 || layer >= cfg_.n_layers) return nullptr;
+    if (pos   < 0 || pos   >= cfg_.max_context) return nullptr;
+
+    // Layout per layer: [K_scales (max_context × n_kv_heads)]
+    //                   [V_scales (max_context × n_kv_heads)]
+    const int64_t per_kv_region = (int64_t)cfg_.max_context * cfg_.n_kv_heads;
+    const int64_t per_layer     = 2 * per_kv_region;
+    const int64_t per_pos       = (int64_t)cfg_.n_kv_heads;
+
+    const int64_t offset_floats = (int64_t)layer * per_layer
+                                + (is_value ? per_kv_region : 0)
+                                + (int64_t)pos * per_pos;
+    return kv_scales_ + offset_floats;
 }
 
 }  // namespace jllm
