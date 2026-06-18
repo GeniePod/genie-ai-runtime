@@ -2588,12 +2588,37 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
             scale_embedding(config_.spec, x_batch, chunk * H, config_.hidden_dim, stream_);
             half* ple_input_batch =
                 (half*)scratch_.get((int64_t)chunk * L * Dple * sizeof(half));
-            for (int i = 0; i < chunk; i++) {
-                const int64_t snap = scratch_.mark();
-                compute_gemma_ple_input(x_batch + (int64_t)i * H,
-                                        prompt_tokens[c0 + i],
-                                        ple_input_batch + (int64_t)i * L * Dple);
-                scratch_.rewind_to(snap);
+            // Per-Layer-Embedding input, BATCHED over the chunk: the model_proj
+            // is a [L*Dple x H] @ [H] gemv per token; doing it per-token (one
+            // gemv_dense each) dominated prefill. Batch the GEMM + norm + scales;
+            // keep the cheap token_identity dequant+add per-token (small reused
+            // scratch, so the arena sizing is unchanged).
+            {
+                const auto& mw = model_weights_;
+                if (mw.ple_embd && mw.ple_model_proj && mw.ple_proj_norm) {
+                    const int total  = L * Dple;
+                    const int ntotal = chunk * total;
+                    // context = ple_proj_norm( (model_proj @ embed)/sqrt(H) ), batched.
+                    gemm_dense_batched(ple_input_batch, mw.ple_model_proj,
+                                       mw.ple_model_proj_type, x_batch,
+                                       total, chunk, H, stream_);
+                    vec_scale(ple_input_batch, ntotal, 1.0f / sqrtf((float)H), stream_);
+                    fused_rmsnorm_residual(ple_input_batch, ple_input_batch, nullptr,
+                                           mw.ple_proj_norm, chunk * L, Dple,
+                                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+                    // + token_identity (per-token dequant) then *1/sqrt(2), per token.
+                    for (int i = 0; i < chunk; i++) {
+                        const int64_t snap = scratch_.mark();
+                        half* o = ple_input_batch + (int64_t)i * total;
+                        half* tid = (half*)scratch_.get(total * sizeof(half));
+                        dequant_embedding(tid, mw.ple_embd, prompt_tokens[c0 + i],
+                                          total, mw.ple_embd_type, stream_);
+                        vec_scale(tid, total, sqrtf((float)Dple), stream_);
+                        vec_add(o, o, tid, total, stream_);
+                        scratch_.rewind_to(snap);
+                    }
+                    vec_scale(ple_input_batch, ntotal, 0.70710678f, stream_);
+                }
             }
             for (int l = 0; l < config_.n_layers; l++) {
                 transformer_prefill_gemma4(l, c0, chunk, x_batch, ple_input_batch);
