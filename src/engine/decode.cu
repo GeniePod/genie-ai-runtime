@@ -2351,42 +2351,51 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         last_prefill_x = x_batch + (int64_t)(M - 1) * H;
     } else if (M > 0 && config_.arch == Arch::Gemma4 &&
                config_.spec.per_layer_embeddings &&
-               batched_prefill_enabled() && gemma_batched_fits) {
-        // Path B for Gemma 4: layer-major batched prefill. Build the [M × H]
-        // activation batch and the per-token PLE-input table once, then loop
-        // layers-outer via transformer_prefill_gemma4 (batches the big K-quant
-        // projections; RoPE/KV-store and PLE stay per-token).
+               batched_prefill_enabled()) {
+        // Path B for Gemma 4: layer-major batched prefill, CHUNKED. Prompts
+        // longer than the batched scratch (BATCH_CAP) used to fall back to the
+        // ~5x slower per-token prefill; instead process the prompt in chunks
+        // that fit the scratch, each chunk batched layer-major. The KV cache
+        // accumulates across chunks (chunk c attends to all prior KV), so the
+        // result is identical — only faster for long prompts.
         static bool logged = false;
         if (!logged) {
-            fprintf(stderr, "[engine] Path B: Gemma 4 batched prefill enabled\n");
+            fprintf(stderr, "[engine] Path B: Gemma 4 batched prefill enabled (chunked)\n");
             logged = true;
         }
-        scratch_.reset();
         const int L = config_.n_layers;
-        const int D = config_.ple_input_dim;
-        half* x_batch = (half*)scratch_.get((int64_t)M * H * sizeof(half));
-        for (int i = 0; i < M; i++) {
-            dequant_embedding(x_batch + (int64_t)i * H, model_weights_.tok_embd,
-                              prompt_tokens[prefill_start + i], H,
-                              model_weights_.embd_type, stream_);
-        }
-        scale_embedding(config_.spec, x_batch, M * H, config_.hidden_dim, stream_);
-        // Per-token PLE input [M × n_layers × ple_dim]; persistent across layers.
-        half* ple_input_batch =
-            (half*)scratch_.get((int64_t)M * L * D * sizeof(half));
-        for (int i = 0; i < M; i++) {
-            const int64_t snap = scratch_.mark();
-            compute_gemma_ple_input(x_batch + (int64_t)i * H,
-                                    prompt_tokens[prefill_start + i],
-                                    ple_input_batch + (int64_t)i * L * D);
-            scratch_.rewind_to(snap);
-        }
-        for (int l = 0; l < config_.n_layers; l++) {
-            transformer_prefill_gemma4(l, prefill_start, M, x_batch,
-                                       ple_input_batch);
+        const int Dple = config_.ple_input_dim;
+        const int64_t gemma_per_tok =
+            (int64_t)H * sizeof(half) + batched_per_token_bytes +
+            (int64_t)(L * Dple + 3 * Dple + config_.hidden_dim) * sizeof(half);
+        int chunk_cap = (int)((scratch_.capacity() - kBatchedScratchMargin) / gemma_per_tok);
+        if (chunk_cap < 1) chunk_cap = 1;
+        for (int c0 = prefill_start; c0 < N; c0 += chunk_cap) {
+            const int chunk = std::min(chunk_cap, N - c0);
+            scratch_.reset();
+            half* x_batch = (half*)scratch_.get((int64_t)chunk * H * sizeof(half));
+            for (int i = 0; i < chunk; i++) {
+                dequant_embedding(x_batch + (int64_t)i * H, model_weights_.tok_embd,
+                                  prompt_tokens[c0 + i], H,
+                                  model_weights_.embd_type, stream_);
+            }
+            scale_embedding(config_.spec, x_batch, chunk * H, config_.hidden_dim, stream_);
+            half* ple_input_batch =
+                (half*)scratch_.get((int64_t)chunk * L * Dple * sizeof(half));
+            for (int i = 0; i < chunk; i++) {
+                const int64_t snap = scratch_.mark();
+                compute_gemma_ple_input(x_batch + (int64_t)i * H,
+                                        prompt_tokens[c0 + i],
+                                        ple_input_batch + (int64_t)i * L * Dple);
+                scratch_.rewind_to(snap);
+            }
+            for (int l = 0; l < config_.n_layers; l++) {
+                transformer_prefill_gemma4(l, c0, chunk, x_batch, ple_input_batch);
+            }
+            if (c0 + chunk == N) last_prefill_x = x_batch + (int64_t)(chunk - 1) * H;
         }
         last_token_ = prompt_tokens.back();
-        last_prefill_x = x_batch + (int64_t)(M - 1) * H;
+        (void)gemma_batched_fits;
     } else if (M > 0) {
         if (batched_prefill_enabled() && !batched_fits) {
             static bool warned = false;
