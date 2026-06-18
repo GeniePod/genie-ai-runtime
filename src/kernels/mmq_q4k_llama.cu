@@ -329,7 +329,7 @@ static __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(
 
 template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
 static __device__ __forceinline__ void mmq_write_back_mma(
-        const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, half * __restrict__ dst,
         const int stride, const int i_max, const int j_max) {
 
     constexpr int granularity = mmq_get_granularity_device(mmq_x);
@@ -370,7 +370,7 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
-                dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                dst[ids_dst[j]*stride + i] = __float2half(sum[(j0/tile_C::J + n)*tile_C::ne + l]);
             }
         }
     }
@@ -409,7 +409,7 @@ template <int mmq_x, int mmq_y, bool need_check>
 __launch_bounds__(32*8, 2)
 __global__ void mul_mat_q_llama(
         const char * __restrict__ x, const int * __restrict__ y, const int * __restrict__ ids_dst,
-        float * __restrict__ dst,
+        half * __restrict__ dst,
         const int nrows_x, const int ncols_dst, const int stride_row_x, const int stride_col_dst,
         const int stride_y_cols) {
     constexpr int warp_size = 32, nwarps = 8, qk = QK_K, ne_block = 4*QK8_1;
@@ -455,7 +455,6 @@ __global__ void mul_mat_q_llama(
 // ---- lazy device scratch (q8 activations + identity ids), grown on demand ----
 static block_q8_1_mmq* g_q8 = nullptr;  static size_t g_q8_cap = 0;
 static int*            g_ids = nullptr; static int    g_ids_cap = 0;
-static float*          g_cf  = nullptr; static size_t g_cf_cap  = 0;  // f32 output staging
 
 static void mmq_ck(cudaError_t e, const char* what, size_t bytes) {
     if (e != cudaSuccess) {
@@ -464,7 +463,7 @@ static void mmq_ck(cudaError_t e, const char* what, size_t bytes) {
                 what, bytes, cudaGetErrorString(e), fr, tot);
     }
 }
-static void ensure_scratch(size_t q8_blocks, int npad, size_t cf_elems) {
+static void ensure_scratch(size_t q8_blocks, int npad) {
     if (q8_blocks > g_q8_cap) { if (g_q8) cudaFree(g_q8);
         mmq_ck(cudaMalloc(&g_q8, q8_blocks*sizeof(block_q8_1_mmq)), "q8", q8_blocks*sizeof(block_q8_1_mmq)); g_q8_cap=q8_blocks; }
     if (npad > g_ids_cap) {
@@ -472,16 +471,6 @@ static void ensure_scratch(size_t q8_blocks, int npad, size_t cf_elems) {
         int* h=(int*)malloc(npad*sizeof(int)); for(int i=0;i<npad;i++) h[i]=i;
         cudaMemcpy(g_ids,h,npad*sizeof(int),cudaMemcpyHostToDevice); free(h);
     }
-    if (cf_elems > g_cf_cap) { if (g_cf) cudaFree(g_cf);
-        mmq_ck(cudaMalloc(&g_cf, cf_elems*sizeof(float)), "cf", cf_elems*sizeof(float)); g_cf_cap=cf_elems; }
-}
-
-// Convert f32 [N x M] (col-major as written by write_back: dst[col*M+row]) which is
-// actually y[token*M + feat] row-major -> half. write_back already wrote row-major
-// [N x M], so just narrow f32->half.
-__global__ void f32_to_half_kernel(const float* __restrict__ src, half* __restrict__ dst, int64_t n) {
-    int64_t i = (int64_t)blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half(src[i]);
 }
 
 // Engine-facing launcher. y[N x M] half row-major = x[N x K] half · W^T (Q4_K).
@@ -501,7 +490,7 @@ void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
     { cudaPointerAttributes pa;
       if (cudaPointerGetAttributes(&pa, W) == cudaSuccess && pa.devicePointer != nullptr)
           Wdev = pa.devicePointer; }
-    ensure_scratch((size_t)nkb128*npad, npad, (size_t)N*M);
+    ensure_scratch((size_t)nkb128*npad, npad);
 
     // quantize activations -> g_q8 (zero padding cols so they contribute nothing)
     if (npad > N) cudaMemsetAsync(g_q8, 0, (size_t)nkb128*npad*sizeof(block_q8_1_mmq), stream);
@@ -512,14 +501,13 @@ void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
     size_t shmem = (size_t)(MX + GGML_PAD(MX*MMQ_TILE_Y_K, nwarps*warp) + MY*MMQ_MMA_TILE_X_K_Q8_1)*sizeof(int);
     dim3 grid(npad/MX, (M + MY - 1)/MY), block(warp, nwarps);
     const int nbk = K/256;
+    // write_back emits half directly into y (no f32 staging buffer / convert kernel).
     if (M % MY == 0) {
         cudaFuncSetAttribute(mul_mat_q_llama<MX,MY,false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        mul_mat_q_llama<MX,MY,false><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g_q8,g_ids,g_cf,M,N,nbk,M,npad);
+        mul_mat_q_llama<MX,MY,false><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g_q8,g_ids,y,M,N,nbk,M,npad);
     } else {
         cudaFuncSetAttribute(mul_mat_q_llama<MX,MY,true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        mul_mat_q_llama<MX,MY,true><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g_q8,g_ids,g_cf,M,N,nbk,M,npad);
+        mul_mat_q_llama<MX,MY,true><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g_q8,g_ids,y,M,N,nbk,M,npad);
     }
-    int64_t n = (int64_t)N*M;
-    f32_to_half_kernel<<<(n+255)/256, 256, 0, stream>>>(g_cf, y, n);
 }
 }  // namespace jllm
