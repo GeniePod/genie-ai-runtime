@@ -1902,6 +1902,13 @@ static block_q8_1* get_q8_1_scratch_batched(int total_blocks) {
 // 32-wide sub-block on raw nibbles x q8_1 activations, with the Q4_K (d,dm)
 // and q8_1 (d8,s8) scales applied in a float epilogue. A-fragment layout and
 // the epilogue mapping validated in tests/test_mmq_q4k_int8.cu.
+// Unpack 4 consecutive Q4_K bytes -> 4 int8 nibbles (0..15) packed in an int,
+// for the s8 MMA A-fragment (qs offset is always a multiple of 4 -> 4-aligned).
+__device__ __forceinline__ int mmq_unpack4(const uint8_t* qs, int parity) {
+    const uint32_t w = *reinterpret_cast<const uint32_t*>(qs);
+    return (int)(parity ? ((w >> 4) & 0x0F0F0F0Fu) : (w & 0x0F0F0F0Fu));
+}
+
 __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
                                        const block_q4_K* __restrict__ W,
                                        const block_q8_1* __restrict__ XQ,
@@ -1926,14 +1933,13 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
 
     float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
 
-    // cp.async double-buffered raw Q4_K tile: the next K-block streams into
-    // shared while the int8 tensor cores work the current one. block_q4_K is
-    // 144 B = 9x16 and blocks sit at 144*k (16-aligned) in the weight array,
-    // so the async copy is 16-byte-aligned. 16B-align the shared buffer too.
+    // cp.async double-buffered raw Q4_K tile (the ONLY shared buffer): the next
+    // K-block streams in while the int8 tensor cores work the current one.
+    // block_q4_K is 144 B = 9x16 and blocks sit at 144*k (16-aligned) in the
+    // weight array, so the async copy is 16-byte-aligned. Each thread unpacks
+    // its OWN A-fragment + per-sub-block scales straight from shared (no A_tile
+    // round-trip, no per-row scale table) -> only 2 barriers per K-block.
     __align__(16) __shared__ block_q4_K Wsh[2][MMQ_Q4K_TILE_M];
-    __shared__ int8_t A_tile[MMQ_Q4K_TILE_M][32];
-    __shared__ float  per_d [MMQ_Q4K_TILE_M][8];
-    __shared__ float  per_dm[MMQ_Q4K_TILE_M][8];
 
     auto prefetch = [&](int buf, int blk_idx) {
         for (int ci = t_id; ci < MMQ_Q4K_TILE_M * 9; ci += blockDim.x) {
@@ -1949,57 +1955,37 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
     for (int b = 0; b < n_blocks; b++) {
         if (b + 1 < n_blocks) prefetch((b + 1) & 1, b + 1);
         __pipeline_wait_prior(b + 1 < n_blocks ? 1 : 0);
-        __syncthreads();
+        __syncthreads();                                   // (A) Wsh[b&1] loaded
         const block_q4_K* Wb = Wsh[b & 1];
-        {
-            const int row = t_id >> 3;
-            const int sb  = t_id &  7;
-            const int g_row = row_base + row;
-            float d = 0.0f, dm = 0.0f;
-            if (g_row < M) {
-                const block_q4_K& blk = Wb[row];
-                const float dall = raw_fp16_to_float(blk.d_raw);
-                const float dmin = raw_fp16_to_float(blk.dmin_raw);
-                uint8_t sc, mn;
-                get_scale_min_k4(sb, blk.scales, sc, mn);
-                d  = dall * sc;
-                dm = dmin * mn;
-            }
-            per_d [row][sb] = d;
-            per_dm[row][sb] = dm;
-        }
-        __syncthreads();
 
+        // This thread owns output rows {groupID, groupID+8}; read their weight
+        // blocks from shared once per K-block (dall/dmin are sub-block-invariant).
+        const block_q4_K& WA = Wb[groupID];
+        const block_q4_K& WB = Wb[groupID + 8];
+        const float dallA = raw_fp16_to_float(WA.d_raw), dminA = raw_fp16_to_float(WA.dmin_raw);
+        const float dallB = raw_fp16_to_float(WB.d_raw), dminB = raw_fp16_to_float(WB.dmin_raw);
+
+        #pragma unroll
         for (int sb = 0; sb < 8; sb++) {
             const int il     = sb >> 1;
             const int parity = sb &  1;
+            const int gsb    = b * 8 + sb;
 
-            // Cooperative unpack of raw 4-bit nibbles -> int8 [0..15].
-            {
-                const int row   = t_id >> 3;
-                const int col_4 = (t_id & 7) << 2;
-                const int g_row = row_base + row;
-                #pragma unroll
-                for (int s = 0; s < 4; s++) {
-                    const int col = col_4 + s;
-                    int8_t q = 0;
-                    if (g_row < M) {
-                        const uint8_t qb = Wb[row].qs[32 * il + col];
-                        q = (int8_t)(parity ? (qb >> 4) : (qb & 0xF));
-                    }
-                    A_tile[row][col] = q;
-                }
-            }
-            __syncthreads();
+            // A fragment: unpack this lane's 4 nibbles straight from shared
+            // (rows {gid, gid+8} across k_lo 4t..+3 / k_hi 16+4t..+3).
+            const uint8_t* qsA = WA.qs + 32 * il;
+            const uint8_t* qsB = WB.qs + 32 * il;
+            const int a0 = mmq_unpack4(qsA + 4 * tinG,      parity);
+            const int a1 = mmq_unpack4(qsB + 4 * tinG,      parity);
+            const int a2 = mmq_unpack4(qsA + 16 + 4 * tinG, parity);
+            const int a3 = mmq_unpack4(qsB + 16 + 4 * tinG, parity);
 
-            const int gsb = b * 8 + sb;
-
-            // A fragment (m16n8k32 s8 layout, validated): rows {gid, gid+8}
-            // paired across k_lo (4t..+3) / k_hi (16+4t..+3).
-            const int a0 = *reinterpret_cast<const int*>(&A_tile[groupID    ][4 * tinG     ]);
-            const int a1 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][4 * tinG     ]);
-            const int a2 = *reinterpret_cast<const int*>(&A_tile[groupID    ][16 + 4 * tinG]);
-            const int a3 = *reinterpret_cast<const int*>(&A_tile[groupID + 8][16 + 4 * tinG]);
+            // per-sub-block Q4_K scales for the two rows (registers, no shared).
+            uint8_t scA, mnA, scB, mnB;
+            get_scale_min_k4(sb, WA.scales, scA, mnA);
+            get_scale_min_k4(sb, WB.scales, scB, mnB);
+            const float dA = dallA * scA, dmA = dminA * mnA;
+            const float dB = dallB * scB, dmB = dminB * mnB;
 
             // B fragment: q8_1 of token (tok_base+groupID).
             const int g_tok = tok_base + groupID;
@@ -2018,10 +2004,6 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bb0), "r"(bb1)
             );
 
-            const float dA  = per_d [groupID    ][sb];
-            const float dmA = per_dm[groupID    ][sb];
-            const float dB  = per_d [groupID + 8][sb];
-            const float dmB = per_dm[groupID + 8][sb];
             float d8_0 = 0.0f, s8_0 = 0.0f, d8_1 = 0.0f, s8_1 = 0.0f;
             if (tok0 < N) {
                 d8_0 = raw_fp16_to_float(XQ[(int64_t)tok0 * nsb + gsb].d_raw);
@@ -2035,8 +2017,8 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
             d1 += dA * d8_1 * (float)c1 - dmA * s8_1;
             d2 += dB * d8_0 * (float)c2 - dmB * s8_0;
             d3 += dB * d8_1 * (float)c3 - dmB * s8_1;
-            __syncthreads();
         }
+        __syncthreads();                                   // (B) done reading Wsh[b&1]
     }
 
     const int row_a = row_base + groupID;
