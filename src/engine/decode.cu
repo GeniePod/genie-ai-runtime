@@ -1803,8 +1803,28 @@ void Engine::transformer_prefill_gemma4(int layer, int start_pos, int n_tokens,
         }
     }
 
-    // 3b. Per-token RoPE (per-layer base) + KV store. Shared layers rotate Q
-    //     only; their K/V already live in kv_layer's cache.
+    // 3b. RoPE (per-layer base) + KV store. Batched over all N tokens in one
+    //     launch when possible (FP16 KV + all-fast cache positions); per-token
+    //     fallback otherwise (int8 KV / overflow / N<2). Shared-KV layers rotate
+    //     Q only — their K/V already live in kv_layer's cache.
+    bool roped_batched = false;
+    if (!has_own_kv) {
+        rope_inplace_batched(q_batch, nullptr, config_.n_heads, 0, hd,
+                             start_pos, N, Q_DIM, 0, lw.rope_theta_l,
+                             config_.rope_neox, stream_);
+        roped_batched = true;
+    } else if (!gen_params_.kv_int8 && N >= 2 &&
+               kv_cache_.is_fast_position(start_pos + N - 1)) {
+        half* kcb = (half*)kv_cache_.key_ptr(layer, start_pos);
+        half* vcb = (half*)kv_cache_.val_ptr(layer, start_pos);
+        const int kv_slot = (int)(((char*)kv_cache_.key_ptr(layer, start_pos + 1)
+                                   - (char*)kcb) / sizeof(half));
+        rope_inplace_store_kv_fp16_batched(q_batch, k_batch, v_batch, kcb, vcb,
+            kv_slot, config_.n_heads, config_.n_kv_heads, hd, start_pos, N,
+            Q_DIM, KV_DIM, lw.rope_theta_l, config_.rope_neox, stream_);
+        roped_batched = true;
+    }
+    if (!roped_batched)
     for (int i = 0; i < N; i++) {
         const int pos = start_pos + i;
         half* q_t = q_batch + (int64_t)i * Q_DIM;

@@ -258,6 +258,19 @@ void rope_inplace_store_kv_fp16(
     cudaStream_t   stream
 );
 
+// Batched RoPE over all N prefill tokens in one launch (replaces the per-token
+// loop, ~8% of prefill in launch overhead). q/k strides are the per-token row
+// strides; kv_slot is the cache's per-position stride in halfs (contiguous fast
+// positions). rope_inplace_batched with k==nullptr / n_kv_heads==0 ropes Q only.
+void rope_inplace_batched(
+    half* q, half* k, int n_heads, int n_kv_heads, int head_dim,
+    int start_pos, int N, int q_stride, int k_stride,
+    float theta_base, bool neox, cudaStream_t stream);
+void rope_inplace_store_kv_fp16_batched(
+    half* q, half* k, const half* v, half* k_cache_base, half* v_cache_base, int kv_slot,
+    int n_heads, int n_kv_heads, int head_dim, int start_pos, int N,
+    int q_stride, int kv_stride, float theta_base, bool neox, cudaStream_t stream);
+
 // CUDA-graph-friendly variant: position is read from a device int* at
 // kernel-execution time, and the K/V cache write destinations are
 // computed inside the kernel as `cache_layer_base + pos * kv_stride`.
