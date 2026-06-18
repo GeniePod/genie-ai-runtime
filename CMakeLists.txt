@@ -276,3 +276,11 @@ add_test(NAME kv_int8_convert COMMAND test_kv_int8_convert)
 add_executable(test_flash_tiled tests/test_flash_tiled.cu)
 target_link_libraries(test_flash_tiled PRIVATE CUDA::cudart)
 add_test(NAME flash_tiled COMMAND test_flash_tiled)
+
+# Tensor-core flash-attention reference (wmma): S=Q@K^T and O=P@V via 16x16x16
+# f16 MMA, online softmax in shared. Validates the TC building blocks (correct
+# vs naive, max_abs 5e-4). First version keeps O in shared -> occupancy-bound;
+# the high-occupancy version (O in registers) is the remaining work.
+add_executable(test_flash_tc tests/test_flash_tc.cu)
+target_link_libraries(test_flash_tc PRIVATE CUDA::cudart)
+add_test(NAME flash_tc COMMAND test_flash_tc)
