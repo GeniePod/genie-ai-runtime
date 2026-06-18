@@ -2758,10 +2758,18 @@ __global__ void gemm_dense_batched_kernel(half* __restrict__ out,
     if (lane == 0) out[(int64_t)n * M + m] = __float2half(acc);
 }
 
+// Tiled fp16 tensor-core dense GEMM (src/kernels/dense_tc.cu) — ~5x the naive
+// scalar kernel on Gemma 4's F32 inp_gate/proj projections.
+bool dense_tc_enabled();
+bool gemm_dense_tc(half* out, const void* Wdev, int wtype, const half* x,
+                   int M, int N, int K, cudaStream_t stream);
+
 void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
                         int M, int N, int K, cudaStream_t stream) {
     if (N == 1) { gemv_dense(out, W, wtype, x, M, K, stream); return; }
     const void* Wd = resolve_weight_device_ptr(W);
+    // Tensor-core path (W already device-resolved); falls back if shape unhandled.
+    if (dense_tc_enabled() && gemm_dense_tc(out, Wd, wtype, x, M, N, K, stream)) return;
     const int rpb = gemv_rows_per_block();
     dim3 grid((M + rpb - 1) / rpb, N);
     gemm_dense_batched_kernel<<<grid, rpb * 32, 0, stream>>>(out, Wd, wtype, x, M, N, K, rpb);
