@@ -29,18 +29,6 @@ static bool fast_attention_enabled() {
     return enabled;
 }
 
-// Tiled flash-attention prefill: one warp per query, K/V tiles reused from
-// shared across the WARPS queries in the block (vs the one-query-per-block
-// kernel that re-reads all K/V per query -> O(N^2) memory). Default on for
-// INT8 KV + head_dim in {256,512}; JLLM_FLASH_TILED=0 reverts to the old path.
-static bool flash_tiled_enabled() {
-    static const bool enabled = [] {
-        const char* v = getenv("JLLM_FLASH_TILED");
-        return !v || strcmp(v, "0") != 0;
-    }();
-    return enabled;
-}
-
 __device__ __forceinline__ float warp_max_f(float v) {
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -360,127 +348,6 @@ __global__ void flash_attention_prefill_batched_kernel(
     }
 }
 
-// Tiled flash-attention prefill kernel. Templated on HEAD_DIM so the per-query
-// Q/O fragments live in registers. INT8 KV only (the genie default). One warp
-// per query; the WARPS queries in a block share each K/V tile loaded into
-// shared. Validated in tests/test_flash_tiled.cu (the f16 reference).
-template<int HEAD_DIM, int WARPS, int TK>
-__global__ void flash_attn_prefill_tiled_kernel(
-    half* __restrict__ output, const half* __restrict__ q,
-    const void* __restrict__ k_cache, const void* __restrict__ v_cache,
-    int n_heads, int n_kv_heads, int cache_head_dim, int start_pos,
-    float scale, const float* __restrict__ k_scales, const float* __restrict__ v_scales,
-    int window, int N)
-{
-    const int head  = blockIdx.x;
-    const int qtile = blockIdx.y;
-    const int warp  = threadIdx.x >> 5;
-    const int lane  = threadIdx.x & 31;
-    const int kv_head = head / (n_heads / n_kv_heads);
-    const int kv_dim  = n_kv_heads * cache_head_dim;
-    const int kv_hoff = kv_head * cache_head_dim;
-    const int q_dim   = n_heads * HEAD_DIM;
-    constexpr int DPL = HEAD_DIM / 32;
-
-    const int q_token = qtile * WARPS + warp;     // chunk-local token
-    const int qpos    = start_pos + q_token;       // absolute KV position of this query
-    const int seq_q   = qpos + 1;                  // causal end
-
-    extern __shared__ char fsmem[];
-    int8_t* Ksh = (int8_t*)fsmem;                  // [TK][HEAD_DIM]
-    int8_t* Vsh = Ksh + TK * HEAD_DIM;             // [TK][HEAD_DIM]
-    float*  ksc = (float*)(Vsh + TK * HEAD_DIM);   // [TK]
-    float*  vsc = ksc + TK;                         // [TK]
-    float*  Ssh = vsc + TK;                         // [WARPS][TK]
-
-    float qreg[DPL], oreg[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; i++) {
-        qreg[i] = (q_token < N)
-            ? __half2float(q[(int64_t)q_token * q_dim + head * HEAD_DIM + lane + i*32]) : 0.0f;
-        oreg[i] = 0.0f;
-    }
-    float run_max = -INFINITY, run_sum = 0.0f;
-
-    const int block_qtoken_max = min(qtile * WARPS + WARPS - 1, N - 1);
-    const int block_seq = start_pos + block_qtoken_max + 1;  // uniform tile range
-
-    for (int kt = 0; kt < block_seq; kt += TK) {
-        const int tklen = min(TK, block_seq - kt);
-        for (int idx = threadIdx.x; idx < TK * HEAD_DIM; idx += blockDim.x) {
-            const int kk = idx / HEAD_DIM, dd = idx % HEAD_DIM;
-            if (kk < tklen) {
-                const int64_t off = (int64_t)(kt + kk) * kv_dim + kv_hoff + dd;
-                Ksh[idx] = ((const int8_t*)k_cache)[off];
-                Vsh[idx] = ((const int8_t*)v_cache)[off];
-            } else { Ksh[idx] = 0; Vsh[idx] = 0; }
-        }
-        for (int kk = threadIdx.x; kk < tklen; kk += blockDim.x) {
-            const int kvpos = kt + kk;
-            ksc[kk] = k_scales ? k_scales[(int64_t)kvpos * n_kv_heads + kv_head] : 1.0f;
-            vsc[kk] = v_scales ? v_scales[(int64_t)kvpos * n_kv_heads + kv_head] : 1.0f;
-        }
-        __syncthreads();
-
-        if (q_token < N) {
-            for (int kk = 0; kk < tklen; kk++) {
-                const int kvpos = kt + kk;
-                float s;
-                if (kvpos > qpos || (window > 0 && kvpos < seq_q - window)) {
-                    s = -INFINITY;
-                } else {
-                    float p = 0.0f;
-                    #pragma unroll
-                    for (int i = 0; i < DPL; i++)
-                        p += qreg[i] * (float)Ksh[kk * HEAD_DIM + lane + i*32];
-                    #pragma unroll
-                    for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffffu, p, o);
-                    s = p * ksc[kk] * scale;
-                }
-                if (lane == 0) Ssh[warp * TK + kk] = s;
-            }
-            __syncwarp();
-            float lmax = -INFINITY;
-            for (int kk = lane; kk < tklen; kk += 32) lmax = fmaxf(lmax, Ssh[warp * TK + kk]);
-            #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) lmax = fmaxf(lmax, __shfl_xor_sync(0xffffffffu, lmax, o));
-            if (lmax > -INFINITY) {
-                const float new_max = fmaxf(run_max, lmax);
-                const float corr = (run_max == -INFINITY) ? 0.0f : expf(run_max - new_max);
-                run_max = new_max;
-                run_sum *= corr;
-                #pragma unroll
-                for (int i = 0; i < DPL; i++) oreg[i] *= corr;
-                float lsum = 0.0f;
-                for (int kk = lane; kk < tklen; kk += 32) {
-                    float e = expf(Ssh[warp * TK + kk] - run_max);
-                    Ssh[warp * TK + kk] = e; lsum += e;
-                }
-                #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, o);
-                run_sum += lsum;
-                __syncwarp();
-                #pragma unroll
-                for (int i = 0; i < DPL; i++) {
-                    const int d = lane + i*32;
-                    float acc = 0.0f;
-                    for (int kk = 0; kk < tklen; kk++)
-                        acc += Ssh[warp * TK + kk] * (vsc[kk] * (float)Vsh[kk * HEAD_DIM + d]);
-                    oreg[i] += acc;
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    if (q_token < N) {
-        const float inv = (run_sum > 0.0f) ? 1.0f / run_sum : 0.0f;
-        #pragma unroll
-        for (int i = 0; i < DPL; i++)
-            output[(int64_t)q_token * q_dim + head * HEAD_DIM + lane + i*32] = __float2half(oreg[i] * inv);
-    }
-}
-
 void flash_attention_prefill_batched(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
@@ -509,31 +376,6 @@ void flash_attention_prefill_batched(
     if (!logged) {
         fprintf(stderr, "[attention] Using CUDA chunked-prefill attention path\n");
         logged = true;
-    }
-
-    // Tiled flash-attention (one warp per query, shared K/V reuse) for INT8 KV
-    // + the Gemma head dims. Cuts the O(N^2) K/V re-reads of the old kernel,
-    // which dominates long-context prefill.
-    if (kv_int8 && flash_tiled_enabled() && (head_dim == 256 || head_dim == 512)) {
-        constexpr int WARPS = 8, TK = 32;
-        static bool tlog = false;
-        if (!tlog) { tlog = true; fprintf(stderr,
-            "[attention] tiled flash-attention prefill active (set JLLM_FLASH_TILED=0 to disable)\n"); }
-        const dim3 tgrid(n_heads, (N + WARPS - 1) / WARPS, 1);
-        const size_t tsmem = (size_t)2 * TK * head_dim + (size_t)2 * TK * sizeof(float)
-                           + (size_t)WARPS * TK * sizeof(float);
-        if (head_dim == 256)
-            flash_attn_prefill_tiled_kernel<256, WARPS, TK><<<tgrid, WARPS*32, tsmem, stream>>>(
-                output, q, k_cache, v_cache, n_heads, n_kv_heads, cache_head_dim,
-                start_pos, scale, k_scales, v_scales, window, N);
-        else
-            flash_attn_prefill_tiled_kernel<512, WARPS, TK><<<tgrid, WARPS*32, tsmem, stream>>>(
-                output, q, k_cache, v_cache, n_heads, n_kv_heads, cache_head_dim,
-                start_pos, scale, k_scales, v_scales, window, N);
-        cudaError_t terr = cudaGetLastError();
-        if (terr == cudaSuccess) return;
-        fprintf(stderr, "[attention] tiled flash-attention launch failed (%s); using old path\n",
-                cudaGetErrorString(terr));
     }
 
     const dim3 grid(n_heads, N, 1);
