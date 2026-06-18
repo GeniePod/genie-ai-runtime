@@ -268,3 +268,11 @@ add_test(NAME kv_scale_storage COMMAND test_kv_scale_storage)
 add_executable(test_kv_int8_convert tests/test_kv_int8_convert.cu)
 target_link_libraries(test_kv_int8_convert PRIVATE jetson_llm_core)
 add_test(NAME kv_int8_convert COMMAND test_kv_int8_convert)
+
+# Tiled flash-attention reference: one warp per query, K/V tiles reused from
+# shared across the query tile (vs the engine's one-query-per-block O(N^2)
+# memory). Validated vs a naive reference; 4-6x faster. Basis for the engine
+# port (int8 KV + head-dim templating).
+add_executable(test_flash_tiled tests/test_flash_tiled.cu)
+target_link_libraries(test_flash_tiled PRIVATE CUDA::cudart)
+add_test(NAME flash_tiled COMMAND test_flash_tiled)
