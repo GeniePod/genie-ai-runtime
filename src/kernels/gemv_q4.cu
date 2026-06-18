@@ -2033,6 +2033,103 @@ __global__ void gemm_mmq_q4k_i8_kernel(half*             __restrict__ y,
     }
 }
 
+// CUTLASS/CODA-style WARP-TILED int8 Q4_K MMQ (opt-in JLLM_MMQ_Q4K_WT). ncu
+// showed the per-sub-block kernel above at ~6% int8-TC util — starved by
+// per-MMA overhead. This uses a large register-accumulator warp-tile so each
+// Q4_K sub-block does 16 m16n8k32 MMAs reusing shared-staged weights + register
+// activations, with the Q4_K dequant applied to the register accumulator.
+// Standalone-validated (rel 5e-4) at ~3900 GOP/s vs ~1920 for the kernel above.
+// 64x32 tile (4 MMAs/sub-block) is the IN-ENGINE sweet spot: bigger tiles
+// (128x64=16 MMAs) win the standalone GFLOPS microbench but are occupancy-
+// starved in the real pipeline (36KB shared + 162 regs -> 1 block/SM, 8% occ),
+// netting the same ~6% TC util as the tiny-tile kernel. 64x32 keeps ~2 blocks/SM
+// (18KB shared) while amortizing overhead 4x -> +9-13% prefill in-engine.
+static constexpr int WT_BM = 64, WT_BN = 32, WT_WM = 2, WT_WN = 2;
+static constexpr int WT_WARP_M = WT_BM/WT_WM, WT_WARP_N = WT_BN/WT_WN;   // 32 x 16
+static constexpr int WT_RF = WT_WARP_M/16, WT_TF = WT_WARP_N/8;          // 2 x 2 = 4 MMAs
+
+static bool q4k_wt_enabled() {
+    static const bool e = []{ const char* v = getenv("JLLM_MMQ_Q4K_WT"); return !v || strcmp(v,"0")!=0; }();
+    return e;   // default ON; JLLM_MMQ_Q4K_WT=0 reverts to the per-sub-block kernel
+}
+
+__global__ void gemm_mmq_q4k_wt_kernel(half* __restrict__ y, const block_q4_K* __restrict__ W,
+                                       const block_q8_1* __restrict__ XQ, int M, int N, int K) {
+    const int row_base = blockIdx.y*WT_BM, tok_base = blockIdx.x*WT_BN;
+    const int wid = threadIdx.x>>5, lane = threadIdx.x&31;
+    const int wm = wid % WT_WM, wn = wid / WT_WM, gid = lane>>2, t = lane&3;
+    const int nbk = K/QK_K, nsb = K/32;
+    const int wrow0 = wm*WT_WARP_M, wtok0 = wn*WT_WARP_N;
+
+    __align__(16) __shared__ block_q4_K Wsh[2][WT_BM];
+    auto prefetch = [&](int buf, int blk){
+        for (int ci = threadIdx.x; ci < WT_BM*9; ci += blockDim.x){
+            const int row = ci/9, c16 = ci%9, g = row_base+row;
+            const char* src = (const char*)((g<M)?&W[(int64_t)g*nbk+blk]:&W[0])+c16*16;
+            __pipeline_memcpy_async((char*)&Wsh[buf][row]+c16*16, src, 16);
+        }
+        __pipeline_commit();
+    };
+
+    float acc[WT_RF][WT_TF][4];
+    #pragma unroll
+    for (int i=0;i<WT_RF;i++) for (int j=0;j<WT_TF;j++){ acc[i][j][0]=acc[i][j][1]=acc[i][j][2]=acc[i][j][3]=0.f; }
+
+    prefetch(0,0);
+    for (int b=0;b<nbk;b++){
+        if (b+1<nbk) prefetch((b+1)&1,b+1);
+        __pipeline_wait_prior(b+1<nbk?1:0);
+        __syncthreads();
+        const block_q4_K* Wb = Wsh[b&1];
+        for (int sb=0;sb<8;sb++){
+            const int il=sb>>1, parity=sb&1, gsb=b*8+sb;
+            int bf[WT_TF][2]; float dx[WT_TF][2], sx[WT_TF][2];
+            #pragma unroll
+            for (int tf=0; tf<WT_TF; tf++){
+                const int gtok = tok_base+wtok0+tf*8+gid;
+                bf[tf][0]=bf[tf][1]=0;
+                if (gtok<N){ const block_q8_1* q=&XQ[(int64_t)gtok*nsb+gsb];
+                    bf[tf][0]=*reinterpret_cast<const int*>(q->qs+4*t);
+                    bf[tf][1]=*reinterpret_cast<const int*>(q->qs+16+4*t); }
+                const int tk0=tok_base+wtok0+tf*8+2*t, tk1=tk0+1;
+                dx[tf][0]=sx[tf][0]=dx[tf][1]=sx[tf][1]=0.f;
+                if(tk0<N){ dx[tf][0]=raw_fp16_to_float(XQ[(int64_t)tk0*nsb+gsb].d_raw); sx[tf][0]=raw_fp16_to_float(XQ[(int64_t)tk0*nsb+gsb].s_raw);}
+                if(tk1<N){ dx[tf][1]=raw_fp16_to_float(XQ[(int64_t)tk1*nsb+gsb].d_raw); sx[tf][1]=raw_fp16_to_float(XQ[(int64_t)tk1*nsb+gsb].s_raw);}
+            }
+            #pragma unroll
+            for (int rf=0; rf<WT_RF; rf++){
+                const block_q4_K& WA = Wb[wrow0+rf*16+gid];
+                const block_q4_K& WB = Wb[wrow0+rf*16+gid+8];
+                int a[4] = { mmq_unpack4(WA.qs+32*il+4*t,parity),    mmq_unpack4(WB.qs+32*il+4*t,parity),
+                             mmq_unpack4(WA.qs+32*il+16+4*t,parity), mmq_unpack4(WB.qs+32*il+16+4*t,parity) };
+                uint8_t scA,mnA,scB,mnB;
+                get_scale_min_k4(sb,WA.scales,scA,mnA); get_scale_min_k4(sb,WB.scales,scB,mnB);
+                const float dwA=raw_fp16_to_float(WA.d_raw)*scA, dmA=raw_fp16_to_float(WA.dmin_raw)*mnA;
+                const float dwB=raw_fp16_to_float(WB.d_raw)*scB, dmB=raw_fp16_to_float(WB.dmin_raw)*mnB;
+                #pragma unroll
+                for (int tf=0; tf<WT_TF; tf++){
+                    int c[4]={0,0,0,0};
+                    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                        :"+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3])
+                        :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(bf[tf][0]),"r"(bf[tf][1]));
+                    acc[rf][tf][0]+=dwA*dx[tf][0]*c[0]-dmA*sx[tf][0];
+                    acc[rf][tf][1]+=dwA*dx[tf][1]*c[1]-dmA*sx[tf][1];
+                    acc[rf][tf][2]+=dwB*dx[tf][0]*c[2]-dmB*sx[tf][0];
+                    acc[rf][tf][3]+=dwB*dx[tf][1]*c[3]-dmB*sx[tf][1];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int rf=0; rf<WT_RF; rf++) for (int tf=0; tf<WT_TF; tf++){
+        const int rA=row_base+wrow0+rf*16+gid, rB=rA+8;
+        const int t0=tok_base+wtok0+tf*8+2*t, t1=t0+1;
+        if(rA<M){ if(t0<N)y[(int64_t)t0*M+rA]=__float2half(acc[rf][tf][0]); if(t1<N)y[(int64_t)t1*M+rA]=__float2half(acc[rf][tf][1]); }
+        if(rB<M){ if(t0<N)y[(int64_t)t0*M+rB]=__float2half(acc[rf][tf][2]); if(t1<N)y[(int64_t)t1*M+rB]=__float2half(acc[rf][tf][3]); }
+    }
+}
+
 // Path E6 Q6_K: int8 tensor-core MMQ for the ffn_down prefill GEMM. One
 // mma.m16n8k16.s8.s8.s32 per 16-wide Q6_K scale group, (q6-32) s8 weights x
 // q8_1 activations, scaled by d*scale*d8 in a float epilogue (no min term).
@@ -2168,8 +2265,14 @@ static bool gemm_quant_batched_gpu(half* y, const void* W, int ggml_type,
             if (xq) {
                 quantize_q8_1_kernel<<<total_blocks, 32, 0, stream>>>(
                     x, xq, N * K);
-                gemm_mmq_q4k_i8_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
-                    y, (const block_q4_K*)W_device, xq, M, N, K);
+                if (q4k_wt_enabled()) {
+                    dim3 wt_grid((N + WT_BN - 1) / WT_BN, (M + WT_BM - 1) / WT_BM);
+                    gemm_mmq_q4k_wt_kernel<<<wt_grid, WT_WM * WT_WN * 32, 0, stream>>>(
+                        y, (const block_q4_K*)W_device, xq, M, N, K);
+                } else {
+                    gemm_mmq_q4k_i8_kernel<<<mmq_grid, MMQ_Q4K_N_WARPS * 32, 0, stream>>>(
+                        y, (const block_q4_K*)W_device, xq, M, N, K);
+                }
                 cudaError_t err = cudaGetLastError();
                 if (err == cudaSuccess) {
                     return true;
