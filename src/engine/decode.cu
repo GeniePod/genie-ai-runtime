@@ -1912,9 +1912,21 @@ int Engine::decode_step(int pos) {
         prof_t = now;
     }
 
+    // #86: mask logits to the grammar before sampling (no-op when inactive).
+    if (grammar_active_) {
+        grammar_apply(grammar_state_, grammar_token_bytes_, tokenizer_.eos_id,
+                      host_logits_, config_.vocab_size);
+    }
+
     // Sample
     int token = sample_token(host_logits_, config_.vocab_size, gen_params_,
                              recent_tokens_.data(), recent_tokens_.size());
+
+    // #86: advance the grammar by the token we just committed to.
+    if (grammar_active_) {
+        grammar_accept_token(grammar_state_, grammar_token_bytes_,
+                             tokenizer_.eos_id, token);
+    }
     if (profile) {
         auto now = Clock::now();
         prof_sample_ms = Ms(now - prof_t).count();
@@ -2158,6 +2170,31 @@ bool validate_conversation_id(const std::string& id) {
     return true;
 }
 
+// #86: parse the request's GBNF grammar and arm constrained decoding. On any
+// parse failure we log and leave grammar_active_ false so generation proceeds
+// unconstrained rather than failing the request. The token-bytes cache (token
+// id -> literal output bytes) is built once; the vocabulary is fixed after
+// load(), so it is reused across requests.
+void Engine::prepare_grammar(const GenParams& params) {
+    grammar_active_ = false;
+    if (params.grammar.empty()) return;
+
+    grammar_ = grammar_parse(params.grammar, params.grammar_root);
+    if (!grammar_.ok) {
+        fprintf(stderr, "[engine] WARN: grammar parse failed — decoding unconstrained\n");
+        return;
+    }
+    if ((int)grammar_token_bytes_.size() != config_.vocab_size) {
+        grammar_token_bytes_.assign(config_.vocab_size, std::string());
+        for (int i = 0; i < config_.vocab_size; i++)
+            grammar_token_bytes_[i] = tokenizer_.decode(i);
+    }
+    grammar_state_init(grammar_state_, grammar_);
+    grammar_active_ = true;
+    fprintf(stderr, "[engine] grammar-constrained decoding active (%zu rules, root=%s)\n",
+            grammar_.rules.size(), params.grammar_root.c_str());
+}
+
 GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                           TokenCallback token_cb) {
     GenStats stats = {};
@@ -2167,6 +2204,11 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
     // Gemma forces FP16 KV (INT8 too lossy for its V distribution).
     if (config_.arch == Arch::Gemma4) gen_params_.kv_int8 = false;
     recent_tokens_.clear();
+
+    // #86: set up grammar-constrained decoding for this request (no-op when
+    // params.grammar is empty). Must run before prefill so the first-token
+    // sample (Path A) is already masked.
+    prepare_grammar(params);
 
     // Path F (#45): plumbing only in F2 — log conversation_id if set; the
     // F3 hooks (save on turn end, hydrate on turn start) consume it.
@@ -2492,10 +2534,20 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
                 copy_err = cudaStreamSynchronize(stream_);
             }
             if (copy_err == cudaSuccess) {
+                // #86: grammar-mask the first token too (Path A).
+                if (grammar_active_) {
+                    grammar_apply(grammar_state_, grammar_token_bytes_,
+                                  tokenizer_.eos_id, host_logits_,
+                                  config_.vocab_size);
+                }
                 first_token = sample_token(host_logits_, config_.vocab_size,
                                            gen_params_,
                                            recent_tokens_.data(),
                                            recent_tokens_.size());
+                if (grammar_active_) {
+                    grammar_accept_token(grammar_state_, grammar_token_bytes_,
+                                         tokenizer_.eos_id, first_token);
+                }
             } else {
                 fprintf(stderr,
                         "[engine] WARN: first-token logits copy failed (%s); "

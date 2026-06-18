@@ -33,6 +33,8 @@ struct Args {
     bool        raw_prompt  = false;
     bool        think       = false;
     std::string conversation_id;       // Path F: optional persistent-KV id
+    std::string grammar;               // #86: inline GBNF grammar
+    std::string grammar_file;          // #86: path to a GBNF grammar file
 };
 
 static std::string lower_copy(std::string s) {
@@ -91,6 +93,8 @@ Args parse_args(int argc, char** argv) {
         else if (strcmp(argv[i], "--think") == 0) args.think = true;
         else if (strcmp(argv[i], "--no-think") == 0) args.think = false;
         else if (strcmp(argv[i], "--conv-id") == 0 && i+1 < argc) args.conversation_id = argv[++i];
+        else if (strcmp(argv[i], "--grammar") == 0 && i+1 < argc) args.grammar = argv[++i];
+        else if (strcmp(argv[i], "--grammar-file") == 0 && i+1 < argc) args.grammar_file = argv[++i];
         else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
 #ifndef JLLM_VERSION
 #define JLLM_VERSION "dev"
@@ -118,6 +122,8 @@ Args parse_args(int argc, char** argv) {
                 "             of KV memory; quality drift FP16-ULP-bounded). Path I.\n"
                 "  --fp16-kv  Use FP16 KV cache (opt out of INT8 default).\n"
                 "  --conv-id ID  Path F: persistent-KV conversation id\n"
+                "  --grammar GBNF       Constrain output to a GBNF grammar (#86)\n"
+                "  --grammar-file PATH  Load the GBNF grammar from a file\n"
                 "                ([A-Za-z0-9_-]{1,64}). F2 plumbing only —\n"
                 "                no persistence yet; engine logs the id.\n"
                 "  -h         This help\n\n"
@@ -200,6 +206,28 @@ int main(int argc, char** argv) {
             params.conversation_id = args.conversation_id;
         }
     }
+
+    // #86: grammar-constrained decoding. --grammar-file takes precedence over
+    // an inline --grammar string.
+    if (!args.grammar_file.empty()) {
+        FILE* gf = fopen(args.grammar_file.c_str(), "rb");
+        if (!gf) {
+            fprintf(stderr, "[cli] ERROR: cannot open grammar file '%s'\n",
+                    args.grammar_file.c_str());
+            return 1;
+        }
+        std::string gbnf;
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), gf)) > 0) gbnf.append(buf, n);
+        fclose(gf);
+        params.grammar = gbnf;
+    } else if (!args.grammar.empty()) {
+        params.grammar = args.grammar;
+    }
+    if (!params.grammar.empty())
+        fprintf(stderr, "[cli] grammar-constrained decoding enabled (%zu bytes)\n",
+                params.grammar.size());
 
     fprintf(stderr, "Loading model...\n");
     auto t_load0 = std::chrono::steady_clock::now();
