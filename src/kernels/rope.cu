@@ -149,6 +149,90 @@ void rope_inplace_store_kv_fp16(
         n_heads, n_kv_heads, head_dim, position, theta_base, neox);
 }
 
+// ── Batched RoPE (one launch for all N prefill tokens) ───────────────────────
+// genie prefill RoPE'd per token (N launches/layer = ~44k launches at 1261 tok,
+// ~8% of prefill in pure launch overhead). blockIdx.y = token; per-token offsets
+// q + i*q_stride etc., position = start_pos + i. Same math/layout as the per-token
+// kernels, so results are identical.
+__global__ void rope_batched_kernel(
+    half* __restrict__ q, half* __restrict__ k,
+    int n_heads, int n_kv_heads, int head_dim,
+    int start_pos, int N, int q_stride, int k_stride, float theta_base, bool neox) {
+    const int i = blockIdx.y; if (i >= N) return;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half_dim = head_dim / 2;
+    const int total_pairs = (n_heads + n_kv_heads) * half_dim;
+    if (tid >= total_pairs) return;
+    const int q_pairs = n_heads * half_dim;
+    const int position = start_pos + i;
+    const bool is_q = tid < q_pairs;
+    int head, pair_idx; half* ptr;
+    if (is_q) { head = tid / half_dim; pair_idx = tid % half_dim; ptr = q + (int64_t)i*q_stride + head*head_dim; }
+    else      { int kt = tid - q_pairs; head = kt / half_dim; pair_idx = kt % half_dim; ptr = k + (int64_t)i*k_stride + head*head_dim; }
+    const float freq = 1.0f / powf(theta_base, (2.0f*pair_idx)/head_dim);
+    const float angle = position*freq, c = cosf(angle), s = sinf(angle);
+    const int i0 = neox ? pair_idx : pair_idx*2, i1 = neox ? pair_idx+half_dim : pair_idx*2+1;
+    const float v0 = __half2float(ptr[i0]), v1 = __half2float(ptr[i1]);
+    ptr[i0] = __float2half(v0*c - v1*s); ptr[i1] = __float2half(v0*s + v1*c);
+}
+
+__global__ void rope_store_kv_fp16_batched_kernel(
+    half* __restrict__ q, half* __restrict__ k, const half* __restrict__ v,
+    half* __restrict__ k_cache_base, half* __restrict__ v_cache_base, int kv_slot,
+    int n_heads, int n_kv_heads, int head_dim, int start_pos, int N,
+    int q_stride, int kv_stride, float theta_base, bool neox) {
+    const int i = blockIdx.y; if (i >= N) return;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half_dim = head_dim / 2;
+    const int q_pairs = n_heads * half_dim;
+    const int total_pairs = (n_heads + n_kv_heads) * half_dim;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int position = start_pos + i;
+    half* qi = q + (int64_t)i*q_stride;
+    half* ki = k + (int64_t)i*kv_stride;
+    const half* vi = v + (int64_t)i*kv_stride;
+    half* kdst = k_cache_base + (int64_t)i*kv_slot;
+    half* vdst = v_cache_base + (int64_t)i*kv_slot;
+    if (tid < total_pairs) {
+        const bool is_q = tid < q_pairs;
+        int head, pair_idx; half* ptr; half* dst = nullptr;
+        if (is_q) { head = tid / half_dim; pair_idx = tid % half_dim; ptr = qi + head*head_dim; }
+        else      { int kt = tid - q_pairs; head = kt / half_dim; pair_idx = kt % half_dim; ptr = ki + head*head_dim; dst = kdst + head*head_dim; }
+        const float freq = 1.0f / powf(theta_base, (2.0f*pair_idx)/head_dim);
+        const float angle = position*freq, c = cosf(angle), s = sinf(angle);
+        const int i0 = neox ? pair_idx : pair_idx*2, i1 = neox ? pair_idx+half_dim : pair_idx*2+1;
+        const float v0 = __half2float(ptr[i0]), v1 = __half2float(ptr[i1]);
+        const half r0 = __float2half(v0*c - v1*s), r1 = __float2half(v0*s + v1*c);
+        ptr[i0] = r0; ptr[i1] = r1;
+        if (!is_q) { dst[i0] = r0; dst[i1] = r1; }
+    }
+    if (tid < kv_dim) vdst[tid] = vi[tid];
+}
+
+void rope_inplace_batched(half* q, half* k, int n_heads, int n_kv_heads, int head_dim,
+                          int start_pos, int N, int q_stride, int k_stride,
+                          float theta_base, bool neox, cudaStream_t stream) {
+    const int total_pairs = (n_heads + n_kv_heads) * (head_dim / 2);
+    const int block = BLOCK_SIZE;
+    dim3 grid((total_pairs + block - 1) / block, N);
+    rope_batched_kernel<<<grid, block, 0, stream>>>(
+        q, k, n_heads, n_kv_heads, head_dim, start_pos, N, q_stride, k_stride, theta_base, neox);
+}
+
+void rope_inplace_store_kv_fp16_batched(
+    half* q, half* k, const half* v, half* k_cache_base, half* v_cache_base, int kv_slot,
+    int n_heads, int n_kv_heads, int head_dim, int start_pos, int N,
+    int q_stride, int kv_stride, float theta_base, bool neox, cudaStream_t stream) {
+    const int total_pairs = (n_heads + n_kv_heads) * (head_dim / 2);
+    const int kv_dim = n_kv_heads * head_dim;
+    const int total = total_pairs > kv_dim ? total_pairs : kv_dim;
+    const int block = BLOCK_SIZE;
+    dim3 grid((total + block - 1) / block, N);
+    rope_store_kv_fp16_batched_kernel<<<grid, block, 0, stream>>>(
+        q, k, v, k_cache_base, v_cache_base, kv_slot,
+        n_heads, n_kv_heads, head_dim, start_pos, N, q_stride, kv_stride, theta_base, neox);
+}
+
 // CUDA-graph-friendly variant: position is read from a device int* at
 // kernel-execution time, so a single captured graph can be replayed for
 // every decode step. The K/V cache destinations are likewise computed
