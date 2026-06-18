@@ -371,7 +371,7 @@ static __device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(
 // ===== mmq_write_back_mma =====
 template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
 static __device__ __forceinline__ void mmq_write_back_mma(
-        const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+        const float * __restrict__ sum, const int * __restrict__ ids_dst, half * __restrict__ dst,
         const int stride, const int i_max, const int j_max) {
 
     constexpr int granularity = mmq_get_granularity_device(mmq_x);
@@ -412,7 +412,7 @@ static __device__ __forceinline__ void mmq_write_back_mma(
                     continue;
                 }
 
-                dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
+                dst[ids_dst[j]*stride + i] = __float2half(sum[(j0/tile_C::J + n)*tile_C::ne + l]);
             }
         }
     }
@@ -441,7 +441,7 @@ template <int mmq_x, int mmq_y, bool need_check>
 __launch_bounds__(32*8, 2)
 __global__ void mul_mat_q6k_llama(
         const char * __restrict__ x, const int * __restrict__ y, const int * __restrict__ ids_dst,
-        float * __restrict__ dst,
+        half * __restrict__ dst,
         const int nrows_x, const int ncols_dst, const int stride_row_x, const int stride_col_dst,
         const int stride_y_cols) {
     constexpr int warp_size = 32, nwarps = 8, qk = QK_K, ne_block = 4*QK8_1;
@@ -482,19 +482,12 @@ __global__ void mul_mat_q6k_llama(
         sum, ids_dst + col0, dst + row0, stride_col_dst, tile_x_max_i, tile_y_max_j);
 }
 
-__global__ void f32_to_half_q6k(const float* __restrict__ src, half* __restrict__ dst, int64_t n) {
-    int64_t i = (int64_t)blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half(src[i]);
-}
-
 static block_q8_1_mmq* g6_q8 = nullptr; static size_t g6_q8_cap = 0;
 static int*            g6_ids = nullptr; static int    g6_ids_cap = 0;
-static float*          g6_cf  = nullptr; static size_t g6_cf_cap = 0;
-static void ensure6(size_t q8_blocks, int npad, size_t cf_elems) {
+static void ensure6(size_t q8_blocks, int npad) {
     if (q8_blocks > g6_q8_cap) { if (g6_q8) cudaFree(g6_q8); cudaMalloc(&g6_q8, q8_blocks*sizeof(block_q8_1_mmq)); g6_q8_cap=q8_blocks; }
     if (npad > g6_ids_cap) { if (g6_ids) cudaFree(g6_ids); cudaMalloc(&g6_ids, npad*sizeof(int)); g6_ids_cap=npad;
         int* h=(int*)malloc(npad*sizeof(int)); for(int i=0;i<npad;i++) h[i]=i; cudaMemcpy(g6_ids,h,npad*sizeof(int),cudaMemcpyHostToDevice); free(h); }
-    if (cf_elems > g6_cf_cap) { if (g6_cf) cudaFree(g6_cf); cudaMalloc(&g6_cf, cf_elems*sizeof(float)); g6_cf_cap=cf_elems; }
 }
 
 }  // anonymous namespace
@@ -507,21 +500,20 @@ void gemm_q6k_mmq_llama(half* y, const void* W, const half* x, int M, int N, int
     const void* Wdev = W;
     { cudaPointerAttributes pa;
       if (cudaPointerGetAttributes(&pa, W) == cudaSuccess && pa.devicePointer != nullptr) Wdev = pa.devicePointer; }
-    ensure6((size_t)nkb128*npad, npad, (size_t)N*M);
+    ensure6((size_t)nkb128*npad, npad);
     if (npad > N) cudaMemsetAsync(g6_q8, 0, (size_t)nkb128*npad*sizeof(block_q8_1_mmq), stream);
     quantize_mmq_q8_1_d4<<<dim3(npad, nkb128), 128, 0, stream>>>(x, g6_q8, N, K, npad);
 
     const int nwarps=8, warp=32;
     size_t shmem = (size_t)(MX + GGML_PAD(MX*MMQ_TILE_Y_K, nwarps*warp) + MY*MMQ_MMA_TILE_X_K_Q6_K)*sizeof(int);
     dim3 grid(npad/MX, (M + MY - 1)/MY), block(warp, nwarps);
+    // write_back emits half directly into y (no f32 staging buffer / convert kernel).
     if (M % MY == 0) {
         cudaFuncSetAttribute(mul_mat_q6k_llama<MX,MY,false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        mul_mat_q6k_llama<MX,MY,false><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g6_q8,g6_ids,g6_cf,M,N,nbk,M,npad);
+        mul_mat_q6k_llama<MX,MY,false><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g6_q8,g6_ids,y,M,N,nbk,M,npad);
     } else {
         cudaFuncSetAttribute(mul_mat_q6k_llama<MX,MY,true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        mul_mat_q6k_llama<MX,MY,true><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g6_q8,g6_ids,g6_cf,M,N,nbk,M,npad);
+        mul_mat_q6k_llama<MX,MY,true><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g6_q8,g6_ids,y,M,N,nbk,M,npad);
     }
-    int64_t n = (int64_t)N*M;
-    f32_to_half_q6k<<<(n+255)/256, 256, 0, stream>>>(g6_cf, y, n);
 }
 }  // namespace jllm
