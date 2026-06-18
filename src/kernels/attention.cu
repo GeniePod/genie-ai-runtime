@@ -10,6 +10,7 @@
 #include "jllm_kernels.h"
 #include <cuda_fp16.h>
 #include <cuda_pipeline.h>
+#include <cublas_v2.h>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -516,6 +517,87 @@ __global__ void flash_attention_prefill_batched_kernel(
     }
 }
 
+// ── Tensor-core unfused prefill attention via cuBLAS (JLLM_ATTN_CUBLAS) ───────
+// QK^T (fp16 TC gemm) → masked f32 softmax → P·V (fp16 TC gemm). ~2-10x the F32
+// flash kernel (genie's attn was 0.22% tensor-core util / ALU-bound; llama uses
+// TC). Numerically safe: fp16 inputs + f32 accumulate, validated rel-RMS 3e-4
+// even on Gemma's 10-20x V-outliers (the prior TC-attn failure was f16 *accumulate*,
+// not f16 inputs). FP16 KV + MQA (n_kv_heads==1) only; else returns false to fall
+// back to the F32 path.
+static bool attn_cublas_enabled() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("JLLM_ATTN_CUBLAS"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;   // default on; JLLM_ATTN_CUBLAS=0 reverts to the F32 flash kernel
+}
+static cublasHandle_t g_attn_cublas = nullptr;
+static float* g_attn_scores = nullptr; static size_t g_attn_scores_cap = 0;
+static half*  g_attn_p      = nullptr; static size_t g_attn_p_cap = 0;
+
+// per (head, query i): scores S already scaled (gemm alpha = scale). Mask causal
+// (key j ≤ start_pos+i) + sliding window (j ≥ start_pos+i+1-window), then softmax.
+// S[(head*N + i)*seq + j] → P fp16 (normalized).
+__global__ void attn_mask_softmax_kernel(const float* __restrict__ S, half* __restrict__ P,
+                                         int N, int seq, int start_pos, int window) {
+    const int i = blockIdx.x, head = blockIdx.y;
+    const int64_t row = ((int64_t)head * N + i) * seq;
+    const int qpos = start_pos + i, hi = qpos;
+    int lo = (window > 0) ? (qpos + 1 - window) : 0; if (lo < 0) lo = 0;
+    extern __shared__ float sh[];
+    float mx = -1e30f;
+    for (int j = threadIdx.x; j < seq; j += blockDim.x) {
+        float v = (j >= lo && j <= hi) ? S[row + j] : -1e30f; sh[j] = v; mx = fmaxf(mx, v);
+    }
+    __syncthreads();
+    __shared__ float r[32]; int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, o));
+    if (l == 0) r[w] = mx; __syncthreads();
+    if (threadIdx.x == 0) { float m = -1e30f; for (int k = 0; k < (blockDim.x >> 5); k++) m = fmaxf(m, r[k]); r[0] = m; }
+    __syncthreads(); mx = r[0];
+    float sum = 0;
+    for (int j = threadIdx.x; j < seq; j += blockDim.x) { float p = sh[j] > -1e29f ? __expf(sh[j] - mx) : 0.f; sh[j] = p; sum += p; }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(~0u, sum, o);
+    __shared__ float rs[32]; if (l == 0) rs[w] = sum; __syncthreads();
+    if (threadIdx.x == 0) { float s = 0; for (int k = 0; k < (blockDim.x >> 5); k++) s += rs[k]; rs[0] = s; }
+    __syncthreads();
+    float inv = rs[0] > 0 ? 1.f / rs[0] : 0.f;
+    for (int j = threadIdx.x; j < seq; j += blockDim.x) P[row + j] = __float2half(sh[j] * inv);
+}
+
+static bool launch_attn_cublas_prefill(
+    half* output, const half* q, const void* k_cache, const void* v_cache,
+    int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
+    int N, int start_pos, float scale, int window, cudaStream_t stream) {
+    if (n_kv_heads != 1) return false;             // MQA only for now (Gemma E2B)
+    const int seq    = start_pos + N;
+    const int q_dim  = n_heads * head_dim;
+    const int kv_dim = n_kv_heads * cache_head_dim;
+    if (!g_attn_cublas) { if (cublasCreate(&g_attn_cublas) != CUBLAS_STATUS_SUCCESS) return false; }
+    cublasSetStream(g_attn_cublas, stream);
+    const size_t sc = (size_t)n_heads * N * seq;
+    if (sc > g_attn_scores_cap) { if (g_attn_scores) cudaFree(g_attn_scores);
+        if (cudaMalloc(&g_attn_scores, sc * sizeof(float)) != cudaSuccess) { g_attn_scores_cap = 0; return false; } g_attn_scores_cap = sc; }
+    if (sc > g_attn_p_cap) { if (g_attn_p) cudaFree(g_attn_p);
+        if (cudaMalloc(&g_attn_p, sc * sizeof(half)) != cudaSuccess) { g_attn_p_cap = 0; return false; } g_attn_p_cap = sc; }
+    float alpha = scale, zero = 0.f;
+    // S[head][N×seq] row-major = scale·Q·K^T. Col-major C^T(seq×N)=K·Q^T → OP_T(K), OP_N(Q).
+    // K shared across heads (MQA → strideK 0); Q per head (stride head_dim within q_dim).
+    if (cublasGemmStridedBatchedEx(g_attn_cublas, CUBLAS_OP_T, CUBLAS_OP_N, seq, N, head_dim,
+            &alpha, k_cache, CUDA_R_16F, kv_dim, 0,
+                    q,       CUDA_R_16F, q_dim,  head_dim,
+            &zero,  g_attn_scores, CUDA_R_32F, seq, (long long)N * seq,
+            n_heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
+    attn_mask_softmax_kernel<<<dim3(N, n_heads), 256, (size_t)seq * sizeof(float), stream>>>(
+        g_attn_scores, g_attn_p, N, seq, start_pos, window);
+    // O[head][N×head_dim] row-major = P·V. Col-major C^T(head_dim×N) → OP_N(V), OP_N(P).
+    float one = 1.f;
+    if (cublasGemmStridedBatchedEx(g_attn_cublas, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, N, seq,
+            &one, v_cache, CUDA_R_16F, kv_dim, 0,
+                  g_attn_p, CUDA_R_16F, seq, (long long)N * seq,
+            &zero, output, CUDA_R_16F, q_dim, head_dim,
+            n_heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) return false;
+    return true;
+}
+
 void flash_attention_prefill_batched(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
@@ -524,6 +606,12 @@ void flash_attention_prefill_batched(
     const float* k_scales, const float* v_scales, int window, cudaStream_t stream)
 {
     if (N <= 0) return;
+    // Tensor-core cuBLAS prefill attention (FP16 KV + MQA); falls back if unsupported.
+    if (attn_cublas_enabled() && !kv_int8 &&
+        launch_attn_cublas_prefill(output, q, k_cache, v_cache, n_heads, n_kv_heads,
+            head_dim, cache_head_dim, N, start_pos, scale, window, stream)) {
+        return;
+    }
     // Path I3 (#62): removed the `kv_int8 → N-sequential-decode` fallback
     // that lived here. The batched kernel now handles INT8 via per-position
     // k_scales / v_scales lookups; no reason to walk per-token anymore.
