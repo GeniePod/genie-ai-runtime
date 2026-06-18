@@ -9,6 +9,7 @@
 
 #include "jllm_kernels.h"
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -67,6 +68,173 @@ __device__ __forceinline__ float block_sum_f(float v, float* red, int warp_id, i
     float r = red[0];
     __syncthreads();
     return r;
+}
+
+// ===================================================================
+// F32 query-tiled flash-attention prefill (opt-in via JLLM_FLASH_TC).
+// Roofline on Orin: attention is MEMORY-BANDWIDTH-bound (AI 16-32 FLOP/byte
+// << ridge ~200), so the win is K/V-byte reduction, NOT tensor-core compute.
+// 16 queries/block (one warp each) share each cp.async-loaded K/V tile ->
+// ~16x less K/V DRAM than the scalar 1-query/block kernel, and the speedup
+// GROWS with context (scalar prefill 63 tok/s @8k -> 101, ~flat). Math is
+// F32 (warp all-reduce dot + online softmax), numerically == the scalar
+// kernel, avoiding the f16 tensor-core precision loss that Gemma's large V
+// outliers amplify. FP16 KV only (Gemma forces FP16 KV); int8 -> scalar path.
+// ===================================================================
+static bool flash_tc_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_FLASH_TC");
+        return v && strcmp(v, "0") != 0;   // opt-in: default OFF
+    }();
+    return enabled;
+}
+
+static constexpr int TC_KT = 16;   // keys per K/V tile
+// Finite-math-safe sentinels: the build uses --use_fast_math (finite-math-only,
+// no Inf/NaN), so masking must NOT use -INFINITY (a fully-masked row would do
+// exp(-INF - -INF) = exp(NaN), undefined under fast-math). Use a large negative
+// value + a guard so the kernel never produces Inf/NaN.
+#define TC_NEG   (-1e30f)
+#define TC_NEG_T (-1e29f)   // threshold: anything <= this is "masked"
+
+// async-load one K/V tile (abs positions kt..kt+15) into shared f16 buffers.
+// cache stride = kv_dim (= n_kv_heads*cache_head_dim); only HEAD_DIM cols read
+// from the cache_head_dim-wide slot. Out-of-range rows zero-filled.
+template<int D>
+__device__ __forceinline__ void tc_load_tile(half* Kb, half* Vb,
+        const half* k_cache, const half* v_cache, int kt, int block_seq,
+        int kv_dim, int kv_hoff, int lane, int bdim) {
+    const int nchunk = (TC_KT*D)/8;
+    for (int chunk = lane; chunk < nchunk; chunk += bdim) {
+        const int hidx = chunk*8, r = hidx/D, c = hidx%D, kp = kt + r;
+        if (kp < block_seq) {
+            __pipeline_memcpy_async(&Kb[hidx], &k_cache[(int64_t)kp*kv_dim + kv_hoff + c], 16);
+            __pipeline_memcpy_async(&Vb[hidx], &v_cache[(int64_t)kp*kv_dim + kv_hoff + c], 16);
+        } else {
+            #pragma unroll
+            for (int z = 0; z < 8; z++) { Kb[hidx+z]=__float2half(0.f); Vb[hidx+z]=__float2half(0.f); }
+        }
+    }
+}
+
+// ===================================================================
+// F32 query-tiled flash-attention prefill (the roofline-correct kernel).
+// Attention is MEMORY-BOUND on Orin, so the win is K/V-byte reduction, NOT
+// tensor-core compute. MQ=16 queries/block (one warp per query) share each
+// cp.async-loaded K/V tile -> 16x less K/V DRAM than the scalar MQ=1 kernel.
+// All math in F32 (warp all-reduce dot + online softmax) -> bit-for-bit the
+// scalar kernel's precision, avoiding the f16-P MMA error that Gemma's large
+// V outliers amplify. No MMA, no f16-P, no 2-warp split. FP16 KV only.
+// ===================================================================
+template<int HEAD_DIM, int MQ>
+__global__ void flash_attn_prefill_f32t_kernel(
+        half* __restrict__ output, const half* __restrict__ q,
+        const half* __restrict__ k_cache, const half* __restrict__ v_cache,
+        int n_heads, int n_kv_heads, int cache_head_dim,
+        int N, int start_pos, float scale, int window) {
+    const int head = blockIdx.x, qt = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int q_idx = qt * MQ + warp;          // query index within the chunk
+    const int q_abs = start_pos + q_idx;       // absolute position (for masking)
+    const int q_dim = n_heads * HEAD_DIM;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int kv_dim  = n_kv_heads * cache_head_dim;
+    const int kv_hoff = kv_head * cache_head_dim;
+    constexpr int CPL = HEAD_DIM / 32;         // head-dim components per lane
+
+    extern __shared__ half f32t_smem[];
+    half* Kbuf = f32t_smem;                    // 2 * TC_KT * HEAD_DIM (double-buffered)
+    half* Vbuf = Kbuf + 2*TC_KT*HEAD_DIM;
+    half* Kb[2] = { Kbuf, Kbuf + TC_KT*HEAD_DIM };
+    half* Vb[2] = { Vbuf, Vbuf + TC_KT*HEAD_DIM };
+
+    const bool valid_q = (q_idx < N);
+    float qreg[CPL], oreg[CPL];
+    #pragma unroll
+    for (int c = 0; c < CPL; c++) {
+        const int d = lane + c*32;
+        qreg[c] = valid_q ? __half2float(q[(int64_t)q_idx*q_dim + (int64_t)head*HEAD_DIM + d]) : 0.f;
+        oreg[c] = 0.f;
+    }
+    float m = -1e30f, l = 0.f;
+
+    const int block_seq = start_pos + min(qt*MQ + MQ - 1, N - 1) + 1;   // uniform per block
+    int kt_start = 0;
+    if (window > 0) { kt_start = start_pos + qt*MQ + 1 - window; if (kt_start < 0) kt_start = 0; kt_start = (kt_start/TC_KT)*TC_KT; }
+
+    int buf = 0;
+    tc_load_tile<HEAD_DIM>(Kb[0], Vb[0], k_cache, v_cache, kt_start, block_seq, kv_dim, kv_hoff, threadIdx.x, blockDim.x);
+    __pipeline_commit();
+
+    for (int kt = kt_start; kt < block_seq; kt += TC_KT) {
+        const int ktn = kt + TC_KT;
+        if (ktn < block_seq) {
+            tc_load_tile<HEAD_DIM>(Kb[buf^1], Vb[buf^1], k_cache, v_cache, ktn, block_seq, kv_dim, kv_hoff, threadIdx.x, blockDim.x);
+            __pipeline_commit();
+            __pipeline_wait_prior(1);
+        } else {
+            __pipeline_wait_prior(0);
+        }
+        __syncthreads();
+        const half* Ksh = Kb[buf];
+        const half* Vsh = Vb[buf];
+
+        #pragma unroll 1
+        for (int j = 0; j < TC_KT; j++) {
+            const int kp = kt + j;
+            const bool masked = !valid_q || (kp > q_abs) || (window > 0 && kp < q_abs + 1 - window);
+            float dot = 0.f;
+            #pragma unroll
+            for (int c = 0; c < CPL; c++) { const int d = lane + c*32; dot += qreg[c] * __half2float(Ksh[j*HEAD_DIM + d]); }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);   // all-reduce -> every lane has full dot
+            const float s = masked ? -1e30f : dot * scale;
+            const float nm = fmaxf(m, s);
+            const float corr = (m <= -1e29f) ? 0.f : __expf(m - nm);
+            const float p    = (s <= -1e29f) ? 0.f : __expf(s - nm);
+            m = nm; l = l*corr + p;
+            #pragma unroll
+            for (int c = 0; c < CPL; c++) { const int d = lane + c*32; oreg[c] = oreg[c]*corr + p * __half2float(Vsh[j*HEAD_DIM + d]); }
+        }
+        __syncthreads();
+        buf ^= 1;
+    }
+
+    if (valid_q) {
+        const float inv = (l > 0.f) ? 1.f/l : 0.f;
+        #pragma unroll
+        for (int c = 0; c < CPL; c++) { const int d = lane + c*32; output[(int64_t)q_idx*q_dim + (int64_t)head*HEAD_DIM + d] = __float2half(oreg[c]*inv); }
+    }
+}
+
+// launch wrapper: picks HEAD_DIM=256/512 template + opt-in shared. Returns
+// false on any unsupported shape (caller falls back to the scalar path).
+static bool launch_flash_attn_prefill_tc(
+        half* output, const half* q, const void* k_cache, const void* v_cache,
+        int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
+        int N, int start_pos, float scale, int window, cudaStream_t stream) {
+    if (head_dim != 256 && head_dim != 512) return false;
+    constexpr int MQ = 16;                                  // queries per block (1 warp each)
+    size_t smbytes = (size_t)(4*TC_KT*head_dim)*sizeof(half);  // double-buffered K+V tiles
+    const dim3 grid(n_heads, (N + MQ - 1)/MQ, 1);
+    const int block = MQ*32;
+    const half* kh = (const half*)k_cache;
+    const half* vh = (const half*)v_cache;
+    cudaError_t sa;
+    if (head_dim == 256) {
+        sa = cudaFuncSetAttribute(flash_attn_prefill_f32t_kernel<256,MQ>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smbytes);
+        if (sa != cudaSuccess) { fprintf(stderr, "[attention] F32T d256 smem %zuB setattr FAIL: %s\n", smbytes, cudaGetErrorString(sa)); return false; }
+        flash_attn_prefill_f32t_kernel<256,MQ><<<grid, block, smbytes, stream>>>(
+            output, q, kh, vh, n_heads, n_kv_heads, cache_head_dim, N, start_pos, scale, window);
+    } else {
+        sa = cudaFuncSetAttribute(flash_attn_prefill_f32t_kernel<512,MQ>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smbytes);
+        if (sa != cudaSuccess) { fprintf(stderr, "[attention] F32T d512 smem %zuB setattr FAIL: %s\n", smbytes, cudaGetErrorString(sa)); return false; }
+        flash_attn_prefill_f32t_kernel<512,MQ><<<grid, block, smbytes, stream>>>(
+            output, q, kh, vh, n_heads, n_kv_heads, cache_head_dim, N, start_pos, scale, window);
+    }
+    cudaError_t le = cudaGetLastError();
+    if (le != cudaSuccess) { fprintf(stderr, "[attention] F32T d%d launch FAIL (smem %zuB): %s\n", head_dim, smbytes, cudaGetErrorString(le)); return false; }
+    return true;
 }
 
 // Each thread handles ceil(head_dim / blockDim.x) output dimensions.
@@ -368,6 +536,20 @@ void flash_attention_prefill_batched(
                 k_cache, v_cache,
                 n_heads, n_kv_heads, head_dim, cache_head_dim,
                 start_pos + t + 1, scale, kv_int8, k_scales, v_scales, window, stream);
+        }
+        return;
+    }
+
+    // Opt-in F32 query-tiled path (FP16 KV only — Gemma forces FP16 KV).
+    // Memory-bound on Orin, so the win is K/V-byte reduction via 16-query
+    // tiles (16x less K/V DRAM than the scalar MQ=1 kernel); f32 math.
+    if (flash_tc_enabled() && !kv_int8 &&
+        launch_flash_attn_prefill_tc(output, q, k_cache, v_cache, n_heads,
+            n_kv_heads, head_dim, cache_head_dim, N, start_pos, scale, window, stream)) {
+        static bool logged_tc = false;
+        if (!logged_tc) {
+            fprintf(stderr, "[attention] Using F32 query-tiled prefill attention path (JLLM_FLASH_TC)\n");
+            logged_tc = true;
         }
         return;
     }
