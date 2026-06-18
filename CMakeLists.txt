@@ -69,6 +69,7 @@ set(JETSON_SRC
 set(KERNEL_SRC
     src/kernels/gemv_q4.cu
     src/kernels/mmq_q4k_llama.cu
+    src/kernels/mmq_q6k_llama.cu
     src/kernels/dense_tc.cu
     src/kernels/fused_norm.cu
     src/kernels/attention.cu
