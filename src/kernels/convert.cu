@@ -78,6 +78,9 @@ void fp16_to_int8(int8_t* dst, float* scale_out, const half* src,
 //
 // output = silu(gate) * up
 // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+//
+// half2 vectorized: 2 elements per thread.  intermediate_dim is always
+// even (power-of-2 FFN dims), so the single-element tail rarely fires.
 
 __global__ void swiglu_kernel(
     half*       __restrict__ output,
@@ -85,20 +88,25 @@ __global__ void swiglu_kernel(
     const half* __restrict__ up,
     int rows, int dim)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx2  = (int)(blockIdx.x * blockDim.x + threadIdx.x) * 2;
     const int total = rows * dim;
-    if (idx >= total) return;
+    if (idx2 >= total) return;
 
-    float g = __half2float(gate[idx]);
-    float u = __half2float(up[idx]);
-    float silu = g / (1.0f + expf(-g));
-    output[idx] = __float2half(silu * u);
+    half2 g2 = *reinterpret_cast<const half2*>(&gate[idx2]);
+    half2 u2 = *reinterpret_cast<const half2*>(&up[idx2]);
+    float g0 = __half2float(g2.x), g1 = __half2float(g2.y);
+    float u0 = __half2float(u2.x), u1 = __half2float(u2.y);
+    half2 out2;
+    out2.x = __float2half(g0 / (1.0f + expf(-g0)) * u0);
+    out2.y = (idx2 + 1 < total) ? __float2half(g1 / (1.0f + expf(-g1)) * u1)
+                                 : __float2half(0.0f);
+    *reinterpret_cast<half2*>(&output[idx2]) = out2;
 }
 
 void fused_swiglu(half* output, const half* gate, const half* up,
                   int rows, int intermediate_dim, cudaStream_t stream) {
-    int total = rows * intermediate_dim;
-    int grid = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int total2 = (rows * intermediate_dim + 1) / 2;
+    const int grid   = (total2 + BLOCK_SIZE - 1) / BLOCK_SIZE;
     swiglu_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
         output, gate, up, rows, intermediate_dim);
 }
@@ -108,6 +116,7 @@ void fused_swiglu(half* output, const half* gate, const half* up,
 // output = gelu_tanh(gate) * up
 // gelu_tanh(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 * x^3) ))
 // This is the "gelu_pytorch_tanh" approximation Gemma's FFN uses.
+// half2 vectorized: 2 elements per thread.
 
 __global__ void geglu_kernel(
     half*       __restrict__ output,
@@ -115,33 +124,48 @@ __global__ void geglu_kernel(
     const half* __restrict__ up,
     int rows, int dim)
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx2  = (int)(blockIdx.x * blockDim.x + threadIdx.x) * 2;
     const int total = rows * dim;
-    if (idx >= total) return;
+    if (idx2 >= total) return;
 
-    float g = __half2float(gate[idx]);
-    float u = __half2float(up[idx]);
-    const float kSqrt2OverPi = 0.7978845608028654f;  // sqrt(2/pi)
-    float gelu = 0.5f * g * (1.0f + tanhf(kSqrt2OverPi * (g + 0.044715f * g * g * g)));
-    output[idx] = __float2half(gelu * u);
+    half2 g2 = *reinterpret_cast<const half2*>(&gate[idx2]);
+    half2 u2 = *reinterpret_cast<const half2*>(&up[idx2]);
+    float g0 = __half2float(g2.x), g1 = __half2float(g2.y);
+    float u0 = __half2float(u2.x), u1 = __half2float(u2.y);
+    const float kSqrt2OverPi = 0.7978845608028654f;
+    auto gelu = [&](float g) {
+        return 0.5f * g * (1.0f + tanhf(kSqrt2OverPi * (g + 0.044715f * g * g * g)));
+    };
+    half2 out2;
+    out2.x = __float2half(gelu(g0) * u0);
+    out2.y = (idx2 + 1 < total) ? __float2half(gelu(g1) * u1) : __float2half(0.0f);
+    *reinterpret_cast<half2*>(&output[idx2]) = out2;
 }
 
 void fused_geglu(half* output, const half* gate, const half* up,
                  int rows, int intermediate_dim, cudaStream_t stream) {
-    int total = rows * intermediate_dim;
-    int grid = (total + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int total2 = (rows * intermediate_dim + 1) / 2;
+    const int grid   = (total2 + BLOCK_SIZE - 1) / BLOCK_SIZE;
     geglu_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
         output, gate, up, rows, intermediate_dim);
 }
 
-// ── Scalar multiply (Gemma embedding scale: x *= sqrt(hidden)) ────────────
+// ── Scalar multiply (Gemma layer scale: x *= layer_scale_val) ────────────
+// half2 vectorized: 2 elements per thread using __hmul2.
 __global__ void vec_scale_kernel(half* x, int n, float s) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) x[i] = __float2half(__half2float(x[i]) * s);
+    const int i2 = (int)(blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (i2 + 1 < n) {
+        half2 sh = __float2half2_rn(s);
+        *reinterpret_cast<half2*>(&x[i2]) =
+            __hmul2(*reinterpret_cast<const half2*>(&x[i2]), sh);
+    } else if (i2 < n) {
+        x[i2] = __float2half(__half2float(x[i2]) * s);
+    }
 }
 
 void vec_scale(half* x, int n, float s, cudaStream_t stream) {
-    int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int n2   = (n + 1) >> 1;
+    const int grid = (n2 + BLOCK_SIZE - 1) / BLOCK_SIZE;
     vec_scale_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(x, n, s);
 }
 

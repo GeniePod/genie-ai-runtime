@@ -54,19 +54,26 @@ static bool fast_embedding_enabled() {
 }
 
 // ── Vector add kernel (for residual connections) ─────────────────────────
-// BUG #2 fix: need explicit residual add between stages
-
+// Vectorized half2: each thread adds 2 elements with __hadd2, avoiding
+// float round-trip.  n is always even (power-of-2 hidden dims), so the
+// single-element tail path is a safety net, not a normal code path.
 __global__ void vec_add_kernel(half* __restrict__ out,
                                 const half* __restrict__ a,
                                 const half* __restrict__ b, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n)
-        out[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+    const int i2 = (int)(blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (i2 + 1 < n) {
+        *reinterpret_cast<half2*>(&out[i2]) =
+            __hadd2(*reinterpret_cast<const half2*>(&a[i2]),
+                    *reinterpret_cast<const half2*>(&b[i2]));
+    } else if (i2 < n) {
+        out[i2] = __hadd(a[i2], b[i2]);
+    }
 }
 
 static void vec_add(half* out, const half* a, const half* b, int n, cudaStream_t s) {
-    int block = 128;
-    int grid = (n + block - 1) / block;
+    const int block = 128;
+    const int n2    = (n + 1) >> 1;
+    const int grid  = (n2 + block - 1) / block;
     vec_add_kernel<<<grid, block, 0, s>>>(out, a, b, n);
 }
 

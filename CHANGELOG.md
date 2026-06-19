@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### perf(kernels): half2-vectorize elementwise kernels (vec_add, norm, geglu, swiglu, scale)
+
+Vectorize five per-layer elementwise kernels to process 2 `half` elements per
+thread using SM 8.7 `half2` SIMD intrinsics, halving instruction count and
+avoiding float round-trips where possible:
+
+- **`vec_add_kernel`** (`decode.cu`): uses `__hadd2` — stays in FP16 natively,
+  no `__half2float` / `__float2half` pair per element.
+- **`swiglu_kernel`** and **`geglu_kernel`** (`convert.cu`): `half2` load of
+  gate/up, float compute for the transcendental, `half2` store.
+- **`vec_scale_kernel`** (`convert.cu`): `__hmul2` — native FP16 scale, no
+  float conversion.
+- **`fused_rmsnorm_residual_kernel`** (`fused_norm.cu`): `half2` loads in both
+  pass 1 (sum-of-squares) and pass 2 (normalize + write), weight loaded as
+  `half2` when FP16 or as two F32 reads when FP32.
+
+All kernels launch with half the grid size.  Hidden/intermediate dims are
+always even, so the single-element tail path is a safety net only.
+
 ### perf(gemv): dp4a triple kernel for Q4_K+Q4_K+Q6_K QKV projections
 
 Adds `gemv_quant_triple_dp4a_typed_kernel<T0,T1,T2>` — a templated kernel that

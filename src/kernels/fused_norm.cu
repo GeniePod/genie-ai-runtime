@@ -19,23 +19,17 @@ static bool fast_norm_enabled() {
     return enabled;
 }
 
-// Single-pass RMSNorm: avoid the previous two-pass sdata cache entirely.
+// RMSNorm kernel: half2-vectorized two-pass implementation.
 //
-// On Qwen3-4B (hidden_dim 2560, block 128) the previous implementation
-// produced output with every-other element zeroed — the signature of a
-// shared-memory layout bug where `extern __shared__ float sdata[]`
-// (sized hidden_dim×4) and the statically-allocated
-// `__shared__ float warp_sums[4]` could end up at overlapping or
-// otherwise miscomputed offsets, plus a missing __syncthreads between
-// Pass 1 (write sdata) and Pass 2 (read sdata) which technically only
-// each thread reads what it wrote but the compiler is free to reorder
-// the writes around the inter-warp reduction.
+// Each thread processes 2 elements per iteration (half2 load), halving
+// the number of memory instructions vs the scalar path.  dim is always
+// even (power-of-2 hidden dims: 2560, 3840, 4096 …) so no tail handling
+// is needed.
 //
-// This rewrite eliminates the cache entirely. Each thread reads x once
-// for the sum-of-squares pass, then re-reads x for the scale-and-write
-// pass. Two reads of a 5 KB hidden-state vector cost ~100 ns of LPDDR5
-// bandwidth — invisible next to the 100s of µs the kernel actually runs
-// for — and the correctness win is unambiguous.
+// Pass 1: accumulate sum-of-squares; warp+block reduce → rrms.
+// Pass 2: re-read x, normalize, scale by weight, store.
+// Two passes avoid a shared-memory cache for the full hidden vector while
+// keeping code correct across any block size.
 __global__ void fused_rmsnorm_residual_kernel(
     half*       __restrict__ output,
     const half* __restrict__ x,
@@ -43,37 +37,36 @@ __global__ void fused_rmsnorm_residual_kernel(
     const void* __restrict__ weight,
     int rows, int dim, float eps, bool weight_fp32)
 {
-    const int row = blockIdx.x;
+    const int row    = blockIdx.x;
     if (row >= rows) return;
 
-    const int tid = threadIdx.x;
+    const int tid    = threadIdx.x;
     const int stride = blockDim.x;
     const int offset = row * dim;
 
-    // ── Pass 1: compute sum of squares (read x[+residual] once) ─────────
+    // ── Pass 1: sum of squares via half2 loads ───────────────────────────
     float sum_sq = 0.0f;
-    for (int i = tid; i < dim; i += stride) {
-        float val = __half2float(x[offset + i]);
-        if (residual)
-            val += __half2float(residual[offset + i]);
-        sum_sq += val * val;
+    for (int i = tid * 2; i < dim; i += stride * 2) {
+        half2 xh = *reinterpret_cast<const half2*>(&x[offset + i]);
+        float2 v = __half22float2(xh);
+        if (residual) {
+            half2 rh = *reinterpret_cast<const half2*>(&residual[offset + i]);
+            float2 r = __half22float2(rh);
+            v.x += r.x;  v.y += r.y;
+        }
+        sum_sq += v.x * v.x + v.y * v.y;
     }
 
-    // Warp-level reduction first (intra-warp, no shared memory).
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         sum_sq += __shfl_xor_sync(0xFFFFFFFF, sum_sq, off);
 
-    // Block-level reduction via shared memory. Sized for up to 32 warps
-    // (block size ≤ 1024). Statically allocated; doesn't touch the
-    // dynamic shared memory pool, so launch-time smem can be 0.
     __shared__ float block_partial[32];
-    const int warp_id   = tid >> 5;     // tid / 32
+    const int warp_id   = tid >> 5;
     const int warp_lane = tid & 31;
     if (warp_lane == 0) block_partial[warp_id] = sum_sq;
     __syncthreads();
 
-    // Thread 0 reduces across warps and writes rrms back into slot 0.
     if (tid == 0) {
         const int n_warps = (stride + 31) >> 5;
         float total = 0.0f;
@@ -84,15 +77,26 @@ __global__ void fused_rmsnorm_residual_kernel(
 
     const float rrms = block_partial[0];
 
-    // ── Pass 2: read x again, normalize, scale by weight, write ─────────
-    for (int i = tid; i < dim; i += stride) {
-        float val = __half2float(x[offset + i]);
-        if (residual)
-            val += __half2float(residual[offset + i]);
-        float w = weight_fp32
-            ? ((const float*)weight)[i]
-            : __half2float(((const half*)weight)[i]);
-        output[offset + i] = __float2half(val * rrms * w);
+    // ── Pass 2: normalize and write via half2 ─────────────────────────────
+    for (int i = tid * 2; i < dim; i += stride * 2) {
+        half2 xh = *reinterpret_cast<const half2*>(&x[offset + i]);
+        float2 v = __half22float2(xh);
+        if (residual) {
+            half2 rh = *reinterpret_cast<const half2*>(&residual[offset + i]);
+            float2 r = __half22float2(rh);
+            v.x += r.x;  v.y += r.y;
+        }
+        float w0, w1;
+        if (weight_fp32) {
+            w0 = ((const float*)weight)[i];
+            w1 = ((const float*)weight)[i + 1];
+        } else {
+            half2 wh = *reinterpret_cast<const half2*>(&((const half*)weight)[i]);
+            float2 wf = __half22float2(wh);
+            w0 = wf.x;  w1 = wf.y;
+        }
+        half2 out2 = __floats2half2_rn(v.x * rrms * w0, v.y * rrms * w1);
+        *reinterpret_cast<half2*>(&output[offset + i]) = out2;
     }
 }
 
