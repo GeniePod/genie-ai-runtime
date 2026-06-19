@@ -293,7 +293,7 @@ void rope_inplace_store_kv_fp16_dyn(
     int            n_heads,
     int            n_kv_heads,
     int            head_dim,
-    int            kv_stride,           // = n_kv_heads * head_dim
+    int            cache_head_dim,      // KV cache per-head slot size (== head_dim for Qwen3/Llama; == global head_dim for Gemma4 sliding layers)
     const int*     d_pos,               // device-side int with current pos
     float          theta_base,
     bool           neox,
@@ -360,6 +360,8 @@ void flash_attention_prefill_batched(
 // CUDA-graph-friendly variant of flash_attention_decode: seq_len is
 // computed inside the kernel as (*d_pos) + 1. Used by the captured
 // decode graph so a single graph can be replayed for every step.
+// window: sliding-window mask size (0 = full attention); fixed per-layer
+// constant so it is safe to embed as a kernel argument in the captured graph.
 void flash_attention_decode_dyn(
     half*          output,
     const half*    q,
@@ -372,6 +374,7 @@ void flash_attention_decode_dyn(
     float          scale,
     bool           kv_int8,
     const float*   kv_scales,
+    int            window,     // 0 = full attention; > 0 = Gemma4 sliding mask
     cudaStream_t   stream
 );
 

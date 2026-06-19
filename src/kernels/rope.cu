@@ -268,31 +268,37 @@ __global__ void rope_store_kv_fp16_batched_kernel_tbl(
     if (tid < kv_dim) vdst[tid] = vi[tid];
 }
 
+// cache_head_dim: the per-head stride in the KV cache slot.  Equals head_dim
+// for all Qwen3/Llama layers; equals the GLOBAL head_dim (512) for Gemma4
+// sliding layers (head_dim=256) because the KV pool is sized for the largest
+// head in the model.  Writing only the first head_dim elements of each cache
+// head slot is correct — the attention kernel also reads only that many.
 __global__ void rope_store_kv_fp16_kernel_dyn_tbl(
     half*       __restrict__ q,
     half*       __restrict__ k,
     const half* __restrict__ v,
     half*       __restrict__ k_cache_layer_base,
     half*       __restrict__ v_cache_layer_base,
-    int n_heads, int n_kv_heads, int head_dim, int kv_stride,
+    int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
     const int*  __restrict__ d_pos,
     const float* __restrict__ cos_tbl, const float* __restrict__ sin_tbl,
     int half_dim, bool neox)
 {
-    const int tid     = blockIdx.x * blockDim.x + threadIdx.x;
-    const int h2      = head_dim / 2;
-    const int q_pairs = n_heads * h2;
-    const int total   = (n_heads + n_kv_heads) * h2;
-    const int kv_dim  = n_kv_heads * head_dim;
+    const int tid      = blockIdx.x * blockDim.x + threadIdx.x;
+    const int h2       = head_dim / 2;
+    const int q_pairs  = n_heads * h2;
+    const int total    = (n_heads + n_kv_heads) * h2;
+    const int kv_dim   = n_kv_heads * head_dim;
+    const int kv_stride = n_kv_heads * cache_head_dim;
     const int position = *d_pos;
-    half* const k_dst = k_cache_layer_base + (int64_t)position * kv_stride;
-    half* const v_dst = v_cache_layer_base + (int64_t)position * kv_stride;
+    half* const k_dst  = k_cache_layer_base + (int64_t)position * kv_stride;
+    half* const v_dst  = v_cache_layer_base + (int64_t)position * kv_stride;
 
     if (tid < total) {
         const bool is_q = tid < q_pairs;
         int head, pair_idx; half* ptr; half* dst = nullptr;
         if (is_q) { head = tid / h2; pair_idx = tid % h2; ptr = q + head * head_dim; }
-        else      { int kt = tid - q_pairs; head = kt / h2; pair_idx = kt % h2; ptr = k + head * head_dim; dst = k_dst + head * head_dim; }
+        else      { int kt = tid - q_pairs; head = kt / h2; pair_idx = kt % h2; ptr = k + head * head_dim; dst = k_dst + head * cache_head_dim; }
         const float c  = cos_tbl[(int64_t)position * half_dim + pair_idx];
         const float s  = sin_tbl[(int64_t)position * half_dim + pair_idx];
         const int i0   = neox ? pair_idx      : pair_idx * 2;
@@ -304,7 +310,13 @@ __global__ void rope_store_kv_fp16_kernel_dyn_tbl(
         ptr[i0] = r0; ptr[i1] = r1;
         if (!is_q) { dst[i0] = r0; dst[i1] = r1; }
     }
-    if (tid < kv_dim) v_dst[tid] = v[tid];
+    // V copy: per-head strided write so the cache slot stride (cache_head_dim)
+    // is respected when cache_head_dim > head_dim (Gemma4 sliding layers).
+    if (tid < kv_dim) {
+        const int kv_head = tid / head_dim;
+        const int d       = tid % head_dim;
+        v_dst[kv_head * cache_head_dim + d] = v[tid];
+    }
 }
 
 __global__ void rope_kernel(
@@ -573,21 +585,22 @@ __global__ void rope_store_kv_fp16_kernel_dyn(
     const half* __restrict__ v,
     half*       __restrict__ k_cache_layer_base,
     half*       __restrict__ v_cache_layer_base,
-    int n_heads, int n_kv_heads, int head_dim, int kv_stride,
+    int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
     const int*  __restrict__ d_pos,
     float theta_base, bool neox)
 {
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int tid      = blockIdx.x * blockDim.x + threadIdx.x;
     const int half_dim = head_dim / 2;
-    const int q_pairs = n_heads * half_dim;
-    const int total_pairs = (n_heads + n_kv_heads) * half_dim;
-    const int kv_dim = n_kv_heads * head_dim;
+    const int q_pairs  = n_heads * half_dim;
+    const int tot      = (n_heads + n_kv_heads) * half_dim;
+    const int kv_dim   = n_kv_heads * head_dim;
+    const int kv_stride = n_kv_heads * cache_head_dim;
 
     const int position = *d_pos;
     half* const k_cache_dst = k_cache_layer_base + (int64_t)position * kv_stride;
     half* const v_cache_dst = v_cache_layer_base + (int64_t)position * kv_stride;
 
-    if (tid < total_pairs) {
+    if (tid < tot) {
         const bool is_q = tid < q_pairs;
         int head, pair_idx;
         half* ptr;
@@ -602,10 +615,10 @@ __global__ void rope_store_kv_fp16_kernel_dyn(
             head = k_tid / half_dim;
             pair_idx = k_tid % half_dim;
             ptr = k + head * head_dim;
-            dst = k_cache_dst + head * head_dim;
+            dst = k_cache_dst + head * cache_head_dim;
         }
 
-        const float freq = 1.0f / powf(theta_base, (2.0f * pair_idx) / head_dim);
+        const float freq  = 1.0f / powf(theta_base, (2.0f * pair_idx) / head_dim);
         const float angle = position * freq;
         const float cos_val = cosf(angle);
         const float sin_val = sinf(angle);
@@ -614,8 +627,8 @@ __global__ void rope_store_kv_fp16_kernel_dyn(
         const int idx1 = neox ? pair_idx + half_dim : pair_idx * 2 + 1;
         const float v0 = __half2float(ptr[idx0]);
         const float v1 = __half2float(ptr[idx1]);
-        const half r0 = __float2half(v0 * cos_val - v1 * sin_val);
-        const half r1 = __float2half(v0 * sin_val + v1 * cos_val);
+        const half r0  = __float2half(v0 * cos_val - v1 * sin_val);
+        const half r1  = __float2half(v0 * sin_val + v1 * cos_val);
 
         ptr[idx0] = r0;
         ptr[idx1] = r1;
@@ -625,36 +638,45 @@ __global__ void rope_store_kv_fp16_kernel_dyn(
         }
     }
 
+    // V copy: per-head strided write for Gemma4 where cache_head_dim > head_dim.
     if (tid < kv_dim) {
-        v_cache_dst[tid] = v[tid];
+        const int kv_head = tid / head_dim;
+        const int d       = tid % head_dim;
+        v_cache_dst[kv_head * cache_head_dim + d] = v[tid];
     }
 }
 
 void rope_inplace_store_kv_fp16_dyn(
     half* q, half* k, const half* v,
     half* k_cache_layer_base, half* v_cache_layer_base,
-    int n_heads, int n_kv_heads, int head_dim, int kv_stride,
+    int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
     const int* d_pos, float theta_base, bool neox, cudaStream_t stream)
 {
-    const int h2     = head_dim / 2;
-    const int t_rope = (n_heads + n_kv_heads) * h2;
-    const int kv_dim = n_kv_heads * head_dim;
-    const int total  = t_rope > kv_dim ? t_rope : kv_dim;
-    const int block  = BLOCK_SIZE;
-    const int grid   = (total + block - 1) / block;
+    const int h2       = head_dim / 2;
+    const int t_rope   = (n_heads + n_kv_heads) * h2;
+    const int kv_dim   = n_kv_heads * head_dim;
+    const int kv_slot  = n_kv_heads * cache_head_dim;
+    const int total    = (t_rope > kv_dim ? t_rope : kv_dim);
+    // Launch enough threads to cover both the RoPE pairs and the V copy.
+    // When cache_head_dim > head_dim the V copy uses tid < kv_dim, so total
+    // is still sized by kv_dim (not kv_slot) — the kernel computes dst offsets
+    // via per-head striding.
+    const int block = BLOCK_SIZE;
+    const int grid  = (total + block - 1) / block;
     const RopeTableEntry* tbl = rope_table_enabled()
         ? find_rope_tbl(theta_base, h2) : nullptr;
     if (tbl) {
         rope_store_kv_fp16_kernel_dyn_tbl<<<grid, block, 0, stream>>>(
             q, k, v, k_cache_layer_base, v_cache_layer_base,
-            n_heads, n_kv_heads, head_dim, kv_stride,
+            n_heads, n_kv_heads, head_dim, cache_head_dim,
             d_pos, tbl->d_cos, tbl->d_sin, tbl->half_dim, neox);
     } else {
         rope_store_kv_fp16_kernel_dyn<<<grid, block, 0, stream>>>(
             q, k, v, k_cache_layer_base, v_cache_layer_base,
-            n_heads, n_kv_heads, head_dim, kv_stride,
+            n_heads, n_kv_heads, head_dim, cache_head_dim,
             d_pos, theta_base, neox);
     }
+    (void)kv_slot;  // referenced implicitly through kv_stride inside the kernels
 }
 
 }  // namespace jllm

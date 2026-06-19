@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### perf(engine): Gemma 4 E2B CUDA graph support
+
+Enables CUDA graph decode for Gemma 4 E2B (models with `n_kv_shared_layers==0`).
+The prior blanket exclusion was based on a comment claiming PLE recomputes
+inside the layer loop — analysis showed PLE is computed *outside* the loop into
+a fixed device buffer (`gemma_ple_input_`), exactly like `d_pos_`.  The graph
+captures the layer loop; `compute_gemma_ple_input` is called outside the graph
+before each `cudaGraphLaunch` so the buffer is updated at the fixed pointer the
+graph already reads.
+
+Also fixes two Gemma 4 cache bugs exposed by the graph path:
+- `rope_inplace_store_kv_fp16_dyn`: K write now uses `head * cache_head_dim`
+  stride (was `head * head_dim`); V copy uses per-head strided write so sliding
+  layers (head_dim=256, cache slot=512) fill the correct half of each KV slot.
+- `flash_attention_decode_dyn`: gains an `int window` parameter; sliding layers
+  pass their window length for the causal mask; global layers pass 0 (full).
+
+Gemma 4 models with shared KV (`n_kv_shared_layers > 0`) still fall back to the
+per-step path — Q-only RoPE for shared-KV layers requires a dyn variant not yet
+implemented.
+
 ### perf(engine): CUDA graph decode default-on for Qwen3/Llama (was opt-in)
 
 `JLLM_DECODE_GRAPH` now defaults to enabled. The graph captures ~448 kernel

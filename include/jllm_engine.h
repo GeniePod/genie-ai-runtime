@@ -430,6 +430,11 @@ private:
     // but rope+KV-store and flash-attention read `*d_pos_` instead of
     // a captured int — so the graph stays valid across decode positions.
     void transformer_layer_graph(int layer, half* x);
+    // Gemma4 graph-capture variant: same kernel/scratch order as
+    // transformer_layer_gemma4 but with _dyn RoPE/attention kernels.
+    // Only safe when n_kv_shared_layers==0 and !kv_int8 (enforced in
+    // build_cuda_graph before capture).
+    void transformer_layer_graph_gemma4(int layer, half* x);
     bool check_memory_and_thermal(int pos);
     // Has the JLLM_DECODE_GRAPH env var been set to a non-zero value?
     // Cached on first read. Default off.

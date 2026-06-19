@@ -669,6 +669,7 @@ void flash_attention_prefill_batched(
 // CUDA-graph-friendly variant of flash_attention_decode_kernel: seq_len is
 // read from a device int* at kernel-execution time as (*d_pos) + 1. Same
 // warp-parallel Q×K^T + block-parallel softmax body as the non-graph path.
+// window: per-layer constant (0 = full attention; > 0 = Gemma4 sliding mask).
 __global__ void flash_attention_decode_kernel_dyn(
     half*        __restrict__ output,
     const half*  __restrict__ q,
@@ -676,7 +677,8 @@ __global__ void flash_attention_decode_kernel_dyn(
     const void*  __restrict__ v_cache,
     int n_heads, int n_kv_heads, int head_dim,
     const int*   __restrict__ d_pos,
-    float scale, bool kv_int8, const float* kv_scales)
+    float scale, bool kv_int8, const float* kv_scales,
+    int window)
 {
     const int head    = blockIdx.x;
     const int kv_head = head / (n_heads / n_kv_heads);
@@ -712,6 +714,11 @@ __global__ void flash_attention_decode_kernel_dyn(
 
         for (int t = warp_id; t < tile_len; t += (blockDim.x >> 5)) {
             int kv_pos = kv_start + t;
+            // Sliding-window mask (Gemma4 local layers; window==0 = full attention).
+            if (window > 0 && kv_pos < seq_len - window) {
+                if (lane == 0) s_scores[t] = -INFINITY;
+                continue;
+            }
             float dot = 0.0f;
             if (kv_int8) {
                 const int8_t* krow = (const int8_t*)k_cache
@@ -786,12 +793,13 @@ void flash_attention_decode_dyn(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim,
     const int* d_pos,
-    float scale, bool kv_int8, const float* kv_scales, cudaStream_t stream)
+    float scale, bool kv_int8, const float* kv_scales, int window,
+    cudaStream_t stream)
 {
     const int smem = (ATTN_TILE_KV + 2 * head_dim) * (int)sizeof(float);
     flash_attention_decode_kernel_dyn<<<n_heads, ATTN_BLOCK, smem, stream>>>(
         output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
-        d_pos, scale, kv_int8, kv_scales);
+        d_pos, scale, kv_int8, kv_scales, window);
 }
 
 void flash_attention_decode(
