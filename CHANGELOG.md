@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### perf(engine): CUDA graph decode default-on for Qwen3/Llama (was opt-in)
+
+`JLLM_DECODE_GRAPH` now defaults to enabled. The graph captures ~448 kernel
+launches per decode step into a single `cudaGraphLaunch`, saving ~10 ms of
+host-side dispatch overhead per token (~23% of wall-clock at 23 tok/s on Orin
+Nano). Opt out with `JLLM_DECODE_GRAPH=0`. Gemma 4 is still excluded (PLE
+per-token dependency; blocked in `build_cuda_graph`). INT8 KV and positions
+outside the KV fast pool also skip the graph path automatically. The graph
+now also benefits from the iteration 2 warp-parallel `flash_attention_decode_dyn`
+kernel captured at graph build time.
+
 ### perf(attn): warp-parallel Q×K^T + block softmax in decode attention kernel
 
 Replaces the old single-thread serial dot product (one thread owns one KV

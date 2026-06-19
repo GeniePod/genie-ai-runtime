@@ -2091,7 +2091,9 @@ int Engine::decode_step(int pos) {
 bool Engine::decode_graph_enabled() const {
     static const bool enabled = [] {
         const char* v = getenv("JLLM_DECODE_GRAPH");
-        return v && strcmp(v, "0") != 0;
+        // Default-on for non-Gemma4 models (Gemma4 is excluded in
+        // build_cuda_graph). Opt out with JLLM_DECODE_GRAPH=0.
+        return !v || strcmp(v, "0") != 0;
     }();
     return enabled;
 }
