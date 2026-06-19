@@ -5,9 +5,10 @@ job: serve a single small model fast and predictably in the memory
 budget left over after voice STT, TTS, denoise, and a Home Assistant
 container.
 
-**`v1.0.0`** — first stable release. See [`ROADMAP.md`](ROADMAP.md) for
-how we got here (the alpha-track path-by-path narrative) and what comes
-next.
+**`v1.1.0`** — adds **Gemma 4 E2B** support plus a kernel optimization
+cycle: decode at llama.cpp parity and prefill up to **4.1×**. See
+[`CHANGELOG.md`](CHANGELOG.md) for the release notes and
+[`ROADMAP.md`](ROADMAP.md) for the alpha-track path-by-path narrative.
 
 ```
 $ ./build/jetson-llm -m models/Qwen3-4B-Q4_K_M.gguf -p "Hello"
@@ -22,8 +23,8 @@ Hello! How can I assist you today?
 ## At a glance
 
 - **Target HW:** Jetson Orin Nano Super 8 GB (SM 8.7, 102 GB/s, 67 TOPS GPU). Not portable.
-- **Models:** GGUF only. Validated on Qwen3-4B-Q4_K_M; the architecture path supports any Qwen-family / Llama-3-family model the loader can parse.
-- **Kernels:** custom CUDA for SM 8.7 — INT4 dequant-fused GEMV, tensor-core MMQ Q4_K prefill, flash attention, fused RMSNorm + RoPE + SwiGLU.
+- **Models:** GGUF only. Validated on Qwen3-4B-Q4_K_M and **Gemma-4-E2B-it-Q4_K_M** (greedy-identical to llama.cpp); the architecture path supports any Qwen-family / Llama-3-family model the loader can parse, plus the Gemma 4 (Gemma-3n-class) path.
+- **Kernels:** custom CUDA for SM 8.7 — INT4 dequant-fused GEMV, dp4a int8 decode, faithful llama.cpp int8 MMQ (Q4_K / Q6_K) and tensor-core (`wmma` / cuBLAS) prefill GEMM + attention, flash attention, fused RMSNorm + RoPE + SwiGLU.
 - **Memory model:** pre-allocated KV and scratch pools accounted before any inference starts; OOM-guard prevents crashes.
 - **KV cache:** INT8 by default (alpha.12, FP16-ULP-bounded drift); FP16 opt-in. Persistent across turns (Path F) when a `conversation_id` or `nvext.agent_hints.session_id` is given, with per-response KV reuse counters.
 - **Two binaries:**
@@ -62,6 +63,21 @@ vs `llama-bench pp18 = 17.97 ± 0.65 tok/s`: **+115 % prefill** on the
 same hardware + model. See [`ROADMAP.md`](ROADMAP.md) for the
 alpha-track perf evolution (alpha.2 → v1.0) and the path-by-path
 breakdown of how each gain landed.
+
+### Gemma 4 E2B (Q4_K_M, MAXN SUPER) — new in v1.1.0
+
+Greedy-identical to llama.cpp on Orin (including past the 512-token sliding
+window), after the v1.1 kernel cycle:
+
+| Workload | Number |
+| -------- | ------ |
+| Decode (tg)                       | **23.5 tok/s** (at llama.cpp parity) |
+| Prefill (1261-tok prompt)         | **620 tok/s** (152 → 620, **4.1×** this cycle) |
+| Prefill (8192-tok, long context)  | **126 tok/s** (63 → 126, long-context collapse fixed) |
+
+Decode matches llama.cpp's `tg`; prefill closed most of the gap via faithful
+llama.cpp int8 MMQ (Q4_K / Q6_K), `wmma` dense GEMM, and cuBLAS tensor-core
+attention. See [`CHANGELOG.md`](CHANGELOG.md) for the per-kernel breakdown.
 
 ## Quickstart
 
@@ -132,7 +148,7 @@ Master header: [`include/jllm.h`](include/jllm.h).
 | Doc | Purpose |
 | --- | --- |
 | [`ROADMAP.md`](ROADMAP.md)                              | The alpha-track narrative (every Path, every perf win, every PR). What we did and how. |
-| [`CHANGELOG.md`](CHANGELOG.md)                          | Per-release notes alpha.0 → v1.0.0 |
+| [`CHANGELOG.md`](CHANGELOG.md)                          | Per-release notes alpha.0 → v1.1.0 |
 | [`docs/build.md`](docs/build.md)                        | Detailed build + prereqs |
 | [`docs/server.md`](docs/server.md)                      | HTTP server reference (endpoints, request fields, SSE, systemd) |
 | [`docs/architecture.md`](docs/architecture.md)          | Module-level design notes |

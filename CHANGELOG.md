@@ -1,5 +1,103 @@
 # Changelog
 
+## v1.1.0 — 2026-06-19
+
+Adds **Gemma 4 E2B** support and a Gemma-4-focused **kernel optimization
+cycle**. Gemma 4 runs greedy-identical to llama.cpp on Jetson Orin Nano
+Super (including contexts past the 512-token sliding window); decode reaches
+llama.cpp parity, and prefill was rewritten onto tensor-core /
+faithful-llama.cpp-MMQ kernels. **No change to the Qwen3 path** — every
+optimization is env-gated (`JLLM_*=0` reverts).
+
+### Performance — Gemma 4 E2B Q4_K_M, Orin Nano Super 8 GB (MAXN_SUPER)
+
+| Metric                          | Before  | v1.1.0          | Δ |
+| ------------------------------- | ------- | --------------- | --- |
+| Decode (tg)                     | 12 tok/s | **23.5 tok/s** | **+96 %** — at llama.cpp parity |
+| Prefill (1261-tok prompt)       | 152 tok/s | **620 tok/s** | **+308 % (4.1×)** this cycle |
+| Prefill (8192-tok, long-ctx)    | 63 tok/s | **126 tok/s**  | **2×** — long-context collapse fixed |
+
+Decode now matches llama.cpp's `tg` (~23.5). Prefill is still behind
+llama.cpp's heavily-tuned MMQ on a warm server (~6×), but the long-context
+collapse is gone and short-prompt prefill is within ~2× of llama.cpp's real
+cold prompt-eval. (The `152 → 620` figure is this cycle's MMQ/tensor-core
+arc on a 1261-token prompt; `12 → 23.5` is the full Gemma decode arc.)
+
+### New: Gemma 4 E2B (Gemma-3n-class architecture)
+
+Full forward support for `gemma-4-E2B-it` GGUF, validated greedy-identical to
+llama.cpp on Orin (Paris/Tokyo/oxygen/cold and a 1043-token counting prompt
+that crosses the sliding window, continuing "231, 232, 233" identically):
+
+- Per-layer-type attention (local *sliding* `head_dim` 256 / global *full*
+  512), dual proportional RoPE (θ 1e4 local / 1e6 global), Per-Layer
+  Embeddings (PLE), trailing-layer KV sharing, GeGLU double-wide MLP, scaled
+  input embeddings, weightless V-RMSNorm, and final-logit soft-capping.
+- KV pool sized to the 15 KV-owning layers (not 35) — ~57 % less KV memory.
+- Batched, chunked prefill with a per-token PLE-input table.
+
+PRs [#96](https://github.com/GeniePod/genie-ai-runtime/pull/96) (config + SPM
+tokenizer), [#97](https://github.com/GeniePod/genie-ai-runtime/pull/97)
+(forward), [#98](https://github.com/GeniePod/genie-ai-runtime/pull/98)
+(sliding-window masking),
+[#99](https://github.com/GeniePod/genie-ai-runtime/pull/99) (KV-pool sizing),
+[#100](https://github.com/GeniePod/genie-ai-runtime/pull/100) (batched
+prefill), [#101](https://github.com/GeniePod/genie-ai-runtime/pull/101)
+(batched PLE), [#117](https://github.com/GeniePod/genie-ai-runtime/pull/117)
+(chunked long-prompt prefill).
+
+### Prefill kernel cycle (all tensor-core / llama-faithful, all default-on)
+
+- Faithful llama.cpp **Q4_K int8 MMQ** prefill GEMM — vendors llama.cpp's
+  `mma.cuh` `tile<>`/`ldmatrix`/`mma` (the operand-load piece genie lacked).
+  [#122](https://github.com/GeniePod/genie-ai-runtime/pull/122) (+31 %)
+- **fp16 tensor-core dense GEMM** (`nvcuda::wmma`) for the PLE projections.
+  [#123](https://github.com/GeniePod/genie-ai-runtime/pull/123) (+26 %)
+- Faithful llama.cpp **Q6_K int8 MMQ** prefill GEMM (attn-V, ffn-down).
+  [#124](https://github.com/GeniePod/genie-ai-runtime/pull/124) (+33 %)
+- **Batched** the Gemma PLE `model_proj` GEMM.
+  [#125](https://github.com/GeniePod/genie-ai-runtime/pull/125) (+10 %)
+- **Tensor-core prefill attention via cuBLAS** (fp16 in, f32 accumulate) —
+  overturns the earlier "TC attention degrades Gemma" finding (the bug was f16
+  *accumulation*, not f16 inputs).
+  [#126](https://github.com/GeniePod/genie-ai-runtime/pull/126) (+43 %)
+- **Fused** `f32→half` into the MMQ write-back (dropped a staging pass).
+  [#127](https://github.com/GeniePod/genie-ai-runtime/pull/127) (+5 %)
+- **Batched RoPE + KV store** across all prefill tokens.
+  [#128](https://github.com/GeniePod/genie-ai-runtime/pull/128) (+10 %)
+
+Earlier in the cycle: an F32 query-tiled flash attention that fixed the
+long-context collapse
+([#118](https://github.com/GeniePod/genie-ai-runtime/pull/118)), plus
+register-overhead-reduced and warp-tiled Q4_K MMQ
+([#119](https://github.com/GeniePod/genie-ai-runtime/pull/119),
+[#120](https://github.com/GeniePod/genie-ai-runtime/pull/120)).
+
+### Decode optimization (to llama.cpp parity)
+
+MMVQ **dp4a int8** dot-product paths for Q4_K and Q6_K
+([#104](https://github.com/GeniePod/genie-ai-runtime/pull/104)–[#106](https://github.com/GeniePod/genie-ai-runtime/pull/106)),
+warp-per-row PLE GEMV
+([#103](https://github.com/GeniePod/genie-ai-runtime/pull/103)), and a Q4_K
+uint32 fast path
+([#102](https://github.com/GeniePod/genie-ai-runtime/pull/102)) took decode
+12 → 23.5 tok/s.
+
+### Also
+
+- **GBNF grammar**-constrained decoding
+  ([#87](https://github.com/GeniePod/genie-ai-runtime/pull/87)).
+- **CUDA Graphs** for decode
+  ([#23](https://github.com/GeniePod/genie-ai-runtime/pull/23)), env-gated
+  (`JLLM_DECODE_GRAPH`); guarded off for Gemma 4 (its PLE recomputes per token).
+
+### Notes
+
+- Gemma 4 forces **FP16 KV** — its V activations have ~10× RMS outliers that
+  INT8 per-row quantization collapses.
+- int8-activation GEMMs can shift greedy tie-breaks on borderline tokens (the
+  same tradeoff as llama.cpp); factual greedy outputs are unchanged.
+
 ## v1.0.0 — 2026-05-16
 
 First stable release. Cuts the `-alpha.N` suffix from `v0.1.0-alpha.12`
