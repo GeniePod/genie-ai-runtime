@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### perf(gemv): dp4a triple kernel for Q4_K+Q4_K+Q6_K QKV projections
+
+Adds `gemv_quant_triple_dp4a_typed_kernel<T0,T1,T2>` — a templated kernel that
+uses `__dp4a` for all three output matrices, sharing one `q8_1`-quantized
+activation.  Dispatched from `gemv_quant_triple_gpu` before the uint32-float
+fallback path whenever scratch is available.
+
+The Q6_K V rows in the QKV triple previously used the scalar float byte-path
+(`dot_q6k_row`); they now use `dot_q6k_row_q8_1` (same dp4a path already used
+by the single-output ffn_down kernel).  Q4_K Q and K rows likewise move from
+`dot_q4k_row_uint32` to `dot_q4k_row_q8_1`.  One `quantize_q8_1` kernel call
+is shared across all three projections — negligible overhead (≤ 8 KB activation).
+
+Explicit instantiations: (12,12,14) Qwen3-4B main case, (12,12,12) all-Q4_K,
+(14,14,14) Gemma4 all-Q6_K, (14,12,12) Q6_K query + Q4_K KV.  Falls back to
+the uint32 float path if scratch allocation fails.
+
 ### perf(engine): Gemma 4 E2B CUDA graph support
 
 Enables CUDA graph decode for Gemma 4 E2B (models with `n_kv_shared_layers==0`).
