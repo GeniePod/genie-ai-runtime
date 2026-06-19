@@ -229,6 +229,15 @@ void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
 // ── Rotary Position Embedding ────────────────────────────────────────────
 // Applied in-place to Q and K before attention.
 //
+// Precomputed cos/sin table: call rope_precompute_table() once at model load
+// for each unique (theta_base, head_dim) pair. Subsequent rope_inplace* calls
+// with a matching theta_base will automatically use the table, eliminating
+// powf + cosf + sinf per thread per decode step. rope_clear_tables() frees all
+// device-side table memory (call on engine unload). Default-on; set
+// JLLM_ROPE_TABLE=0 to fall back to the per-step trig computation path.
+void rope_precompute_table(int max_seq, int head_dim, float theta_base);
+void rope_clear_tables();
+
 void rope_inplace(
     half*          q,          // [n_heads × head_dim]
     half*          k,          // [n_kv_heads × head_dim]

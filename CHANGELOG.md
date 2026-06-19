@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### perf(rope): precomputed cos/sin table eliminates trig per decode step
+
+Adds `rope_precompute_table()` (called once at model load) that builds
+device-side `[max_seq × half_dim]` cos/sin float tables for each unique
+`(theta_base, head_dim)` pair. All `rope_inplace*` variants (decode,
+batched prefill, dyn/CUDA-graph) automatically dispatch to the table lookup
+instead of recomputing `powf + cosf + sinf` per thread. Fallback to the
+original trig path retained (`JLLM_ROPE_TABLE=0`). Gemma 4 precomputes
+two tables (local θ=10000, global θ=1000000); Qwen3/Llama precompute one.
+Test: `test_rope_table` verifies zero max-abs-diff vs CPU reference for
+head_dim ∈ {128, 256, 512}.
+
 ## v1.1.0 — 2026-06-19
 
 Adds **Gemma 4 E2B** support and a Gemma-4-focused **kernel optimization

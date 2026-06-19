@@ -293,3 +293,10 @@ add_test(NAME flash_tiled COMMAND test_flash_tiled)
 add_executable(test_flash_tc tests/test_flash_tc.cu)
 target_link_libraries(test_flash_tc PRIVATE CUDA::cudart)
 add_test(NAME flash_tc COMMAND test_flash_tc)
+
+# Precomputed RoPE cos/sin table: validates table lookup against CPU reference.
+# Tests Qwen3-4B (hd=128), Gemma4 local (hd=256), and Gemma4 global (hd=512)
+# shapes; expects zero max-abs-diff in fp16.
+add_executable(test_rope_table tests/test_rope_table.cu)
+target_link_libraries(test_rope_table PRIVATE jetson_llm_core)
+add_test(NAME rope_table COMMAND test_rope_table)

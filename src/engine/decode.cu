@@ -352,6 +352,7 @@ Engine::Engine() {}
 Engine::~Engine() { unload(); }
 
 void Engine::unload() {
+    rope_clear_tables();
     if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
     if (decode_graph_)      { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
     if (d_pos_) { cudaFree(d_pos_); d_pos_ = nullptr; }
@@ -1089,6 +1090,19 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
         fprintf(stderr, "[engine] cudaMalloc d_pos_ (4 B) failed: %s\n",
                 cudaGetErrorString(pos_err));
         return false;
+    }
+
+    // Precompute RoPE cos/sin tables. One table per unique (theta_base, head_dim)
+    // pair. The rope_inplace* kernels automatically use the table instead of
+    // recomputing powf + cosf + sinf per decode step.
+    if (config_.spec.dual_rope) {
+        // Gemma 4: two theta bases, two head dims (sliding and global).
+        rope_precompute_table(config_.max_seq_len,
+                              config_.sliding_head_dim, config_.rope_theta_swa);
+        rope_precompute_table(config_.max_seq_len,
+                              config_.global_head_dim,  config_.rope_theta);
+    } else {
+        rope_precompute_table(config_.max_seq_len, config_.head_dim, config_.rope_theta);
     }
 
     budget_.print();
