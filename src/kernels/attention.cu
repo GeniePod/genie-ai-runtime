@@ -252,103 +252,103 @@ __global__ void flash_attention_decode_kernel(
     const float* __restrict__ v_scales,
     int window)   // Gemma sliding layers: attend only to last `window` keys (0 = full)
 {
-    const int head = blockIdx.x;
-    const int kv_head = head / (n_heads / n_kv_heads);  // GQA
-    const int tid = threadIdx.x;
+    const int head    = blockIdx.x;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
     // Per-position stride in the KV cache uses the cache slot head dim, which
     // for Gemma sliding layers (active head_dim 256) is the larger global slot
     // (512). For all other models cache_head_dim == head_dim (no-op).
-    const int kv_dim = n_kv_heads * cache_head_dim;
+    const int kv_dim  = n_kv_heads * cache_head_dim;
     const int kv_hoff = kv_head * cache_head_dim;
 
     // Shared memory layout:
-    //   s_scores[ATTN_TILE_KV]     — attention scores for current KV tile
-    //   s_out[head_dim]            — output accumulator (BUG #6 FIX)
+    //   s_scores[ATTN_TILE_KV]  — attention scores for current KV tile
+    //   s_out[head_dim]         — output accumulator
+    //   s_q[head_dim]           — query cached once, reused across every KV tile
     extern __shared__ float smem[];
     float* s_scores = smem;
     float* s_out    = smem + ATTN_TILE_KV;
+    float* s_q      = smem + ATTN_TILE_KV + head_dim;
 
     __shared__ float s_running_max;
     __shared__ float s_running_sum;
     __shared__ float s_correction;
+    __shared__ float s_red[4];
 
-    // Initialize output accumulator to zero
-    for (int d = tid; d < head_dim; d += blockDim.x)
+    // Load Q once into shared memory; initialize output accumulator.
+    for (int d = tid; d < head_dim; d += blockDim.x) {
         s_out[d] = 0.0f;
+        s_q[d]   = __half2float(q[head * head_dim + d]);
+    }
     if (tid == 0) {
         s_running_max = -FLT_MAX;
         s_running_sum = 0.0f;
-        s_correction = 1.0f;
+        s_correction  = 1.0f;
     }
     __syncthreads();
 
-    // Tile over KV sequence
     for (int kv_start = 0; kv_start < seq_len; kv_start += ATTN_TILE_KV) {
         int tile_len = min(ATTN_TILE_KV, seq_len - kv_start);
 
-        // ── Step 1: Q × K^T for tile ────────────────────────────
-        for (int t = tid; t < tile_len; t += blockDim.x) {
+        // ── Step 1: Q × K^T — one warp per KV slot, lane-strided inner loop
+        //   then warp-shuffle reduce. Eliminates the serial head_dim loop and
+        //   the repeated Q global reads that the old single-thread path had.
+        for (int t = warp_id; t < tile_len; t += (blockDim.x >> 5)) {
             int kv_pos = kv_start + t;
-            // Sliding-window mask: the query (at position seq_len-1) attends
-            // only to keys in [seq_len-window, seq_len-1]. Older keys are -inf.
+            // Sliding-window mask (Gemma local layers only).
             if (window > 0 && kv_pos < seq_len - window) {
-                s_scores[t] = -INFINITY;
+                if (lane == 0) s_scores[t] = -INFINITY;
                 continue;
             }
             float dot = 0.0f;
-
-            for (int d = 0; d < head_dim; d++) {
-                float q_val = __half2float(q[head * head_dim + d]);
-                float k_val;
-                if (kv_int8) {
-                    const int8_t* ki = (const int8_t*)k_cache;
-                    // Path I3: per-position scale lookup.
-                    float ks = k_scales ? k_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
-                    k_val = ki[(int64_t)kv_pos * kv_dim + kv_hoff + d] * ks;
-                } else {
-                    const half* kf = (const half*)k_cache;
-                    k_val = __half2float(
-                        kf[(int64_t)kv_pos * kv_dim + kv_hoff + d]);
-                }
-                dot += q_val * k_val;
+            if (kv_int8) {
+                const int8_t* krow = (const int8_t*)k_cache
+                    + (int64_t)kv_pos * kv_dim + kv_hoff;
+                float ks = k_scales ? k_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
+                for (int d = lane; d < head_dim; d += 32)
+                    dot += s_q[d] * (krow[d] * ks);
+            } else {
+                const half* krow = (const half*)k_cache
+                    + (int64_t)kv_pos * kv_dim + kv_hoff;
+                for (int d = lane; d < head_dim; d += 32)
+                    dot += s_q[d] * __half2float(krow[d]);
             }
-            s_scores[t] = dot * scale;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) s_scores[t] = dot * scale;
         }
         __syncthreads();
 
-        // ── Step 2: Online softmax ──────────────────────────────
+        // ── Step 2: Block-parallel online softmax ──────────────────
+        float lmax = -FLT_MAX;
+        for (int t = tid; t < tile_len; t += blockDim.x)
+            lmax = fmaxf(lmax, s_scores[t]);
+        float tile_max = block_max_f(lmax, s_red, warp_id, lane);
         if (tid == 0) {
-            float tile_max = -FLT_MAX;
-            for (int t = 0; t < tile_len; ++t) {
-                tile_max = fmaxf(tile_max, s_scores[t]);
-            }
-
             const float old_max = s_running_max;
             s_running_max = fmaxf(s_running_max, tile_max);
-            s_correction = expf(old_max - s_running_max);
+            s_correction  = expf(old_max - s_running_max);
             s_running_sum *= s_correction;
         }
         __syncthreads();
 
-        // Correct existing accumulators
         for (int d = tid; d < head_dim; d += blockDim.x)
             s_out[d] *= s_correction;
-        __syncthreads();
 
-        // Exponentiate scores
-        if (tid == 0) {
-            float tile_sum = 0.0f;
-            for (int t = 0; t < tile_len; ++t) {
-                float p = expf(s_scores[t] - s_running_max);
-                s_scores[t] = p;
-                tile_sum += p;
-            }
-            s_running_sum += tile_sum;
+        float lsum = 0.0f;
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            float p = expf(s_scores[t] - s_running_max);
+            s_scores[t] = p;
+            lsum += p;
         }
+        float tile_sum = block_sum_f(lsum, s_red, warp_id, lane);
+        if (tid == 0) s_running_sum += tile_sum;
         __syncthreads();
 
-        // ── Step 3: Accumulate P × V (BUG #6 FIX — per-dimension) ──
-        // Each thread handles its slice of head_dim
+        // ── Step 3: Accumulate P × V ────────────────────────────────
         for (int d = tid; d < head_dim; d += blockDim.x) {
             float val = 0.0f;
             for (int t = 0; t < tile_len; t++) {
@@ -356,26 +356,22 @@ __global__ void flash_attention_decode_kernel(
                 float v_val;
                 if (kv_int8) {
                     const int8_t* vi = (const int8_t*)v_cache;
-                    // Path I3: per-position scale lookup.
                     float vs = v_scales ? v_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
                     v_val = vi[(int64_t)kv_pos * kv_dim + kv_hoff + d] * vs;
                 } else {
                     const half* vf = (const half*)v_cache;
-                    v_val = __half2float(
-                        vf[(int64_t)kv_pos * kv_dim + kv_hoff + d]);
+                    v_val = __half2float(vf[(int64_t)kv_pos * kv_dim + kv_hoff + d]);
                 }
                 val += s_scores[t] * v_val;
             }
-            s_out[d] += val;  // BUG #6 FIX: accumulate into correct dimension
+            s_out[d] += val;
         }
         __syncthreads();
     }
 
-    // ── Finalize: normalize and write output ─────────────────────
     float inv_sum = (s_running_sum > 0.0f) ? 1.0f / s_running_sum : 0.0f;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
+    for (int d = tid; d < head_dim; d += blockDim.x)
         output[head * head_dim + d] = __float2half(s_out[d] * inv_sum);
-    }
 }
 
 // Prefill counterpart of flash_attention_decode_kernel. Each block
@@ -670,9 +666,9 @@ void flash_attention_prefill_batched(
     }
 }
 
-// CUDA-graph-friendly variant of flash_attention_decode_kernel: the
-// per-step seq_len is read from a device int* at kernel-execution time,
-// computed as (*d_pos) + 1. Same online-softmax body otherwise.
+// CUDA-graph-friendly variant of flash_attention_decode_kernel: seq_len is
+// read from a device int* at kernel-execution time as (*d_pos) + 1. Same
+// warp-parallel Q×K^T + block-parallel softmax body as the non-graph path.
 __global__ void flash_attention_decode_kernel_dyn(
     half*        __restrict__ output,
     const half*  __restrict__ q,
@@ -682,78 +678,83 @@ __global__ void flash_attention_decode_kernel_dyn(
     const int*   __restrict__ d_pos,
     float scale, bool kv_int8, const float* kv_scales)
 {
-    const int head = blockIdx.x;
+    const int head    = blockIdx.x;
     const int kv_head = head / (n_heads / n_kv_heads);
-    const int tid = threadIdx.x;
-    const int kv_dim = n_kv_heads * head_dim;
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+    const int kv_dim  = n_kv_heads * head_dim;
     const int seq_len = (*d_pos) + 1;
 
     extern __shared__ float smem[];
     float* s_scores = smem;
     float* s_out    = smem + ATTN_TILE_KV;
+    float* s_q      = smem + ATTN_TILE_KV + head_dim;
 
     __shared__ float s_running_max;
     __shared__ float s_running_sum;
     __shared__ float s_correction;
+    __shared__ float s_red[4];
 
-    for (int d = tid; d < head_dim; d += blockDim.x)
+    for (int d = tid; d < head_dim; d += blockDim.x) {
         s_out[d] = 0.0f;
+        s_q[d]   = __half2float(q[head * head_dim + d]);
+    }
     if (tid == 0) {
         s_running_max = -FLT_MAX;
         s_running_sum = 0.0f;
-        s_correction = 1.0f;
+        s_correction  = 1.0f;
     }
     __syncthreads();
 
     for (int kv_start = 0; kv_start < seq_len; kv_start += ATTN_TILE_KV) {
         int tile_len = min(ATTN_TILE_KV, seq_len - kv_start);
 
-        for (int t = tid; t < tile_len; t += blockDim.x) {
+        for (int t = warp_id; t < tile_len; t += (blockDim.x >> 5)) {
             int kv_pos = kv_start + t;
             float dot = 0.0f;
-            for (int d = 0; d < head_dim; d++) {
-                float q_val = __half2float(q[head * head_dim + d]);
-                float k_val;
-                if (kv_int8) {
-                    const int8_t* ki = (const int8_t*)k_cache;
-                    float ks = kv_scales ? kv_scales[kv_head] : 1.0f;
-                    k_val = ki[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * ks;
-                } else {
-                    const half* kf = (const half*)k_cache;
-                    k_val = __half2float(
-                        kf[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d]);
-                }
-                dot += q_val * k_val;
+            if (kv_int8) {
+                const int8_t* krow = (const int8_t*)k_cache
+                    + (int64_t)kv_pos * kv_dim + kv_head * head_dim;
+                float ks = kv_scales ? kv_scales[kv_head] : 1.0f;
+                for (int d = lane; d < head_dim; d += 32)
+                    dot += s_q[d] * (krow[d] * ks);
+            } else {
+                const half* krow = (const half*)k_cache
+                    + (int64_t)kv_pos * kv_dim + kv_head * head_dim;
+                for (int d = lane; d < head_dim; d += 32)
+                    dot += s_q[d] * __half2float(krow[d]);
             }
-            s_scores[t] = dot * scale;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+                dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) s_scores[t] = dot * scale;
         }
         __syncthreads();
 
+        float lmax = -FLT_MAX;
+        for (int t = tid; t < tile_len; t += blockDim.x)
+            lmax = fmaxf(lmax, s_scores[t]);
+        float tile_max = block_max_f(lmax, s_red, warp_id, lane);
         if (tid == 0) {
-            float tile_max = -FLT_MAX;
-            for (int t = 0; t < tile_len; ++t) {
-                tile_max = fmaxf(tile_max, s_scores[t]);
-            }
             const float old_max = s_running_max;
             s_running_max = fmaxf(s_running_max, tile_max);
-            s_correction = expf(old_max - s_running_max);
+            s_correction  = expf(old_max - s_running_max);
             s_running_sum *= s_correction;
         }
         __syncthreads();
 
         for (int d = tid; d < head_dim; d += blockDim.x)
             s_out[d] *= s_correction;
-        __syncthreads();
 
-        if (tid == 0) {
-            float tile_sum = 0.0f;
-            for (int t = 0; t < tile_len; ++t) {
-                float p = expf(s_scores[t] - s_running_max);
-                s_scores[t] = p;
-                tile_sum += p;
-            }
-            s_running_sum += tile_sum;
+        float lsum = 0.0f;
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            float p = expf(s_scores[t] - s_running_max);
+            s_scores[t] = p;
+            lsum += p;
         }
+        float tile_sum = block_sum_f(lsum, s_red, warp_id, lane);
+        if (tid == 0) s_running_sum += tile_sum;
         __syncthreads();
 
         for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -767,8 +768,7 @@ __global__ void flash_attention_decode_kernel_dyn(
                     v_val = vi[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d] * vs;
                 } else {
                     const half* vf = (const half*)v_cache;
-                    v_val = __half2float(
-                        vf[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d]);
+                    v_val = __half2float(vf[(int64_t)kv_pos * kv_dim + kv_head * head_dim + d]);
                 }
                 val += s_scores[t] * v_val;
             }
@@ -778,9 +778,8 @@ __global__ void flash_attention_decode_kernel_dyn(
     }
 
     float inv_sum = (s_running_sum > 0.0f) ? 1.0f / s_running_sum : 0.0f;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
+    for (int d = tid; d < head_dim; d += blockDim.x)
         output[head * head_dim + d] = __float2half(s_out[d] * inv_sum);
-    }
 }
 
 void flash_attention_decode_dyn(
@@ -789,7 +788,7 @@ void flash_attention_decode_dyn(
     const int* d_pos,
     float scale, bool kv_int8, const float* kv_scales, cudaStream_t stream)
 {
-    const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
+    const int smem = (ATTN_TILE_KV + 2 * head_dim) * (int)sizeof(float);
     flash_attention_decode_kernel_dyn<<<n_heads, ATTN_BLOCK, smem, stream>>>(
         output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
         d_pos, scale, kv_int8, kv_scales);
@@ -808,7 +807,7 @@ void flash_attention_decode(
             logged = true;
         }
 
-        const int smem = (ATTN_TILE_KV + head_dim) * (int)sizeof(float);
+        const int smem = (ATTN_TILE_KV + 2 * head_dim) * (int)sizeof(float);
         flash_attention_decode_kernel<<<n_heads, ATTN_BLOCK, smem, stream>>>(
             output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, cache_head_dim,
             seq_len, scale, kv_int8, k_scales, v_scales, window);

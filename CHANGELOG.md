@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### perf(attn): warp-parallel Q×K^T + block softmax in decode attention kernel
+
+Replaces the old single-thread serial dot product (one thread owns one KV
+slot, loops over all head_dim=128–512 elements serially) with a
+warp-parallel reduction: one warp owns one KV slot, each lane strides over
+the head_dim with a stride-32 inner loop, then `__shfl_xor_sync` reduces to
+lane 0. Also replaces the `tid==0` serial softmax scan with `block_max_f` /
+`block_sum_f` parallel reductions, and adds a `s_q[head_dim]` shared-memory
+cache so Q is loaded from DRAM once per block instead of once per KV tile.
+Applies to both `flash_attention_decode_kernel` and the CUDA-graph-friendly
+`flash_attention_decode_kernel_dyn`. Matches the design already proven in
+`flash_attention_prefill_batched_kernel`.
+
 ### perf(rope): precomputed cos/sin table eliminates trig per decode step
 
 Adds `rope_precompute_table()` (called once at model load) that builds
