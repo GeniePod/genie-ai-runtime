@@ -2241,16 +2241,30 @@ void Engine::build_cuda_graph(int pos) {
     // Gemma 4 with shared KV layers is not yet supported in the graph path
     // (Q-only RoPE for shared-KV layers needs a dyn variant we don't have).
     // Gemma4 E2B (n_kv_shared_layers==0) is fully supported.
+    // These diagnostics fire from a function called once per decode step;
+    // guard each with a one-shot flag so we log the reason once, not per token.
     if (config_.arch == Arch::Gemma4 && config_.n_kv_shared_layers > 0) {
-        fprintf(stderr, "[engine] decode-graph: Gemma4 shared-KV not supported in graph; staying on per-step path\n");
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] decode-graph: Gemma4 shared-KV not supported in graph; staying on per-step path\n");
+            logged = true;
+        }
         return;
     }
     if (gen_params_.kv_int8) {
-        fprintf(stderr, "[engine] decode-graph: INT8 KV not supported; staying on per-step path\n");
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] decode-graph: INT8 KV not supported; staying on per-step path\n");
+            logged = true;
+        }
         return;
     }
     if (!kv_cache_.is_fast_position(pos)) {
-        fprintf(stderr, "[engine] decode-graph: pos %d outside KV fast pool; staying on per-step path\n", pos);
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] decode-graph: pos %d outside KV fast pool; staying on per-step path\n", pos);
+            logged = true;
+        }
         return;
     }
 
