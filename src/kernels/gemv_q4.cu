@@ -617,6 +617,59 @@ __device__ __forceinline__ float dot_q6k_row_q8_1(
     return acc;
 }
 
+// Type-dispatched dp4a dot: T=12 → Q4_K, T=14 → Q6_K.
+// Used by the triple/quad dp4a kernels below to avoid per-row branching.
+template<int T>
+__device__ __forceinline__ float dot_dp4a_row_typed(
+    const void* __restrict__ W, int row, int n_blocks,
+    const block_q8_1* __restrict__ xq, int lane);
+
+template<>
+__device__ __forceinline__ float dot_dp4a_row_typed<12>(
+    const void* __restrict__ W, int row, int n_blocks,
+    const block_q8_1* __restrict__ xq, int lane) {
+    return dot_q4k_row_q8_1((const block_q4_K*)W + (int64_t)row * n_blocks,
+                             xq, n_blocks, lane);
+}
+
+template<>
+__device__ __forceinline__ float dot_dp4a_row_typed<14>(
+    const void* __restrict__ W, int row, int n_blocks,
+    const block_q8_1* __restrict__ xq, int lane) {
+    return dot_q6k_row_q8_1((const block_q6_K*)W + (int64_t)row * n_blocks,
+                             xq, n_blocks, lane);
+}
+
+// Unified dp4a triple kernel: T0/T1/T2 ∈ {12=Q4_K, 14=Q6_K}.
+// All three outputs share one q8_1-quantized activation (no float dequant).
+template<int T0, int T1, int T2>
+__global__ void gemv_quant_triple_dp4a_typed_kernel(
+    half*       __restrict__ y0, const void* __restrict__ W0, int M0,
+    half*       __restrict__ y1, const void* __restrict__ W1, int M1,
+    half*       __restrict__ y2, const void* __restrict__ W2, int M2,
+    const block_q8_1* __restrict__ xq, int K, int rows_per_block)
+{
+    const int row  = blockIdx.x * rows_per_block + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= M0 + M1 + M2) return;
+    const int n_blocks = K / QK_K;
+    if (row < M0) {
+        float acc = dot_dp4a_row_typed<T0>(W0, row, n_blocks, xq, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y0[row] = __float2half(acc);
+    } else if (row < M0 + M1) {
+        const int lr = row - M0;
+        float acc = dot_dp4a_row_typed<T1>(W1, lr, n_blocks, xq, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y1[lr] = __float2half(acc);
+    } else {
+        const int lr = row - M0 - M1;
+        float acc = dot_dp4a_row_typed<T2>(W2, lr, n_blocks, xq, lane);
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) y2[lr] = __float2half(acc);
+    }
+}
+
 __global__ void gemv_q6k_dp4a_kernel(
     half* __restrict__ y, const block_q6_K* __restrict__ W,
     const block_q8_1* __restrict__ xq, int M, int K, int rows_per_block) {
@@ -1407,13 +1460,57 @@ static bool gemv_quant_triple_gpu(
     const int block = rows_per_block * 32;
     const int grid = (M0 + M1 + M2 + rows_per_block - 1) / rows_per_block;
 
+    // MMVQ dp4a triple: quantize activation once, use __dp4a for all rows.
+    // Handles Q4_K+Q4_K+Q4_K, Q4_K+Q4_K+Q6_K, Q6_K+Q6_K+Q6_K.
+    // Preferred over the uint32 float path below when scratch is available.
+    if ((type0 == 12 || type0 == 14) &&
+        (type1 == 12 || type1 == 14) &&
+        (type2 == 12 || type2 == 14)) {
+        block_q8_1* xq = get_q8_1_scratch(K);
+        if (xq) {
+            quantize_q8_1_kernel<<<K / 32, 32, 0, stream>>>(x, xq, K);
+            // Explicit instantiations for the four common combinations.
+            cudaError_t e = cudaSuccess;
+            if      (type0==12 && type1==12 && type2==14)
+                gemv_quant_triple_dp4a_typed_kernel<12,12,14>
+                    <<<grid, block, 0, stream>>>(y0, W0_device, M0, y1, W1_device, M1,
+                                                 y2, W2_device, M2, xq, K, rows_per_block);
+            else if (type0==12 && type1==12 && type2==12)
+                gemv_quant_triple_dp4a_typed_kernel<12,12,12>
+                    <<<grid, block, 0, stream>>>(y0, W0_device, M0, y1, W1_device, M1,
+                                                 y2, W2_device, M2, xq, K, rows_per_block);
+            else if (type0==14 && type1==14 && type2==14)
+                gemv_quant_triple_dp4a_typed_kernel<14,14,14>
+                    <<<grid, block, 0, stream>>>(y0, W0_device, M0, y1, W1_device, M1,
+                                                 y2, W2_device, M2, xq, K, rows_per_block);
+            else if (type0==14 && type1==12 && type2==12)
+                gemv_quant_triple_dp4a_typed_kernel<14,12,12>
+                    <<<grid, block, 0, stream>>>(y0, W0_device, M0, y1, W1_device, M1,
+                                                 y2, W2_device, M2, xq, K, rows_per_block);
+            else
+                e = cudaErrorInvalidValue;
+            if (e == cudaSuccess) e = cudaGetLastError();
+            if (e == cudaSuccess) {
+                static bool logged = false;
+                if (!logged) {
+                    fprintf(stderr, "[GEMV] dp4a triple kernel active (%d,%d,%d)\n",
+                            type0, type1, type2);
+                    logged = true;
+                }
+                return true;
+            }
+            fprintf(stderr, "[GEMV] dp4a triple launch failed (%s); falling back\n",
+                    cudaGetErrorString(e));
+        }
+    }
+
     // Q4_K uint32 triple paths — same env-var family as #25 / #26.
     if (q4k_uint32_loads_enabled() &&
         type0 == 12 && type1 == 12 && (type2 == 12 || type2 == 14)) {
         static bool logged = false;
         if (!logged) {
             fprintf(stderr,
-                    "[GEMV] Q4_K uint32 triple weight-load path enabled (V=%s)\n",
+                    "[GEMV] Q4_K uint32 triple weight-load path enabled (V=%s, fallback)\n",
                     type2 == 14 ? "Q6_K (byte path)" : "Q4_K");
             logged = true;
         }

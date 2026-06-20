@@ -54,19 +54,26 @@ static bool fast_embedding_enabled() {
 }
 
 // ── Vector add kernel (for residual connections) ─────────────────────────
-// BUG #2 fix: need explicit residual add between stages
-
+// Vectorized half2: each thread adds 2 elements with __hadd2, avoiding
+// float round-trip.  n is always even (power-of-2 hidden dims), so the
+// single-element tail path is a safety net, not a normal code path.
 __global__ void vec_add_kernel(half* __restrict__ out,
                                 const half* __restrict__ a,
                                 const half* __restrict__ b, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n)
-        out[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+    const int i2 = (int)(blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (i2 + 1 < n) {
+        *reinterpret_cast<half2*>(&out[i2]) =
+            __hadd2(*reinterpret_cast<const half2*>(&a[i2]),
+                    *reinterpret_cast<const half2*>(&b[i2]));
+    } else if (i2 < n) {
+        out[i2] = __hadd(a[i2], b[i2]);
+    }
 }
 
 static void vec_add(half* out, const half* a, const half* b, int n, cudaStream_t s) {
-    int block = 128;
-    int grid = (n + block - 1) / block;
+    const int block = 128;
+    const int n2    = (n + 1) >> 1;
+    const int grid  = (n2 + block - 1) / block;
     vec_add_kernel<<<grid, block, 0, s>>>(out, a, b, n);
 }
 
@@ -352,6 +359,7 @@ Engine::Engine() {}
 Engine::~Engine() { unload(); }
 
 void Engine::unload() {
+    rope_clear_tables();
     if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
     if (decode_graph_)      { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
     if (d_pos_) { cudaFree(d_pos_); d_pos_ = nullptr; }
@@ -1091,6 +1099,19 @@ bool Engine::load(const std::string& gguf_path, const GenParams& params) {
         return false;
     }
 
+    // Precompute RoPE cos/sin tables. One table per unique (theta_base, head_dim)
+    // pair. The rope_inplace* kernels automatically use the table instead of
+    // recomputing powf + cosf + sinf per decode step.
+    if (config_.spec.dual_rope) {
+        // Gemma 4: two theta bases, two head dims (sliding and global).
+        rope_precompute_table(config_.max_seq_len,
+                              config_.sliding_head_dim, config_.rope_theta_swa);
+        rope_precompute_table(config_.max_seq_len,
+                              config_.global_head_dim,  config_.rope_theta);
+    } else {
+        rope_precompute_table(config_.max_seq_len, config_.head_dim, config_.rope_theta);
+    }
+
     budget_.print();
     loaded_ = true;
     return true;
@@ -1545,7 +1566,7 @@ void Engine::transformer_layer_graph(int layer, half* x) {
                                    (half*)kv_cache_.key_ptr(layer, 0),
                                    (half*)kv_cache_.val_ptr(layer, 0),
                                    config_.n_heads, config_.n_kv_heads,
-                                   config_.head_dim, KV_DIM,
+                                   config_.head_dim, config_.head_dim,
                                    d_pos_, config_.rope_theta,
                                    config_.rope_neox, stream_);
 
@@ -1556,7 +1577,8 @@ void Engine::transformer_layer_graph(int layer, half* x) {
                                config_.n_heads, config_.n_kv_heads,
                                config_.head_dim,
                                d_pos_, scale,
-                               /*kv_int8=*/false, /*kv_scales=*/nullptr, stream_);
+                               /*kv_int8=*/false, /*kv_scales=*/nullptr,
+                               /*window=*/0, stream_);
 
     gemv_quant(attn_proj, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
     vec_add(x2, x, attn_proj, H, stream_);
@@ -1576,6 +1598,118 @@ void Engine::transformer_layer_graph(int layer, half* x) {
     half* ffn_out = (half*)scratch_.get(H * sizeof(half));
     gemv_quant(ffn_out, lw.w_down, lw.type_w_down, swiglu_out, H, I, stream_);
     vec_add(x, x2, ffn_out, H, stream_);
+}
+
+// Graph-capture-friendly Gemma4 transformer layer. Mirrors
+// transformer_layer_gemma4 in scratch-allocation order so replay sees the same
+// buffer addresses. Uses rope_inplace_store_kv_fp16_dyn and
+// flash_attention_decode_dyn so a single captured graph is valid for every
+// decode step (pos is read from *d_pos_ inside those kernels).
+//
+// Requirements (enforced by build_cuda_graph before capture):
+//   - n_kv_shared_layers == 0: all layers own K/V; no Q-only RoPE path needed.
+//   - !gen_params_.kv_int8
+void Engine::transformer_layer_graph_gemma4(int layer, half* x) {
+    const auto& lw = model_weights_.layers[layer];
+    const int H  = config_.hidden_dim;
+    const int hd = lw.head_dim_l;                    // 256 sliding / 512 global
+    const int Q_DIM  = config_.n_heads * hd;
+    const int KV_DIM = config_.n_kv_heads * hd;
+    const int I  = lw.intermediate_l;
+    const bool norm_fp32 = (lw.rms_type == 0);
+
+    half* normed   = (half*)scratch_.get(H * sizeof(half));
+    half* q_buf    = (half*)scratch_.get(Q_DIM * sizeof(half));
+    half* k_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* v_buf    = (half*)scratch_.get(KV_DIM * sizeof(half));
+    half* attn_out = (half*)scratch_.get(Q_DIM * sizeof(half));
+
+    fused_rmsnorm_residual(normed, x, nullptr, lw.rms_attn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+
+    // All layers own their own K/V (n_kv_shared_layers==0 enforced in build_cuda_graph).
+    gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
+                      k_buf, lw.wk, lw.type_wk, KV_DIM,
+                      v_buf, lw.wv, lw.type_wv, KV_DIM,
+                      normed, H, stream_);
+
+    if (lw.q_norm) {
+        fused_rmsnorm_residual(q_buf, q_buf, nullptr, lw.q_norm,
+                               config_.n_heads, hd, config_.rms_eps,
+                               lw.qk_norm_type == 0, stream_);
+    }
+    if (lw.k_norm) {
+        fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
+                               config_.n_kv_heads, hd, config_.rms_eps,
+                               lw.qk_norm_type == 0, stream_);
+    }
+    if (gemma_vnorm_ones_) {
+        fused_rmsnorm_residual(v_buf, v_buf, nullptr, gemma_vnorm_ones_,
+                               config_.n_kv_heads, hd, config_.rms_eps,
+                               /*weight_fp32=*/true, stream_);
+    }
+
+    // RoPE + KV store: position is read from *d_pos_ at execution time.
+    // cache_head_dim = config_.head_dim (512) so sliding layers (hd=256)
+    // write into the first 256 elements of each 512-element cache slot.
+    rope_inplace_store_kv_fp16_dyn(q_buf, k_buf, v_buf,
+                                   (half*)kv_cache_.key_ptr(layer, 0),
+                                   (half*)kv_cache_.val_ptr(layer, 0),
+                                   config_.n_heads, config_.n_kv_heads,
+                                   hd, config_.head_dim,
+                                   d_pos_, lw.rope_theta_l,
+                                   config_.rope_neox, stream_);
+
+    const float scale      = attention_scale(config_.spec, hd);
+    const int   attn_window = lw.is_sliding ? config_.sliding_window : 0;
+    flash_attention_decode_dyn(attn_out, q_buf,
+                               kv_cache_.key_ptr(layer, 0),
+                               kv_cache_.val_ptr(layer, 0),
+                               config_.n_heads, config_.n_kv_heads,
+                               hd, d_pos_, scale,
+                               /*kv_int8=*/false, /*kv_scales=*/nullptr,
+                               attn_window, stream_);
+
+    half* wo_out = (half*)scratch_.get(H * sizeof(half));
+    half* x2     = (half*)scratch_.get(H * sizeof(half));
+    gemv_quant(wo_out, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
+    fused_rmsnorm_residual(wo_out, wo_out, nullptr, lw.post_attn_norm, 1, H,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+    vec_add(x2, x, wo_out, H, stream_);
+
+    half* normed2 = (half*)scratch_.get(H * sizeof(half));
+    half* gate    = (half*)scratch_.get(I * sizeof(half));
+    half* up      = (half*)scratch_.get(I * sizeof(half));
+    half* act     = (half*)scratch_.get(I * sizeof(half));
+    half* ffn_out = (half*)scratch_.get(H * sizeof(half));
+    fused_rmsnorm_residual(normed2, x2, nullptr, lw.rms_ffn, 1, H,
+                           config_.rms_eps, norm_fp32, stream_);
+    gemv_quant_pair(gate, lw.w_gate, lw.type_w_gate, I,
+                    up,   lw.w_up,   lw.type_w_up,   I, normed2, H, stream_);
+    fused_geglu(act, gate, up, 1, I, stream_);
+    gemv_quant(ffn_out, lw.w_down, lw.type_w_down, act, H, I, stream_);
+    fused_rmsnorm_residual(ffn_out, ffn_out, nullptr, lw.post_ffn_norm, 1, H,
+                           config_.rms_eps, /*weight_fp32=*/true, stream_);
+    vec_add(x, x2, ffn_out, H, stream_);
+
+    if (lw.ple_gate && gemma_ple_input_) {
+        const int D = config_.ple_input_dim;  // 256
+        half* g_in = (half*)scratch_.get(D * sizeof(half));
+        half* g    = (half*)scratch_.get(D * sizeof(half));
+        half* p    = (half*)scratch_.get(H * sizeof(half));
+        gemv_dense(g_in, lw.ple_gate, lw.type_ple_gate, x, D, H, stream_);
+        // gemma_ple_input_ is updated each token (outside the graph).
+        // The pointer is fixed; the kernel reads updated values at replay time.
+        fused_geglu(g, g_in, gemma_ple_input_ + (int64_t)layer * D, 1, D, stream_);
+        gemv_dense(p, lw.ple_proj, lw.type_ple_proj, g, H, D, stream_);
+        fused_rmsnorm_residual(p, p, nullptr, lw.ple_norm, 1, H,
+                               config_.rms_eps, /*weight_fp32=*/true, stream_);
+        vec_add(x, x, p, H, stream_);
+    }
+
+    if (lw.layer_scale_val != 1.0f) {
+        vec_scale(x, H, lw.layer_scale_val, stream_);
+    }
 }
 
 // ── Batched prefill scaffolding (Path B, issue #12) ──────────────────────
@@ -2077,7 +2211,9 @@ int Engine::decode_step(int pos) {
 bool Engine::decode_graph_enabled() const {
     static const bool enabled = [] {
         const char* v = getenv("JLLM_DECODE_GRAPH");
-        return v && strcmp(v, "0") != 0;
+        // Default-on for non-Gemma4 models (Gemma4 is excluded in
+        // build_cuda_graph). Opt out with JLLM_DECODE_GRAPH=0.
+        return !v || strcmp(v, "0") != 0;
     }();
     return enabled;
 }
@@ -2102,19 +2238,38 @@ void Engine::build_cuda_graph(int pos) {
     if (graph_captured_) return;
     if (!gen_params_.use_cuda_graph) return;
     if (!decode_graph_enabled()) return;
-    // Gemma 4's PLE recomputes per-token from the changing token, so the decode
-    // step can't be captured into a static graph — use the non-graph path.
-    if (config_.arch == Arch::Gemma4) return;
+    // Gemma 4 with shared KV layers is not yet supported in the graph path
+    // (Q-only RoPE for shared-KV layers needs a dyn variant we don't have).
+    // Gemma4 E2B (n_kv_shared_layers==0) is fully supported.
+    // These diagnostics fire from a function called once per decode step;
+    // guard each with a one-shot flag so we log the reason once, not per token.
+    if (config_.arch == Arch::Gemma4 && config_.n_kv_shared_layers > 0) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] decode-graph: Gemma4 shared-KV not supported in graph; staying on per-step path\n");
+            logged = true;
+        }
+        return;
+    }
     if (gen_params_.kv_int8) {
-        fprintf(stderr, "[engine] decode-graph: INT8 KV not supported; staying on per-step path\n");
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] decode-graph: INT8 KV not supported; staying on per-step path\n");
+            logged = true;
+        }
         return;
     }
     if (!kv_cache_.is_fast_position(pos)) {
-        fprintf(stderr, "[engine] decode-graph: pos %d outside KV fast pool; staying on per-step path\n", pos);
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr, "[engine] decode-graph: pos %d outside KV fast pool; staying on per-step path\n", pos);
+            logged = true;
+        }
         return;
     }
 
-    fprintf(stderr, "[engine] Capturing decode CUDA graph...\n");
+    fprintf(stderr, "[engine] Capturing decode CUDA graph%s...\n",
+            config_.arch == Arch::Gemma4 ? " (Gemma4 — PLE updated per-step outside graph)" : "");
 
     int H = config_.hidden_dim;
 
@@ -2127,7 +2282,10 @@ void Engine::build_cuda_graph(int pos) {
     cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal);
 
     for (int l = 0; l < config_.n_layers; l++) {
-        transformer_layer_graph(l, graph_x);
+        if (config_.arch == Arch::Gemma4)
+            transformer_layer_graph_gemma4(l, graph_x);
+        else
+            transformer_layer_graph(l, graph_x);
     }
 
     half* g_normed = (half*)scratch_.get(H * sizeof(half));
@@ -2183,6 +2341,14 @@ int Engine::decode_step_graph(int pos) {
     // rope/attention dyn kernels read.
     cudaError_t err = cudaMemcpyAsync(d_pos_, &pos, sizeof(int),
                                       cudaMemcpyHostToDevice, stream_);
+
+    // Gemma4: PLE is computed outside the layer loop into a fixed device
+    // buffer that the captured graph reads by pointer.  Values change each
+    // step but the pointer captured in the graph is stable.
+    if (err == cudaSuccess && config_.arch == Arch::Gemma4 && gemma_ple_input_) {
+        compute_gemma_ple_input(x, last_token_, gemma_ple_input_);
+    }
+
     if (err == cudaSuccess) {
         err = cudaGraphLaunch(decode_graph_exec_, stream_);
     }

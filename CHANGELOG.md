@@ -1,5 +1,142 @@
 # Changelog
 
+## v1.2.0 — 2026-06-20
+
+A **decode-focused optimization cycle** on top of v1.1.0, for Gemma 4 E2B on
+Jetson Orin Nano Super: a precomputed RoPE cos/sin table, warp-parallel decode
+attention, a fused dp4a QKV GEMV, and `half2`-vectorized elementwise kernels.
+**No change to correctness** (greedy output unchanged) and **no change to the
+Qwen3 path** — every optimization is env-gated (`JLLM_*=0` reverts).
+
+### Performance — Gemma 4 E2B Q4_K_M, Orin Nano Super 8 GB (MAXN_SUPER)
+
+| Metric                       | v1.1.0  | v1.2.0          | Δ |
+| ---------------------------- | ------- | --------------- | --- |
+| Decode (64-tok greedy A/B)   | 29.1 tok/s | **31.0 tok/s** | **+6.5 %** |
+
+Measured as a same-conditions A/B (identical prompt, 64 decode tokens,
+MAXN_SUPER, 3 interleaved runs each, ≤0.3 tok/s variance). The increment comes
+from the warp-parallel decode attention, the dp4a QKV triple, and the `half2`
+elementwise kernels; the RoPE table and the Gemma 4 CUDA-graph path contribute
+negligibly for this model (see below). This is a short-context A/B and is **not**
+comparable to the v1.1.0 "23.5 tok/s at llama.cpp parity" figure, which is
+measured at 512-token depth.
+
+> **Note on the Gemma 4 CUDA-graph path:** Gemma 4 E2B uses 20 shared-KV layers,
+> so `build_cuda_graph` correctly refuses to capture a graph for it and stays on
+> the per-step path. The graph support added this cycle only benefits a
+> hypothetical non-shared-KV Gemma 4 variant; for E2B it is inert.
+
+### fix(engine): print decode-graph skip reasons once, not per token
+
+`build_cuda_graph()` runs once per decode step and returns early (before
+`graph_captured_` is set) whenever the graph path is unsupported, so each
+skip-reason `fprintf` spammed stderr on every generated token. Each is now
+guarded by a one-shot flag. Observed on gemma-4-E2B (shared-KV), where the
+message repeated for all decode tokens.
+
+### chore(bench): add `scripts/bench_v11x.sh` decode profiler
+
+A profiling harness for this cycle: runs the binary under cumulative
+feature-enablement and single-feature ablations (via the `JLLM_*` env gates),
+parses prefill/decode tok/s and the `JLLM_PROFILE=1` per-token breakdown, and
+emits a speedup table. (`--profile`, `--nsys`, `--tokens N` flags.) The
+prefill/decode grep was made case-insensitive to match the binary's
+`[engine] Prefill:` / `Decode:` lines.
+
+### perf(kernels): half2-vectorize elementwise kernels (vec_add, norm, geglu, swiglu, scale)
+
+Vectorize five per-layer elementwise kernels to process 2 `half` elements per
+thread using SM 8.7 `half2` SIMD intrinsics, halving instruction count and
+avoiding float round-trips where possible:
+
+- **`vec_add_kernel`** (`decode.cu`): uses `__hadd2` — stays in FP16 natively,
+  no `__half2float` / `__float2half` pair per element.
+- **`swiglu_kernel`** and **`geglu_kernel`** (`convert.cu`): `half2` load of
+  gate/up, float compute for the transcendental, `half2` store.
+- **`vec_scale_kernel`** (`convert.cu`): `__hmul2` — native FP16 scale, no
+  float conversion.
+- **`fused_rmsnorm_residual_kernel`** (`fused_norm.cu`): `half2` loads in both
+  pass 1 (sum-of-squares) and pass 2 (normalize + write), weight loaded as
+  `half2` when FP16 or as two F32 reads when FP32.
+
+All kernels launch with half the grid size.  Hidden/intermediate dims are
+always even, so the single-element tail path is a safety net only.
+
+### perf(gemv): dp4a triple kernel for Q4_K+Q4_K+Q6_K QKV projections
+
+Adds `gemv_quant_triple_dp4a_typed_kernel<T0,T1,T2>` — a templated kernel that
+uses `__dp4a` for all three output matrices, sharing one `q8_1`-quantized
+activation.  Dispatched from `gemv_quant_triple_gpu` before the uint32-float
+fallback path whenever scratch is available.
+
+The Q6_K V rows in the QKV triple previously used the scalar float byte-path
+(`dot_q6k_row`); they now use `dot_q6k_row_q8_1` (same dp4a path already used
+by the single-output ffn_down kernel).  Q4_K Q and K rows likewise move from
+`dot_q4k_row_uint32` to `dot_q4k_row_q8_1`.  One `quantize_q8_1` kernel call
+is shared across all three projections — negligible overhead (≤ 8 KB activation).
+
+Explicit instantiations: (12,12,14) Qwen3-4B main case, (12,12,12) all-Q4_K,
+(14,14,14) Gemma4 all-Q6_K, (14,12,12) Q6_K query + Q4_K KV.  Falls back to
+the uint32 float path if scratch allocation fails.
+
+### perf(engine): Gemma 4 E2B CUDA graph support
+
+Enables CUDA graph decode for Gemma 4 E2B (models with `n_kv_shared_layers==0`).
+The prior blanket exclusion was based on a comment claiming PLE recomputes
+inside the layer loop — analysis showed PLE is computed *outside* the loop into
+a fixed device buffer (`gemma_ple_input_`), exactly like `d_pos_`.  The graph
+captures the layer loop; `compute_gemma_ple_input` is called outside the graph
+before each `cudaGraphLaunch` so the buffer is updated at the fixed pointer the
+graph already reads.
+
+Also fixes two Gemma 4 cache bugs exposed by the graph path:
+- `rope_inplace_store_kv_fp16_dyn`: K write now uses `head * cache_head_dim`
+  stride (was `head * head_dim`); V copy uses per-head strided write so sliding
+  layers (head_dim=256, cache slot=512) fill the correct half of each KV slot.
+- `flash_attention_decode_dyn`: gains an `int window` parameter; sliding layers
+  pass their window length for the causal mask; global layers pass 0 (full).
+
+Gemma 4 models with shared KV (`n_kv_shared_layers > 0`) still fall back to the
+per-step path — Q-only RoPE for shared-KV layers requires a dyn variant not yet
+implemented.
+
+### perf(engine): CUDA graph decode default-on for Qwen3/Llama (was opt-in)
+
+`JLLM_DECODE_GRAPH` now defaults to enabled. The graph captures ~448 kernel
+launches per decode step into a single `cudaGraphLaunch`, saving ~10 ms of
+host-side dispatch overhead per token (~23% of wall-clock at 23 tok/s on Orin
+Nano). Opt out with `JLLM_DECODE_GRAPH=0`. Gemma 4 is still excluded (PLE
+per-token dependency; blocked in `build_cuda_graph`). INT8 KV and positions
+outside the KV fast pool also skip the graph path automatically. The graph
+now also benefits from the iteration 2 warp-parallel `flash_attention_decode_dyn`
+kernel captured at graph build time.
+
+### perf(attn): warp-parallel Q×K^T + block softmax in decode attention kernel
+
+Replaces the old single-thread serial dot product (one thread owns one KV
+slot, loops over all head_dim=128–512 elements serially) with a
+warp-parallel reduction: one warp owns one KV slot, each lane strides over
+the head_dim with a stride-32 inner loop, then `__shfl_xor_sync` reduces to
+lane 0. Also replaces the `tid==0` serial softmax scan with `block_max_f` /
+`block_sum_f` parallel reductions, and adds a `s_q[head_dim]` shared-memory
+cache so Q is loaded from DRAM once per block instead of once per KV tile.
+Applies to both `flash_attention_decode_kernel` and the CUDA-graph-friendly
+`flash_attention_decode_kernel_dyn`. Matches the design already proven in
+`flash_attention_prefill_batched_kernel`.
+
+### perf(rope): precomputed cos/sin table eliminates trig per decode step
+
+Adds `rope_precompute_table()` (called once at model load) that builds
+device-side `[max_seq × half_dim]` cos/sin float tables for each unique
+`(theta_base, head_dim)` pair. All `rope_inplace*` variants (decode,
+batched prefill, dyn/CUDA-graph) automatically dispatch to the table lookup
+instead of recomputing `powf + cosf + sinf` per thread. Fallback to the
+original trig path retained (`JLLM_ROPE_TABLE=0`). Gemma 4 precomputes
+two tables (local θ=10000, global θ=1000000); Qwen3/Llama precompute one.
+Test: `test_rope_table` verifies zero max-abs-diff vs CPU reference for
+head_dim ∈ {128, 256, 512}.
+
 ## v1.1.0 — 2026-06-19
 
 Adds **Gemma 4 E2B** support and a Gemma-4-focused **kernel optimization
