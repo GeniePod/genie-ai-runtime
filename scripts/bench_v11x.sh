@@ -98,14 +98,14 @@ run_bench() {
     eval "env $profile_flag $env $BIN -m '$MODEL' -p '$PROMPT' -n $TOKENS" \
         > /dev/null 2>"$logfile" || true
 
-    # Prefill
+    # Prefill — binary prints "[engine] Prefill: ... (N tok/s, ...)"
     local ptps
-    ptps=$(grep -m1 "prefill" "$logfile" 2>/dev/null \
+    ptps=$(grep -im1 "prefill.*tok/s" "$logfile" 2>/dev/null \
            | grep -oP '[\d.]+(?= tok/s)' | head -1 || echo 0)
 
-    # Decode
+    # Decode — binary prints "[engine] Decode: ... (N tok/s)"
     local dtps
-    dtps=$(grep -m1 "\bdecode\b.*tok/s" "$logfile" 2>/dev/null \
+    dtps=$(grep -im1 "\bdecode\b.*tok/s" "$logfile" 2>/dev/null \
            | grep -oP '[\d.]+(?= tok/s)' | head -1 || echo 0)
 
     # CUDA graph active?
