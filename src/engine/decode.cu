@@ -3040,6 +3040,44 @@ GenStats Engine::generate(const std::string& prompt, const GenParams& params,
         int token;
         if (use_graph) {
             token = decode_step_graph(pos);
+            // Debug: compare graph logits vs a per-step recompute for the same
+            // (pos, last_token_). decode_step_graph already set last_token_ to
+            // the graph's sampled token; save it, snapshot the graph logits,
+            // re-run the per-step forward (rewrites KV[pos] with the same
+            // values if correct), then report the max logit divergence.
+            static const bool gcmp = [] {
+                const char* v = getenv("JLLM_GRAPH_CMP"); return v && v[0] == '1';
+            }();
+            if (gcmp) {
+                int graph_tok = token;
+                int prev_last = recent_tokens_.empty() ? 0 : 0;  // unused
+                (void)prev_last;
+                std::vector<float> g_logits(host_logits_,
+                                            host_logits_ + config_.vocab_size);
+                // The graph set last_token_ = graph_tok; restore the input token
+                // (the token whose forward we just ran was the prior last_token_,
+                // which decode_step_graph consumed). We recompute with the SAME
+                // input by temporarily setting last_token_ back.
+                int input_tok = recent_tokens_.size() >= 2
+                    ? recent_tokens_[recent_tokens_.size() - 2]
+                    : graph_tok;
+                int saved_last = last_token_;
+                size_t saved_rt = recent_tokens_.size();
+                last_token_ = input_tok;
+                int ps_tok = decode_step(pos);   // overwrites host_logits_
+                double maxd = 0.0; int argd = -1;
+                for (int v = 0; v < config_.vocab_size; v++) {
+                    double d = fabs((double)g_logits[v] - (double)host_logits_[v]);
+                    if (d > maxd) { maxd = d; argd = v; }
+                }
+                fprintf(stderr, "[gcmp] pos=%d in_tok=%d graph_tok=%d ps_tok=%d "
+                        "max|dlogit|=%.4f @v=%d %s\n",
+                        pos, input_tok, graph_tok, ps_tok, maxd, argd,
+                        graph_tok == ps_tok ? "" : "<-- DIVERGE");
+                // Restore state so generation continues on the graph trajectory.
+                while (recent_tokens_.size() > saved_rt) recent_tokens_.pop_back();
+                last_token_ = saved_last;
+            }
         } else {
             token = decode_step(pos);
             if (decode_graph_enabled() && !graph_captured_
