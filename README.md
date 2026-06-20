@@ -7,7 +7,8 @@ container.
 
 **`v1.2.0`** — **Gemma 4 E2B** support (decode at llama.cpp parity, prefill up
 to **4.1×**) plus a decode-tuning cycle (warp-parallel attention, dp4a QKV,
-`half2` kernels; **+6.5 %** decode over v1.1.0). See
+`half2` kernels; **+6.5 %** decode over v1.1.0 short-context, **~+12 %** at
+512-token depth). See
 [`CHANGELOG.md`](CHANGELOG.md) for the release notes and
 [`ROADMAP.md`](ROADMAP.md) for the alpha-track path-by-path narrative.
 

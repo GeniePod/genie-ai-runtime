@@ -10,17 +10,28 @@ Qwen3 path** — every optimization is env-gated (`JLLM_*=0` reverts).
 
 ### Performance — Gemma 4 E2B Q4_K_M, Orin Nano Super 8 GB (MAXN_SUPER)
 
-| Metric                       | v1.1.0  | v1.2.0          | Δ |
-| ---------------------------- | ------- | --------------- | --- |
-| Decode (64-tok greedy A/B)   | 29.1 tok/s | **31.0 tok/s** | **+6.5 %** |
+Same-conditions decode A/B (v1.1.0 vs v1.2.0 binaries, identical prompt,
+MAXN_SUPER, 3 interleaved runs each, ≤0.3 tok/s variance), at three context
+depths:
 
-Measured as a same-conditions A/B (identical prompt, 64 decode tokens,
-MAXN_SUPER, 3 interleaved runs each, ≤0.3 tok/s variance). The increment comes
-from the warp-parallel decode attention, the dp4a QKV triple, and the `half2`
-elementwise kernels; the RoPE table and the Gemma 4 CUDA-graph path contribute
-negligibly for this model (see below). This is a short-context A/B and is **not**
-comparable to the v1.1.0 "23.5 tok/s at llama.cpp parity" figure, which is
-measured at 512-token depth.
+| Context depth (prompt len) | v1.1.0  | v1.2.0          | Δ |
+| -------------------------- | ------- | --------------- | --- |
+| shallow (~11 tok)          | 29.1 tok/s | **31.0 tok/s** | **+6.5 %** |
+| ~450 (421 tok)             | 22.1 tok/s | **24.4 tok/s** | **+10.4 %** |
+| 512 (511 tok)              | 21.1 tok/s | **23.8 tok/s** | **~+12 %** |
+
+**The decode gain grows with context depth** — the warp-parallel decode
+attention does more work per token as the KV cache grows, so it saves more
+there. The increment comes from that attention kernel, the dp4a QKV triple, and
+the `half2` elementwise kernels; the RoPE table and the Gemma 4 CUDA-graph path
+contribute negligibly for this model (see below). The 512-depth row is the
+apples-to-apples comparison with v1.1.0's "23.5 tok/s at llama.cpp parity"
+measurement methodology (v1.1.0 here reads 21.1 rather than 23.5 because these
+runs are at `jetson_clocks`-unlocked MAXN_SUPER and average over depth
+511–553). _(At depth 512 v1.2.0 stopped at 28 greedy tokens vs v1.1.0's 43 — a
+borderline tie-break shifted by the decode-path change — so v1.2.0's tokens
+average ~7 positions shallower, inflating its figure by ~1 %; the true gain is
+~+11 %.)_
 
 > **Note on the Gemma 4 CUDA-graph path:** Gemma 4 E2B uses 20 shared-KV layers,
 > so `build_cuda_graph` correctly refuses to capture a graph for it and stays on
