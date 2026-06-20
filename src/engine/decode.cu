@@ -1606,9 +1606,11 @@ void Engine::transformer_layer_graph(int layer, half* x) {
 // flash_attention_decode_dyn so a single captured graph is valid for every
 // decode step (pos is read from *d_pos_ inside those kernels).
 //
+// Handles both KV-owning layers (rotate Q+K, store K/V) and shared-KV layers
+// (rotate Q only via rope_inplace_dyn, read the source layer's cache).
+//
 // Requirements (enforced by build_cuda_graph before capture):
-//   - n_kv_shared_layers == 0: all layers own K/V; no Q-only RoPE path needed.
-//   - !gen_params_.kv_int8
+//   - !gen_params_.kv_int8  (the dyn rope/KV-store kernels only emit FP16)
 void Engine::transformer_layer_graph_gemma4(int layer, half* x) {
     const auto& lw = model_weights_.layers[layer];
     const int H  = config_.hidden_dim;
@@ -1627,44 +1629,68 @@ void Engine::transformer_layer_graph_gemma4(int layer, half* x) {
     fused_rmsnorm_residual(normed, x, nullptr, lw.rms_attn, 1, H,
                            config_.rms_eps, norm_fp32, stream_);
 
-    // All layers own their own K/V (n_kv_shared_layers==0 enforced in build_cuda_graph).
-    gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
-                      k_buf, lw.wk, lw.type_wk, KV_DIM,
-                      v_buf, lw.wv, lw.type_wv, KV_DIM,
-                      normed, H, stream_);
+    // KV sharing: the trailing n_kv_shared_layers layers reuse the cache of the
+    // last KV-producing layer of their type (sliding -> kv_from_start-2,
+    // global -> kv_from_start-1), matching transformer_layer_gemma4. kv_layer
+    // is a fixed integer per layer, so key_ptr(kv_layer,0) is a constant
+    // address the captured graph can replay. (build_cuda_graph guarantees
+    // FP16 KV + fast positions, so no int8/overflow store path is needed.)
+    const int kv_from_start = config_.n_layers - config_.n_kv_shared_layers;
+    const bool has_own_kv = (layer < kv_from_start);
+    const int kv_layer = has_own_kv
+        ? layer
+        : (lw.is_sliding ? kv_from_start - 2 : kv_from_start - 1);
+
+    if (has_own_kv) {
+        gemv_quant_triple(q_buf, lw.wq, lw.type_wq, Q_DIM,
+                          k_buf, lw.wk, lw.type_wk, KV_DIM,
+                          v_buf, lw.wv, lw.type_wv, KV_DIM,
+                          normed, H, stream_);
+    } else {
+        gemv_quant(q_buf, lw.wq, lw.type_wq, normed, Q_DIM, H, stream_);
+    }
 
     if (lw.q_norm) {
         fused_rmsnorm_residual(q_buf, q_buf, nullptr, lw.q_norm,
                                config_.n_heads, hd, config_.rms_eps,
                                lw.qk_norm_type == 0, stream_);
     }
-    if (lw.k_norm) {
-        fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
-                               config_.n_kv_heads, hd, config_.rms_eps,
-                               lw.qk_norm_type == 0, stream_);
-    }
-    if (gemma_vnorm_ones_) {
-        fused_rmsnorm_residual(v_buf, v_buf, nullptr, gemma_vnorm_ones_,
-                               config_.n_kv_heads, hd, config_.rms_eps,
-                               /*weight_fp32=*/true, stream_);
+    // K-norm + weightless V-RMSNorm only when this layer produces its own K/V.
+    if (has_own_kv) {
+        if (lw.k_norm) {
+            fused_rmsnorm_residual(k_buf, k_buf, nullptr, lw.k_norm,
+                                   config_.n_kv_heads, hd, config_.rms_eps,
+                                   lw.qk_norm_type == 0, stream_);
+        }
+        if (gemma_vnorm_ones_) {
+            fused_rmsnorm_residual(v_buf, v_buf, nullptr, gemma_vnorm_ones_,
+                                   config_.n_kv_heads, hd, config_.rms_eps,
+                                   /*weight_fp32=*/true, stream_);
+        }
     }
 
-    // RoPE + KV store: position is read from *d_pos_ at execution time.
-    // cache_head_dim = config_.head_dim (512) so sliding layers (hd=256)
-    // write into the first 256 elements of each 512-element cache slot.
-    rope_inplace_store_kv_fp16_dyn(q_buf, k_buf, v_buf,
-                                   (half*)kv_cache_.key_ptr(layer, 0),
-                                   (half*)kv_cache_.val_ptr(layer, 0),
-                                   config_.n_heads, config_.n_kv_heads,
-                                   hd, config_.head_dim,
-                                   d_pos_, lw.rope_theta_l,
-                                   config_.rope_neox, stream_);
+    // RoPE: position is read from *d_pos_ at execution time. KV-owning layers
+    // rotate Q+K and store K/V (cache_head_dim = config_.head_dim so sliding
+    // layers write into the first hd elements of each slot). Shared-KV layers
+    // rotate Q only — their K/V already live in kv_layer's cache.
+    if (has_own_kv) {
+        rope_inplace_store_kv_fp16_dyn(q_buf, k_buf, v_buf,
+                                       (half*)kv_cache_.key_ptr(layer, 0),
+                                       (half*)kv_cache_.val_ptr(layer, 0),
+                                       config_.n_heads, config_.n_kv_heads,
+                                       hd, config_.head_dim,
+                                       d_pos_, lw.rope_theta_l,
+                                       config_.rope_neox, stream_);
+    } else {
+        rope_inplace_dyn(q_buf, nullptr, config_.n_heads, 0, hd,
+                         d_pos_, lw.rope_theta_l, config_.rope_neox, stream_);
+    }
 
     const float scale      = attention_scale(config_.spec, hd);
     const int   attn_window = lw.is_sliding ? config_.sliding_window : 0;
     flash_attention_decode_dyn(attn_out, q_buf,
-                               kv_cache_.key_ptr(layer, 0),
-                               kv_cache_.val_ptr(layer, 0),
+                               kv_cache_.key_ptr(kv_layer, 0),
+                               kv_cache_.val_ptr(kv_layer, 0),
                                config_.n_heads, config_.n_kv_heads,
                                hd, d_pos_, scale,
                                /*kv_int8=*/false, /*kv_scales=*/nullptr,
@@ -2238,19 +2264,12 @@ void Engine::build_cuda_graph(int pos) {
     if (graph_captured_) return;
     if (!gen_params_.use_cuda_graph) return;
     if (!decode_graph_enabled()) return;
-    // Gemma 4 with shared KV layers is not yet supported in the graph path
-    // (Q-only RoPE for shared-KV layers needs a dyn variant we don't have).
-    // Gemma4 E2B (n_kv_shared_layers==0) is fully supported.
+    // Gemma 4 (both KV-owning and shared-KV layers) is supported:
+    // transformer_layer_graph_gemma4 rotates Q only via rope_inplace_dyn for
+    // shared-KV layers and reads the source layer's cache; the PLE input is
+    // recomputed outside the graph each step (fixed gemma_ple_input_ pointer).
     // These diagnostics fire from a function called once per decode step;
     // guard each with a one-shot flag so we log the reason once, not per token.
-    if (config_.arch == Arch::Gemma4 && config_.n_kv_shared_layers > 0) {
-        static bool logged = false;
-        if (!logged) {
-            fprintf(stderr, "[engine] decode-graph: Gemma4 shared-KV not supported in graph; staying on per-step path\n");
-            logged = true;
-        }
-        return;
-    }
     if (gen_params_.kv_int8) {
         static bool logged = false;
         if (!logged) {

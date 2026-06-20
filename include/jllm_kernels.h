@@ -300,6 +300,21 @@ void rope_inplace_store_kv_fp16_dyn(
     cudaStream_t   stream
 );
 
+// CUDA-graph-friendly Q/K RoPE with NO KV store (position from a device int*).
+// Pass k == nullptr and n_kv_heads == 0 to rotate Q only — used by Gemma 4
+// shared-KV layers in the captured decode graph.
+void rope_inplace_dyn(
+    half*          q,
+    half*          k,
+    int            n_heads,
+    int            n_kv_heads,
+    int            head_dim,
+    const int*     d_pos,
+    float          theta_base,
+    bool           neox,
+    cudaStream_t   stream
+);
+
 // ── Flash Attention (single query, decode path) ──────────────────────────
 // Fused: Q×K^T → scale → softmax → ×V, all in shared memory + registers.
 // Tuned for 48 KB shared mem: TILE_Q=1 (decode), TILE_KV=64.
