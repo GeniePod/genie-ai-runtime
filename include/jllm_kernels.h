@@ -384,7 +384,8 @@ void flash_attention_decode_dyn(
     const void*    v_cache,
     int            n_heads,
     int            n_kv_heads,
-    int            head_dim,
+    int            head_dim,        // active per-head vector length (Gemma sliding=256)
+    int            cache_head_dim,  // KV cache slot per-head stride (Gemma=512)
     const int*     d_pos,
     float          scale,
     bool           kv_int8,

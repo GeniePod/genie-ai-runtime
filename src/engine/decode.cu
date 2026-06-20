@@ -1575,7 +1575,7 @@ void Engine::transformer_layer_graph(int layer, half* x) {
                                kv_cache_.key_ptr(layer, 0),
                                kv_cache_.val_ptr(layer, 0),
                                config_.n_heads, config_.n_kv_heads,
-                               config_.head_dim,
+                               config_.head_dim, config_.head_dim,
                                d_pos_, scale,
                                /*kv_int8=*/false, /*kv_scales=*/nullptr,
                                /*window=*/0, stream_);
@@ -1692,7 +1692,7 @@ void Engine::transformer_layer_graph_gemma4(int layer, half* x) {
                                kv_cache_.key_ptr(kv_layer, 0),
                                kv_cache_.val_ptr(kv_layer, 0),
                                config_.n_heads, config_.n_kv_heads,
-                               hd, d_pos_, scale,
+                               hd, config_.head_dim, d_pos_, scale,
                                /*kv_int8=*/false, /*kv_scales=*/nullptr,
                                attn_window, stream_);
 
