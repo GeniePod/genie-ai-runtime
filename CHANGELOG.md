@@ -1,6 +1,48 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 — 2026-06-20
+
+A **decode-focused optimization cycle** on top of v1.1.0, for Gemma 4 E2B on
+Jetson Orin Nano Super: a precomputed RoPE cos/sin table, warp-parallel decode
+attention, a fused dp4a QKV GEMV, and `half2`-vectorized elementwise kernels.
+**No change to correctness** (greedy output unchanged) and **no change to the
+Qwen3 path** — every optimization is env-gated (`JLLM_*=0` reverts).
+
+### Performance — Gemma 4 E2B Q4_K_M, Orin Nano Super 8 GB (MAXN_SUPER)
+
+| Metric                       | v1.1.0  | v1.2.0          | Δ |
+| ---------------------------- | ------- | --------------- | --- |
+| Decode (64-tok greedy A/B)   | 29.1 tok/s | **31.0 tok/s** | **+6.5 %** |
+
+Measured as a same-conditions A/B (identical prompt, 64 decode tokens,
+MAXN_SUPER, 3 interleaved runs each, ≤0.3 tok/s variance). The increment comes
+from the warp-parallel decode attention, the dp4a QKV triple, and the `half2`
+elementwise kernels; the RoPE table and the Gemma 4 CUDA-graph path contribute
+negligibly for this model (see below). This is a short-context A/B and is **not**
+comparable to the v1.1.0 "23.5 tok/s at llama.cpp parity" figure, which is
+measured at 512-token depth.
+
+> **Note on the Gemma 4 CUDA-graph path:** Gemma 4 E2B uses 20 shared-KV layers,
+> so `build_cuda_graph` correctly refuses to capture a graph for it and stays on
+> the per-step path. The graph support added this cycle only benefits a
+> hypothetical non-shared-KV Gemma 4 variant; for E2B it is inert.
+
+### fix(engine): print decode-graph skip reasons once, not per token
+
+`build_cuda_graph()` runs once per decode step and returns early (before
+`graph_captured_` is set) whenever the graph path is unsupported, so each
+skip-reason `fprintf` spammed stderr on every generated token. Each is now
+guarded by a one-shot flag. Observed on gemma-4-E2B (shared-KV), where the
+message repeated for all decode tokens.
+
+### chore(bench): add `scripts/bench_v11x.sh` decode profiler
+
+A profiling harness for this cycle: runs the binary under cumulative
+feature-enablement and single-feature ablations (via the `JLLM_*` env gates),
+parses prefill/decode tok/s and the `JLLM_PROFILE=1` per-token breakdown, and
+emits a speedup table. (`--profile`, `--nsys`, `--tokens N` flags.) The
+prefill/decode grep was made case-insensitive to match the binary's
+`[engine] Prefill:` / `Decode:` lines.
 
 ### perf(kernels): half2-vectorize elementwise kernels (vec_add, norm, geglu, swiglu, scale)
 
