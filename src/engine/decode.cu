@@ -2376,6 +2376,12 @@ int Engine::decode_step_graph(int pos) {
 
     dequant_embedding(x, model_weights_.tok_embd, last_token_, H,
                       model_weights_.embd_type, stream_);
+    // Gemma scales the token embedding by sqrt(hidden) (ScaledWordEmbedding).
+    // The per-step decode_step does this right after the lookup; it MUST also
+    // happen here (the layers' input RMSNorm hides the scale from attention,
+    // but the residual stream and the PLE — which reads the embedding directly
+    // — need the scaled value). No-op when spec has no embedding scale.
+    scale_embedding(config_.spec, x, H, config_.hidden_dim, stream_);
 
     // Push the new pos to the device-side int that the captured
     // rope/attention dyn kernels read.
