@@ -363,6 +363,7 @@ void Engine::unload() {
     if (decode_graph_exec_) { cudaGraphExecDestroy(decode_graph_exec_); decode_graph_exec_ = nullptr; }
     if (decode_graph_)      { cudaGraphDestroy(decode_graph_); decode_graph_ = nullptr; }
     if (d_pos_) { cudaFree(d_pos_); d_pos_ = nullptr; }
+    if (gemma_ple_graph_buf_) { cudaFree(gemma_ple_graph_buf_); gemma_ple_graph_buf_ = nullptr; }
     if (stream_)            { cudaStreamDestroy(stream_); stream_ = nullptr; }
     if (host_logits_) {
         cudaFreeHost(host_logits_);
@@ -2292,6 +2293,26 @@ void Engine::build_cuda_graph(int pos) {
 
     int H = config_.hidden_dim;
 
+    // Gemma 4: the captured PLE kernels must read from a buffer that does NOT
+    // alias scratch (the graph reuses scratch offsets for its per-layer
+    // buffers and would overwrite a scratch PLE buffer mid-replay). Point
+    // gemma_ple_input_ at a dedicated persistent buffer for capture; the same
+    // pointer is rewritten each step in decode_step_graph.
+    if (config_.arch == Arch::Gemma4 && config_.spec.per_layer_embeddings) {
+        if (!gemma_ple_graph_buf_) {
+            const size_t bytes =
+                (size_t)config_.n_layers * config_.ple_input_dim * sizeof(half);
+            cudaError_t e = cudaMalloc((void**)&gemma_ple_graph_buf_, bytes);
+            if (e != cudaSuccess) {
+                fprintf(stderr, "[engine] decode-graph: cudaMalloc PLE buffer "
+                        "(%zu B) failed: %s; staying on per-step path\n",
+                        bytes, cudaGetErrorString(e));
+                return;
+            }
+        }
+        gemma_ple_input_ = gemma_ple_graph_buf_;
+    }
+
     // Reset scratch so the captured allocation pattern matches what
     // decode_step_graph will produce on replay (it starts with one
     // scratch_.get(x) after scratch_.reset()).
@@ -2361,10 +2382,12 @@ int Engine::decode_step_graph(int pos) {
     cudaError_t err = cudaMemcpyAsync(d_pos_, &pos, sizeof(int),
                                       cudaMemcpyHostToDevice, stream_);
 
-    // Gemma4: PLE is computed outside the layer loop into a fixed device
-    // buffer that the captured graph reads by pointer.  Values change each
-    // step but the pointer captured in the graph is stable.
-    if (err == cudaSuccess && config_.arch == Arch::Gemma4 && gemma_ple_input_) {
+    // Gemma4: PLE is computed outside the layer loop into the dedicated
+    // persistent buffer the captured graph reads by pointer (NOT scratch —
+    // see build_cuda_graph). Values change each step; the pointer is stable.
+    if (err == cudaSuccess && config_.arch == Arch::Gemma4 &&
+        gemma_ple_graph_buf_) {
+        gemma_ple_input_ = gemma_ple_graph_buf_;
         compute_gemma_ple_input(x, last_token_, gemma_ple_input_);
     }
 
