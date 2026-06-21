@@ -529,11 +529,12 @@ void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
 
     const int nbk = K/256;
     // write_back emits half directly into y (no f32 staging buffer / convert kernel).
+    const int* q8 = (const int*)g_q8;
     switch (choice) {
-        case 1:  launch_mmq_tile<128, 64 >(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
-        case 2:  launch_mmq_tile<128, 128>(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
-        case 3:  launch_mmq_tile<64,  64 >(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
-        default: launch_mmq_tile<64,  128>(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
+        case 1:  launch_mmq_tile<128, 64 >(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
+        case 2:  launch_mmq_tile<128, 128>(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
+        case 3:  launch_mmq_tile<64,  64 >(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
+        default: launch_mmq_tile<64,  128>(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
     }
 }
 }  // namespace jllm
