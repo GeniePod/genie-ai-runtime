@@ -622,9 +622,12 @@ void flash_attention_prefill_batched(
     const float* k_scales, const float* v_scales, int window, cudaStream_t stream)
 {
     if (N <= 0) return;
-    // Short query-batch: the fused F32 query-tiled kernel beats cuBLAS (see
-    // above). Try it first; fall back to cuBLAS if it can't run this shape.
-    if (short_tiled_enabled() && !kv_int8 && N < attn_short_crossover() &&
+    // Short context: the fused F32 query-tiled kernel beats cuBLAS (see above).
+    // The cost per output is ~ seq_len (key count), so dispatch on the total
+    // sequence length start_pos+N, NOT the query-batch N: a late chunk of a
+    // long prompt has small N but a large key count, where cuBLAS still wins.
+    // Try the fused kernel first below the crossover; fall back to cuBLAS.
+    if (short_tiled_enabled() && !kv_int8 && (start_pos + N) < attn_short_crossover() &&
         launch_flash_attn_prefill_tc(output, q, k_cache, v_cache, n_heads,
             n_kv_heads, head_dim, cache_head_dim, N, start_pos, scale, window, stream)) {
         return;
