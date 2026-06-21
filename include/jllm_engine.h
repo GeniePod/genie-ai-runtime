@@ -364,6 +364,13 @@ private:
     // loop; each gemma4 layer reads its slice via gemma_ple_input_.
     void compute_gemma_ple_input(const half* inputs_embeds, int token, half* out);
     half* gemma_ple_input_ = nullptr;
+    // Dedicated (non-scratch) PLE-input buffer for the CUDA-graph decode path.
+    // The per-step path allocates gemma_ple_input_ from scratch, but the
+    // captured graph reuses scratch offsets for its per-layer buffers, which
+    // would overwrite a scratch PLE buffer mid-replay. This persistent buffer
+    // is read by the captured PLE kernels and rewritten each step in
+    // decode_step_graph, so it must not alias scratch.
+    half* gemma_ple_graph_buf_ = nullptr;
     // Gemma 4 normalizes V with a *weightless* per-head RMSNorm before the KV
     // store (ggml_rms_norm in llama.cpp). fused_rmsnorm_residual needs a weight
     // vector, so this is a device buffer of `head_dim` ones used as unit weight.

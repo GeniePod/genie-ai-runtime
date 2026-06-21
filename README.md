@@ -5,10 +5,11 @@ job: serve a single small model fast and predictably in the memory
 budget left over after voice STT, TTS, denoise, and a Home Assistant
 container.
 
-**`v1.2.0`** — **Gemma 4 E2B** support (decode at llama.cpp parity, prefill up
+**`v1.2.1`** — **Gemma 4 E2B** support (decode at llama.cpp parity, prefill up
 to **4.1×**) plus a decode-tuning cycle (warp-parallel attention, dp4a QKV,
 `half2` kernels; **+6.5 %** decode over v1.1.0 short-context, **~+12 %** at
-512-token depth). See
+512-token depth) and a fixed decode CUDA-graph path (**+5.5 %** decode at
+shallow context). See
 [`CHANGELOG.md`](CHANGELOG.md) for the release notes and
 [`ROADMAP.md`](ROADMAP.md) for the alpha-track path-by-path narrative.
 
@@ -150,7 +151,7 @@ Master header: [`include/jllm.h`](include/jllm.h).
 | Doc | Purpose |
 | --- | --- |
 | [`ROADMAP.md`](ROADMAP.md)                              | The alpha-track narrative (every Path, every perf win, every PR). What we did and how. |
-| [`CHANGELOG.md`](CHANGELOG.md)                          | Per-release notes alpha.0 → v1.2.0 |
+| [`CHANGELOG.md`](CHANGELOG.md)                          | Per-release notes alpha.0 → v1.2.1 |
 | [`docs/build.md`](docs/build.md)                        | Detailed build + prereqs |
 | [`docs/server.md`](docs/server.md)                      | HTTP server reference (endpoints, request fields, SSE, systemd) |
 | [`docs/architecture.md`](docs/architecture.md)          | Module-level design notes |

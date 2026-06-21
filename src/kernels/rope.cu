@@ -646,6 +646,95 @@ __global__ void rope_store_kv_fp16_kernel_dyn(
     }
 }
 
+// Dyn-position Q/K RoPE WITHOUT a KV store. Mirrors rope_kernel_tbl /
+// rope_kernel but reads the position from *d_pos so a captured CUDA graph
+// stays valid across decode steps. Used by Gemma 4 shared-KV layers, which
+// rotate Q only (k == nullptr, n_kv_heads == 0) — their K/V already live in
+// the source layer's cache and must NOT be re-stored.
+__global__ void rope_kernel_dyn_tbl(
+    half* __restrict__ q, half* __restrict__ k,
+    int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ d_pos,
+    const float* __restrict__ cos_tbl, const float* __restrict__ sin_tbl,
+    int half_dim, bool neox)
+{
+    const int tid      = blockIdx.x * blockDim.x + threadIdx.x;
+    const int h2       = head_dim / 2;
+    const int q_pairs  = n_heads * h2;
+    const int total    = (n_heads + n_kv_heads) * h2;
+    if (tid >= total) return;
+    const int position = *d_pos;
+
+    const bool is_q = tid < q_pairs;
+    int head, pair_idx; half* ptr;
+    if (is_q) {
+        head = tid / h2; pair_idx = tid % h2; ptr = q + head * head_dim;
+    } else {
+        int kt = tid - q_pairs; head = kt / h2; pair_idx = kt % h2;
+        ptr = k + head * head_dim;
+    }
+    const float c  = cos_tbl[(int64_t)position * half_dim + pair_idx];
+    const float s  = sin_tbl[(int64_t)position * half_dim + pair_idx];
+    const int i0   = neox ? pair_idx      : pair_idx * 2;
+    const int i1   = neox ? pair_idx + h2 : pair_idx * 2 + 1;
+    const float v0 = __half2float(ptr[i0]);
+    const float v1 = __half2float(ptr[i1]);
+    ptr[i0] = __float2half(v0 * c - v1 * s);
+    ptr[i1] = __float2half(v0 * s + v1 * c);
+}
+
+__global__ void rope_kernel_dyn(
+    half* __restrict__ q, half* __restrict__ k,
+    int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ d_pos, float theta_base, bool neox)
+{
+    const int tid      = blockIdx.x * blockDim.x + threadIdx.x;
+    const int h2       = head_dim / 2;
+    const int q_pairs  = n_heads * h2;
+    const int total    = (n_heads + n_kv_heads) * h2;
+    if (tid >= total) return;
+    const int position = *d_pos;
+
+    const bool is_q = tid < q_pairs;
+    int head, pair_idx; half* ptr;
+    if (is_q) {
+        head = tid / h2; pair_idx = tid % h2; ptr = q + head * head_dim;
+    } else {
+        int kt = tid - q_pairs; head = kt / h2; pair_idx = kt % h2;
+        ptr = k + head * head_dim;
+    }
+    const float freq  = 1.0f / powf(theta_base, (2.0f * pair_idx) / head_dim);
+    const float angle = position * freq;
+    const float c = cosf(angle), s = sinf(angle);
+    const int i0   = neox ? pair_idx      : pair_idx * 2;
+    const int i1   = neox ? pair_idx + h2 : pair_idx * 2 + 1;
+    const float v0 = __half2float(ptr[i0]);
+    const float v1 = __half2float(ptr[i1]);
+    ptr[i0] = __float2half(v0 * c - v1 * s);
+    ptr[i1] = __float2half(v0 * s + v1 * c);
+}
+
+// Q/K RoPE with device-resident position (no KV store). k may be nullptr with
+// n_kv_heads == 0 to rotate Q only.
+void rope_inplace_dyn(half* q, half* k, int n_heads, int n_kv_heads,
+                      int head_dim, const int* d_pos, float theta_base,
+                      bool neox, cudaStream_t stream) {
+    const int h2    = head_dim / 2;
+    const int total = (n_heads + n_kv_heads) * h2;
+    const int block = BLOCK_SIZE;
+    const int grid  = (total + block - 1) / block;
+    const RopeTableEntry* tbl = rope_table_enabled()
+        ? find_rope_tbl(theta_base, h2) : nullptr;
+    if (tbl) {
+        rope_kernel_dyn_tbl<<<grid, block, 0, stream>>>(
+            q, k, n_heads, n_kv_heads, head_dim,
+            d_pos, tbl->d_cos, tbl->d_sin, tbl->half_dim, neox);
+    } else {
+        rope_kernel_dyn<<<grid, block, 0, stream>>>(
+            q, k, n_heads, n_kv_heads, head_dim, d_pos, theta_base, neox);
+    }
+}
+
 void rope_inplace_store_kv_fp16_dyn(
     half* q, half* k, const half* v,
     half* k_cache_layer_base, half* v_cache_layer_base,
