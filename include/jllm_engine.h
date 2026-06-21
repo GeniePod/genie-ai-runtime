@@ -346,6 +346,9 @@ private:
     cudaGraph_t     decode_graph_ = nullptr;
     cudaGraphExec_t decode_graph_exec_ = nullptr;
     bool            graph_captured_ = false;
+    // Split-K decode-attention split count baked into the captured graph (the
+    // grid is fixed at capture, so it is chosen once from the capture-time pos).
+    int             graph_attn_splits_ = 1;
     float*          host_logits_ = nullptr;
     int             host_logits_capacity_ = 0;
     // Device-side int written by the host before each decode-graph
