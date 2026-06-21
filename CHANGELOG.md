@@ -1,5 +1,60 @@
 # Changelog
 
+## v1.2.1 — 2026-06-21
+
+Fixes the **Gemma 4 E2B decode CUDA-graph path** and enables it for the E2B
+model (which uses KV sharing). The graph was added in v1.2.0 but excluded for
+shared-KV models and, as it turned out, carried three latent bugs that made it
+produce garbage if enabled — none ever shipped to users (the path was
+guard-disabled for every real Gemma 4 model). With these fixed, Gemma 4 E2B
+decode runs through the captured graph by default (`JLLM_DECODE_GRAPH=0`
+reverts).
+
+### Performance — Gemma 4 E2B Q4_K_M, Orin Nano Super (MAXN_SUPER)
+
+Clean equal-token decode A/B (graph OFF vs ON):
+
+| Context depth | graph OFF | graph ON | Δ |
+| ------------- | --------- | -------- | --- |
+| shallow / typical | 30.7 tok/s | **32.4 tok/s** | **+5.5 %** |
+| 512-token depth   | 23.9 tok/s | 24.0 tok/s | ~neutral |
+
+The graph collapses ~448 per-token kernel launches into one `cudaGraphLaunch`,
+recovering host-launch overhead that matters most when tokens are fast
+(shallow context); at depth the per-token GPU work dominates and the win
+tapers to neutral. Greedy output matches the per-step path (factual prompts
+identical; a 511-token prompt crossing the 512-token sliding window is
+byte-identical). A residual ~1–2 logit difference between the per-step and
+dyn attention kernels (fp reduction order) can flip an occasional borderline
+token — the same class as the existing int8-GEMM tie-breaks.
+
+### fix(engine): enable + correct the Gemma 4 shared-KV decode graph
+
+Three bugs in the v1.2.0 Gemma 4 graph path (all dormant — the path was never
+exercised because E2B was guard-excluded):
+
+- **`flash_attention_decode_dyn` ignored `cache_head_dim`.** It derived the
+  KV-cache position stride and per-head offset from `head_dim`, but the
+  per-step kernel (and the store kernel) use `cache_head_dim`. For Gemma 4
+  sliding layers (`head_dim` 256, cache slot 512) the graph read each KV slot
+  at half the correct stride. Added the `cache_head_dim` parameter and used it
+  for the strides, reading `head_dim` columns from each slot.
+- **The PLE input buffer aliased scratch.** `gemma_ple_input_` is a scratch
+  allocation, but the captured graph reuses the same scratch offsets for its
+  per-layer buffers and overwrote the PLE values mid-replay. Added a dedicated
+  persistent buffer (`gemma_ple_graph_buf_`) that the captured PLE kernels read
+  and `decode_step_graph` rewrites each step.
+- **`scale_embedding` was missing from the graph path.** `decode_step` scales
+  the token embedding by `sqrt(hidden)` (Gemma's ScaledWordEmbedding);
+  `decode_step_graph` skipped it, so the forward ran on an embedding ~39× too
+  small. The layers' input RMSNorm hides this from attention, but the residual
+  stream and the per-layer-embedding block (which read the embedding directly)
+  were wrong, degenerating generation after the first high-confidence tokens.
+
+Also enables the graph for shared-KV Gemma 4: a new device-position Q-only
+RoPE (`rope_inplace_dyn`) lets the captured graph rotate Q for the trailing
+KV-sharing layers (which reuse a source layer's cache) without a KV store.
+
 ## v1.2.0 — 2026-06-20
 
 A **decode-focused optimization cycle** on top of v1.1.0, for Gemma 4 E2B on
