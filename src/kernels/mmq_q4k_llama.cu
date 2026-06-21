@@ -473,12 +473,42 @@ static void ensure_scratch(size_t q8_blocks, int npad) {
     }
 }
 
+// Launch mul_mat_q_llama for a compile-time tile (MX cols × MY rows). npad must
+// be a multiple of MX (caller pads N up to MX). need_check guards partial M tiles.
+template <int MX, int MY>
+static void launch_mmq_tile(const void* Wdev, const int* g_q8, const int* g_ids,
+                            half* y, int M, int N, int nbk, int npad, cudaStream_t stream) {
+    constexpr int nwarps = 8, warp = 32;
+    size_t shmem = (size_t)(MX + GGML_PAD(MX*MMQ_TILE_Y_K, nwarps*warp) + MY*MMQ_MMA_TILE_X_K_Q8_1)*sizeof(int);
+    dim3 grid(npad/MX, (M + MY - 1)/MY), block(warp, nwarps);
+    if (M % MY == 0) {
+        cudaFuncSetAttribute(mul_mat_q_llama<MX,MY,false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+        mul_mat_q_llama<MX,MY,false><<<grid,block,shmem,stream>>>((const char*)Wdev, g_q8, g_ids, y, M, N, nbk, M, npad);
+    } else {
+        cudaFuncSetAttribute(mul_mat_q_llama<MX,MY,true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+        mul_mat_q_llama<MX,MY,true><<<grid,block,shmem,stream>>>((const char*)Wdev, g_q8, g_ids, y, M, N, nbk, M, npad);
+    }
+}
+
+// Tile (MX×MY) selection. Default 64×128 (the shipped config). JLLM_MMQ_TILE
+// overrides for in-engine autotuning sweeps: 0=64x128, 1=128x64, 2=128x128,
+// 3=64x64. mmq_x (=MX, the token-tile width) amortizes the weight unpack over
+// more columns; on the 8-SM Orin bigger tiles trade occupancy for amortization.
+static int mmq_tile_choice() {
+    static const int t = [] {
+        const char* v = getenv("JLLM_MMQ_TILE");
+        return v ? atoi(v) : 0;
+    }();
+    return t;
+}
+
 // Engine-facing launcher. y[N x M] half row-major = x[N x K] half · W^T (Q4_K).
 // In namespace jllm to match genie's gemv_q4.cu forward declaration.
 namespace jllm {
 void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
                         int M, int N, int K, cudaStream_t stream) {
-    constexpr int MX = 64, MY = 128;
+    const int choice = mmq_tile_choice();
+    const int MX = (choice == 0 || choice == 3) ? 64 : 128;
     const int npad = ((N + MX - 1)/MX)*MX;
     const int nkb128 = K/128;
 
@@ -497,17 +527,13 @@ void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
     dim3 qgrid(npad, nkb128); // padding cols (col>=N) write zero d/qs via the col<N guard
     quantize_mmq_q8_1_ds4<<<qgrid, 128, 0, stream>>>(x, g_q8, N, K, npad);
 
-    const int nwarps=8, warp=32;
-    size_t shmem = (size_t)(MX + GGML_PAD(MX*MMQ_TILE_Y_K, nwarps*warp) + MY*MMQ_MMA_TILE_X_K_Q8_1)*sizeof(int);
-    dim3 grid(npad/MX, (M + MY - 1)/MY), block(warp, nwarps);
     const int nbk = K/256;
     // write_back emits half directly into y (no f32 staging buffer / convert kernel).
-    if (M % MY == 0) {
-        cudaFuncSetAttribute(mul_mat_q_llama<MX,MY,false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        mul_mat_q_llama<MX,MY,false><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g_q8,g_ids,y,M,N,nbk,M,npad);
-    } else {
-        cudaFuncSetAttribute(mul_mat_q_llama<MX,MY,true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
-        mul_mat_q_llama<MX,MY,true><<<grid,block,shmem,stream>>>((const char*)Wdev,(const int*)g_q8,g_ids,y,M,N,nbk,M,npad);
+    switch (choice) {
+        case 1:  launch_mmq_tile<128, 64 >(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
+        case 2:  launch_mmq_tile<128, 128>(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
+        case 3:  launch_mmq_tile<64,  64 >(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
+        default: launch_mmq_tile<64,  128>(Wdev, g_q8, g_ids, y, M, N, nbk, npad, stream); break;
     }
 }
 }  // namespace jllm
