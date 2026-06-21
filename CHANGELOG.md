@@ -1,5 +1,50 @@
 # Changelog
 
+## v1.3.0 — 2026-06-21
+
+**Split-K (flash-decoding) decode attention** — fixes genie's decode-at-depth
+collapse and pushes decode *past* llama.cpp at every context depth.
+
+The decode-attention kernels launched `grid=(n_heads)` — only 8 blocks on the
+8-SM Orin (ncu: ~11 % occupancy, 3 % throughput), and each per-head block
+walked the whole KV serially, so decode throughput fell off a cliff with
+context depth. Split-K splits the KV range across `n_splits` blocks per head
+(grid `n_heads × n_splits`), each computing an online-softmax partial
+(`m`, `l`, unnormalized `acc`) over its slice; a reduce kernel combines them
+per head. This fills the SMs at depth. Default-on; `JLLM_SPLITK=0` reverts.
+
+### Performance — Gemma 4 E2B Q4_K_M, Orin Nano Super (MAXN_SUPER)
+
+Decode tok/s at depth (same machine, same model, same power state):
+
+| Context depth | v1.2.1 (no split-K) | **v1.3.0 (split-K)** | llama.cpp `tg` | v1.3.0 vs llama |
+| ------------- | ------------------- | -------------------- | -------------- | --------------- |
+| ~512          | 25.7 | **31.8** | 20.1 | **1.58×** |
+| ~1024         | 19.7 | **30.5** | 20.8 | **1.47×** |
+| ~2048         | 14.2 | **26.8** | 20.4 | **1.31×** |
+| ~4096         | 8.6  | **21.0** | 19.1 | **1.10×** |
+
+Without split-K, genie fell from rough parity at 512 to **2.2× behind**
+llama.cpp at 4096 (8.6 vs 19.1). With it, genie is **ahead at every depth**.
+Shallow decode is unchanged (the single-block kernel is kept below 64 tokens,
+where its launch is cheaper). The win grows with depth as attention's share of
+the per-token cost grows.
+
+### perf(attn): split-K decode attention
+
+- `flash_decode_splitk_partial_kernel` (grid `n_heads × n_splits`) +
+  `flash_decode_reduce_kernel`, wired into both decode paths: the per-step
+  `flash_attention_decode` picks `n_splits` from the sequence length;
+  `flash_attention_decode_dyn` (CUDA graph) takes the split count baked at
+  capture from the capture-time position (the grid is fixed in the captured
+  graph; the kernel still derives each split's KV range from `*d_pos` at
+  replay). Partials live in a lazily-allocated buffer, pre-allocated before
+  graph capture.
+- Handles FP16 + INT8 KV, Gemma's `cache_head_dim` sliding layers, and the
+  sliding-window mask. Numerically exact vs the single-block kernel (standalone
+  `tests/test_flash_decode_splitk.cu`: max abs diff 0.0, 3.2–7.3× faster at
+  seq 512–4096). `n_splits` policy: < 64 → single-block, 64–127 → 4, ≥ 128 → 8.
+
 ## v1.2.1 — 2026-06-21
 
 Fixes the **Gemma 4 E2B decode CUDA-graph path** and enables it for the E2B
