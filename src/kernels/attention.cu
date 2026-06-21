@@ -957,9 +957,18 @@ float* get_splitk_partials(int n_heads, int n_splits, int head_dim) {
     return buf;
 }
 
+static bool splitk_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_SPLITK");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 // n_splits policy from the standalone crossover sweep: <64 the single-block
 // kernel wins (split-K launch overhead); 64-127 → 4; ≥128 → 8.
 int decode_attn_splits(int seq_len) {
+    if (!splitk_enabled()) return 1;
     if (seq_len < 64)  return 1;
     if (seq_len < 128) return 4;
     return 8;
