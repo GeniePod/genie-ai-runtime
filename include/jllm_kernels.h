@@ -391,8 +391,16 @@ void flash_attention_decode_dyn(
     bool           kv_int8,
     const float*   kv_scales,
     int            window,     // 0 = full attention; > 0 = Gemma4 sliding mask
+    int            n_splits,   // >1 = split-K (flash-decoding); 1 = single-block kernel
     cudaStream_t   stream
 );
+
+// Split-K (flash-decoding) decode helpers. decode_attn_splits picks the split
+// count from the sequence length; get_splitk_partials returns the lazily
+// (cudaMalloc) allocated partials scratch — call it once before CUDA-graph
+// capture (cudaMalloc is illegal during stream capture).
+int    decode_attn_splits(int seq_len);
+float* get_splitk_partials(int n_heads, int n_splits, int head_dim);
 
 // ── Softmax (standalone, for logits) ─────────────────────────────────────
 void softmax_inplace(

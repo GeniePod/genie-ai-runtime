@@ -1579,7 +1579,7 @@ void Engine::transformer_layer_graph(int layer, half* x) {
                                config_.head_dim, config_.head_dim,
                                d_pos_, scale,
                                /*kv_int8=*/false, /*kv_scales=*/nullptr,
-                               /*window=*/0, stream_);
+                               /*window=*/0, graph_attn_splits_, stream_);
 
     gemv_quant(attn_proj, lw.wo, lw.type_wo, attn_out, H, Q_DIM, stream_);
     vec_add(x2, x, attn_proj, H, stream_);
@@ -1695,7 +1695,7 @@ void Engine::transformer_layer_graph_gemma4(int layer, half* x) {
                                config_.n_heads, config_.n_kv_heads,
                                hd, config_.head_dim, d_pos_, scale,
                                /*kv_int8=*/false, /*kv_scales=*/nullptr,
-                               attn_window, stream_);
+                               attn_window, graph_attn_splits_, stream_);
 
     half* wo_out = (half*)scratch_.get(H * sizeof(half));
     half* x2     = (half*)scratch_.get(H * sizeof(half));
@@ -2311,6 +2311,22 @@ void Engine::build_cuda_graph(int pos) {
             }
         }
         gemma_ple_input_ = gemma_ple_graph_buf_;
+    }
+
+    // Split-K decode attention: the grid (n_heads × n_splits) is baked into the
+    // captured graph, so choose the split count ONCE from the capture-time pos
+    // (== sequence length at capture). The kernel still computes each split's
+    // KV range from *d_pos at replay, so it stays correct as the sequence
+    // grows. Pre-allocate the partials buffer now — cudaMalloc is illegal
+    // during stream capture. Short contexts keep the single-block kernel
+    // (n_splits==1), preserving the shallow-decode graph win.
+    graph_attn_splits_ = decode_attn_splits(pos + 1);
+    if (graph_attn_splits_ > 1) {
+        if (!get_splitk_partials(config_.n_heads, graph_attn_splits_, config_.head_dim)) {
+            fprintf(stderr, "[engine] decode-graph: split-K partials alloc failed; "
+                    "using single-block attention in the graph\n");
+            graph_attn_splits_ = 1;
+        }
     }
 
     // Reset scratch so the captured allocation pattern matches what

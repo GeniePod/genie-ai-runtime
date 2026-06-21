@@ -794,14 +794,210 @@ __global__ void flash_attention_decode_kernel_dyn(
         output[head * head_dim + d] = __float2half(s_out[d] * inv_sum);
 }
 
+// ── Split-K (flash-decoding) decode attention ────────────────────────────────
+// The decode kernels above launch grid=(n_heads) — only n_heads blocks (8 on
+// the Orin, 1 per head), so the SMs sit ~11% occupied (ncu) and each per-head
+// block walks the whole KV serially → decode degrades badly with depth. Split-K
+// splits the KV range across n_splits blocks per head (grid n_heads*n_splits),
+// each computing an online-softmax PARTIAL (m, l, unnormalized acc) over its
+// slice; flash_decode_reduce_kernel then combines the partials per head. This
+// fills the SMs at depth (standalone: exact match to the naive kernel, 3-7×
+// faster at seq 512-4096). seq_len comes from *d_pos (graph path) or the
+// seq_len_static arg (per-step path).
+__global__ void flash_decode_splitk_partial_kernel(
+    float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+    const half* __restrict__ q, const void* __restrict__ k_cache, const void* __restrict__ v_cache,
+    int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
+    int seq_len_static, const int* __restrict__ d_pos,
+    int n_splits, float scale, bool kv_int8,
+    const float* __restrict__ k_scales, const float* __restrict__ v_scales, int window)
+{
+    const int head    = blockIdx.x;
+    const int split   = blockIdx.y;
+    const int kv_head = head / (n_heads / n_kv_heads);
+    const int tid     = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane    = tid & 31;
+    const int kv_dim  = n_kv_heads * cache_head_dim;
+    const int kv_hoff = kv_head * cache_head_dim;
+    const int seq_len = d_pos ? (*d_pos + 1) : seq_len_static;
+    const int per     = (seq_len + n_splits - 1) / n_splits;
+    const int kv0     = split * per;
+    const int kv1     = min(kv0 + per, seq_len);
+    const int pbase   = head * n_splits + split;
+
+    extern __shared__ float smem[];
+    float* s_scores = smem;
+    float* s_out    = smem + ATTN_TILE_KV;
+    float* s_q      = smem + ATTN_TILE_KV + head_dim;
+    __shared__ float s_running_max, s_running_sum, s_correction, s_red[4];
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        s_out[d] = 0.0f;
+        s_q[d]   = __half2float(q[head * head_dim + d]);
+    }
+    if (tid == 0) { s_running_max = -FLT_MAX; s_running_sum = 0.0f; s_correction = 1.0f; }
+    __syncthreads();
+
+    if (kv0 >= kv1) {   // empty split (seq_len < n_splits, or fully past the end)
+        if (tid == 0) { part_m[pbase] = -FLT_MAX; part_l[pbase] = 0.0f; }
+        for (int d = tid; d < head_dim; d += blockDim.x)
+            part_acc[(int64_t)pbase * head_dim + d] = 0.0f;
+        return;
+    }
+
+    for (int kv_start = kv0; kv_start < kv1; kv_start += ATTN_TILE_KV) {
+        int tile_len = min(ATTN_TILE_KV, kv1 - kv_start);
+        for (int t = warp_id; t < tile_len; t += (blockDim.x >> 5)) {
+            int kv_pos = kv_start + t;
+            if (window > 0 && kv_pos < seq_len - window) {
+                if (lane == 0) s_scores[t] = -INFINITY;
+                continue;
+            }
+            float dot = 0.0f;
+            if (kv_int8) {
+                const int8_t* kr = (const int8_t*)k_cache + (int64_t)kv_pos * kv_dim + kv_hoff;
+                float ks = k_scales ? k_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
+                for (int d = lane; d < head_dim; d += 32) dot += s_q[d] * (kr[d] * ks);
+            } else {
+                const half* kr = (const half*)k_cache + (int64_t)kv_pos * kv_dim + kv_hoff;
+                for (int d = lane; d < head_dim; d += 32) dot += s_q[d] * __half2float(kr[d]);
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) s_scores[t] = dot * scale;
+        }
+        __syncthreads();
+        float lmax = -FLT_MAX;
+        for (int t = tid; t < tile_len; t += blockDim.x) lmax = fmaxf(lmax, s_scores[t]);
+        float tile_max = block_max_f(lmax, s_red, warp_id, lane);
+        if (tid == 0) {
+            const float om = s_running_max;
+            s_running_max = fmaxf(s_running_max, tile_max);
+            s_correction  = expf(om - s_running_max);
+            s_running_sum *= s_correction;
+        }
+        __syncthreads();
+        for (int d = tid; d < head_dim; d += blockDim.x) s_out[d] *= s_correction;
+        float lsum = 0.0f;
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            float p = expf(s_scores[t] - s_running_max); s_scores[t] = p; lsum += p;
+        }
+        float tile_sum = block_sum_f(lsum, s_red, warp_id, lane);
+        if (tid == 0) s_running_sum += tile_sum;
+        __syncthreads();
+        for (int d = tid; d < head_dim; d += blockDim.x) {
+            float val = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                int kv_pos = kv_start + t; float vv;
+                if (kv_int8) {
+                    const int8_t* vi = (const int8_t*)v_cache;
+                    float vs = v_scales ? v_scales[(int64_t)kv_pos * n_kv_heads + kv_head] : 1.0f;
+                    vv = vi[(int64_t)kv_pos * kv_dim + kv_hoff + d] * vs;
+                } else {
+                    const half* vf = (const half*)v_cache;
+                    vv = __half2float(vf[(int64_t)kv_pos * kv_dim + kv_hoff + d]);
+                }
+                val += s_scores[t] * vv;
+            }
+            s_out[d] += val;
+        }
+        __syncthreads();
+    }
+    // Write the UNNORMALIZED partial (acc is sum p*V, not divided by l).
+    if (tid == 0) { part_m[pbase] = s_running_max; part_l[pbase] = s_running_sum; }
+    for (int d = tid; d < head_dim; d += blockDim.x)
+        part_acc[(int64_t)pbase * head_dim + d] = s_out[d];
+}
+
+// Combine n_splits partials per head: M = max m_s; out = Σ acc_s·e^{m_s-M} / Σ l_s·e^{m_s-M}.
+__global__ void flash_decode_reduce_kernel(
+    half* __restrict__ output, const float* __restrict__ part_m,
+    const float* __restrict__ part_l, const float* __restrict__ part_acc,
+    int n_heads, int head_dim, int n_splits)
+{
+    const int head = blockIdx.x;
+    const int tid  = threadIdx.x;
+    __shared__ float M, L;
+    if (tid == 0) {
+        float m = -FLT_MAX;
+        for (int s = 0; s < n_splits; s++) m = fmaxf(m, part_m[head * n_splits + s]);
+        float l = 0.0f;
+        for (int s = 0; s < n_splits; s++) l += part_l[head * n_splits + s] * expf(part_m[head * n_splits + s] - m);
+        M = m; L = l;
+    }
+    __syncthreads();
+    float inv = (L > 0.0f) ? 1.0f / L : 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_splits; s++) {
+            int pb = head * n_splits + s;
+            acc += part_acc[(int64_t)pb * head_dim + d] * expf(part_m[pb] - M);
+        }
+        output[head * head_dim + d] = __float2half(acc * inv);
+    }
+}
+
+// Lazily-allocated partials buffer (pm | pl | pacc), reused across layers/tokens.
+// Safe in a CUDA graph: each layer's partial+reduce run sequentially on the
+// stream before the next layer reuses it (like the scratch arena). Must be
+// allocated BEFORE stream capture (cudaMalloc is illegal during capture).
+float* get_splitk_partials(int n_heads, int n_splits, int head_dim) {
+    static float* buf = nullptr;
+    static size_t  cap = 0;
+    size_t floats = (size_t)n_heads * n_splits * 2
+                  + (size_t)n_heads * n_splits * head_dim;
+    if (floats > cap) {
+        if (buf) cudaFree(buf);
+        if (cudaMalloc((void**)&buf, floats * sizeof(float)) != cudaSuccess) {
+            buf = nullptr; cap = 0; return nullptr;
+        }
+        cap = floats;
+    }
+    return buf;
+}
+
+static bool splitk_enabled() {
+    static const bool enabled = [] {
+        const char* v = getenv("JLLM_SPLITK");
+        return !v || strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// n_splits policy from the standalone crossover sweep: <64 the single-block
+// kernel wins (split-K launch overhead); 64-127 → 4; ≥128 → 8.
+int decode_attn_splits(int seq_len) {
+    if (!splitk_enabled()) return 1;
+    if (seq_len < 64)  return 1;
+    if (seq_len < 128) return 4;
+    return 8;
+}
+
 void flash_attention_decode_dyn(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
     const int* d_pos,
-    float scale, bool kv_int8, const float* kv_scales, int window,
+    float scale, bool kv_int8, const float* kv_scales, int window, int n_splits,
     cudaStream_t stream)
 {
     const int smem = (ATTN_TILE_KV + 2 * head_dim) * (int)sizeof(float);
+    if (n_splits > 1) {
+        float* pm = get_splitk_partials(n_heads, n_splits, head_dim);
+        if (pm) {
+            float* pl   = pm + (size_t)n_heads * n_splits;
+            float* pacc = pm + (size_t)n_heads * n_splits * 2;
+            dim3 grid(n_heads, n_splits);
+            flash_decode_splitk_partial_kernel<<<grid, ATTN_BLOCK, smem, stream>>>(
+                pm, pl, pacc, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
+                cache_head_dim, /*seq_len_static=*/0, d_pos, n_splits, scale,
+                kv_int8, kv_scales, kv_scales, window);
+            flash_decode_reduce_kernel<<<n_heads, ATTN_BLOCK, 0, stream>>>(
+                output, pm, pl, pacc, n_heads, head_dim, n_splits);
+            return;
+        }
+        // fall through to the single-block kernel if the buffer alloc failed
+    }
     flash_attention_decode_kernel_dyn<<<n_heads, ATTN_BLOCK, smem, stream>>>(
         output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, cache_head_dim,
         d_pos, scale, kv_int8, kv_scales, window);
@@ -821,9 +1017,23 @@ void flash_attention_decode(
         }
 
         const int smem = (ATTN_TILE_KV + 2 * head_dim) * (int)sizeof(float);
-        flash_attention_decode_kernel<<<n_heads, ATTN_BLOCK, smem, stream>>>(
-            output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, cache_head_dim,
-            seq_len, scale, kv_int8, k_scales, v_scales, window);
+        const int n_splits = decode_attn_splits(seq_len);
+        float* pm = (n_splits > 1) ? get_splitk_partials(n_heads, n_splits, head_dim) : nullptr;
+        if (pm) {
+            float* pl   = pm + (size_t)n_heads * n_splits;
+            float* pacc = pm + (size_t)n_heads * n_splits * 2;
+            dim3 grid(n_heads, n_splits);
+            flash_decode_splitk_partial_kernel<<<grid, ATTN_BLOCK, smem, stream>>>(
+                pm, pl, pacc, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
+                cache_head_dim, seq_len, /*d_pos=*/nullptr, n_splits, scale,
+                kv_int8, k_scales, v_scales, window);
+            flash_decode_reduce_kernel<<<n_heads, ATTN_BLOCK, 0, stream>>>(
+                output, pm, pl, pacc, n_heads, head_dim, n_splits);
+        } else {
+            flash_attention_decode_kernel<<<n_heads, ATTN_BLOCK, smem, stream>>>(
+                output, q, k_cache, v_cache, n_heads, n_kv_heads, head_dim, cache_head_dim,
+                seq_len, scale, kv_int8, k_scales, v_scales, window);
+        }
 
         cudaError_t err = cudaGetLastError();
         if (err == cudaSuccess) {
