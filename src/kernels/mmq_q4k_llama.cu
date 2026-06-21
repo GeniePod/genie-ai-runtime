@@ -490,10 +490,11 @@ static void launch_mmq_tile(const void* Wdev, const int* g_q8, const int* g_ids,
     }
 }
 
-// Tile (MX×MY) selection. Default 64×128 (the shipped config). JLLM_MMQ_TILE
-// overrides for in-engine autotuning sweeps: 0=64x128, 1=128x64, 2=128x128,
-// 3=64x64. mmq_x (=MX, the token-tile width) amortizes the weight unpack over
-// more columns; on the 8-SM Orin bigger tiles trade occupancy for amortization.
+// mmq_x (=MX, the token-tile width) selection; MY is fixed at 128 (the MMA tile
+// structure requires mmq_y == nwarps*tile_C::I == 8*16 == 128). A wider mmq_x
+// amortizes the weight unpack over more token columns but uses more registers
+// (sum[mmq_x*mmq_y/256]) and shared mem; narrower mmq_x raises occupancy on the
+// 8-SM Orin. Default 64. JLLM_MMQ_TILE: 0=64, 1=128, 2=32.
 static int mmq_tile_choice() {
     static const int t = [] {
         const char* v = getenv("JLLM_MMQ_TILE");
@@ -508,7 +509,7 @@ namespace jllm {
 void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
                         int M, int N, int K, cudaStream_t stream) {
     const int choice = mmq_tile_choice();
-    const int MX = (choice == 0 || choice == 3) ? 64 : 128;
+    const int MX = (choice == 1) ? 128 : (choice == 2) ? 32 : 64;
     const int npad = ((N + MX - 1)/MX)*MX;
     const int nkb128 = K/128;
 
@@ -531,9 +532,8 @@ void gemm_q4k_mmq_llama(half* y, const void* W, const half* x,
     // write_back emits half directly into y (no f32 staging buffer / convert kernel).
     const int* q8 = (const int*)g_q8;
     switch (choice) {
-        case 1:  launch_mmq_tile<128, 64 >(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
-        case 2:  launch_mmq_tile<128, 128>(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
-        case 3:  launch_mmq_tile<64,  64 >(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
+        case 1:  launch_mmq_tile<128, 128>(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
+        case 2:  launch_mmq_tile<32,  128>(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
         default: launch_mmq_tile<64,  128>(Wdev, q8, g_ids, y, M, N, nbk, npad, stream); break;
     }
 }
