@@ -594,6 +594,26 @@ static bool launch_attn_cublas_prefill(
     return true;
 }
 
+// Short-prefill dispatch: the fused F32 query-tiled kernel beats the cuBLAS
+// path for small query-batches N because cuBLAS's per-call overhead (handle
+// setup, ~70 batched-GEMM + softmax launches/layer, score-buffer traffic)
+// dominates at small N. Measured on Orin (gemma-4-E2B): F32-tiled is 2.3× at
+// N~76, 1.6× at ~236, ~parity by ~768; cuBLAS wins beyond. So use the fused
+// kernel below the crossover and cuBLAS above it. JLLM_ATTN_SHORT_TILED=0
+// disables; JLLM_ATTN_CROSSOVER overrides the threshold.
+static bool short_tiled_enabled() {
+    static const bool e = [] {
+        const char* v = getenv("JLLM_ATTN_SHORT_TILED"); return !v || v[0] != '0';
+    }();
+    return e;
+}
+static int attn_short_crossover() {
+    static const int c = [] {
+        const char* v = getenv("JLLM_ATTN_CROSSOVER"); return v ? atoi(v) : 768;
+    }();
+    return c;
+}
+
 void flash_attention_prefill_batched(
     half* output, const half* q, const void* k_cache, const void* v_cache,
     int n_heads, int n_kv_heads, int head_dim, int cache_head_dim,
@@ -602,6 +622,16 @@ void flash_attention_prefill_batched(
     const float* k_scales, const float* v_scales, int window, cudaStream_t stream)
 {
     if (N <= 0) return;
+    // Short context: the fused F32 query-tiled kernel beats cuBLAS (see above).
+    // The cost per output is ~ seq_len (key count), so dispatch on the total
+    // sequence length start_pos+N, NOT the query-batch N: a late chunk of a
+    // long prompt has small N but a large key count, where cuBLAS still wins.
+    // Try the fused kernel first below the crossover; fall back to cuBLAS.
+    if (short_tiled_enabled() && !kv_int8 && (start_pos + N) < attn_short_crossover() &&
+        launch_flash_attn_prefill_tc(output, q, k_cache, v_cache, n_heads,
+            n_kv_heads, head_dim, cache_head_dim, N, start_pos, scale, window, stream)) {
+        return;
+    }
     // Tensor-core cuBLAS prefill attention (FP16 KV + MQA); falls back if unsupported.
     if (attn_cublas_enabled() && !kv_int8 &&
         launch_attn_cublas_prefill(output, q, k_cache, v_cache, n_heads, n_kv_heads,
