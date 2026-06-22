@@ -8,8 +8,11 @@
 // pointer (caller resolves host-mapped weights via resolve_weight_device_ptr).
 #include <mma.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 using namespace nvcuda;
 
 namespace jllm {
@@ -79,6 +82,57 @@ bool gemm_dense_tc(half* out, const void* Wdev, int wtype, const half* x,
     dim3 grid((M + BM - 1)/BM, (N + BN - 1)/BN), block(WM*WN*32);
     dense_gemm_wmma_kernel<WM,WN><<<grid, block, 0, stream>>>(out, Wdev, wtype, x, M, N, K);
     return true;
+}
+
+// ── cuBLAS dense GEMM (F16/BF16 weights) ─────────────────────────────────────
+// The wmma kernel above accumulates through shared memory and stalls (ncu:
+// ~5.5% TC util, 44% SM throughput at large N), so cuBLAS's tuned GEMM is much
+// faster for the big batched projections (Gemma's PLE model_proj is BF16).
+// Default on; JLLM_DENSE_CUBLAS=0 reverts to the wmma kernel. F32 weights stay
+// on wmma (returns false). out[N×M] row-major = x[N×K]·W[M×K]^T, computed as
+// the column-major [M×N] = opT(W[K×M]) · opN(x[K×N]).
+bool dense_cublas_enabled() {
+    static int e = -1;
+    if (e < 0) { const char* v = getenv("JLLM_DENSE_CUBLAS"); e = (v && v[0] == '0') ? 0 : 1; }
+    return e;
+}
+
+__global__ void f16_to_bf16_kernel(__nv_bfloat16* __restrict__ out,
+                                   const half* __restrict__ in, int64_t n) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __float2bfloat16(__half2float(in[i]));
+}
+
+bool gemm_dense_cublas(half* out, const void* Wdev, int wtype, const half* x,
+                       int M, int N, int K, cudaStream_t stream) {
+    if (wtype != 1 && wtype != 30) return false;   // F16 / BF16 only
+    static cublasHandle_t h = nullptr;
+    if (!h) { if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) { h = nullptr; return false; } }
+    cublasSetStream(h, stream);
+
+    cudaDataType_t wt, xt;
+    const void* xptr = x;
+    if (wtype == 30) {                  // BF16 weight: convert activations to BF16
+        static __nv_bfloat16* xbf = nullptr; static size_t cap = 0;
+        size_t n = (size_t)N * K;
+        if (n > cap) {
+            if (xbf) cudaFree(xbf);
+            if (cudaMalloc(&xbf, n * sizeof(__nv_bfloat16)) != cudaSuccess) { xbf = nullptr; cap = 0; return false; }
+            cap = n;
+        }
+        int t = 256; int64_t b = ((int64_t)n + t - 1) / t;
+        f16_to_bf16_kernel<<<b, t, 0, stream>>>(xbf, x, n);
+        wt = CUDA_R_16BF; xt = CUDA_R_16BF; xptr = xbf;
+    } else {                            // F16 weight
+        wt = CUDA_R_16F; xt = CUDA_R_16F;
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t s = cublasGemmEx(
+        h, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
+        &alpha, Wdev, wt, K, xptr, xt, K,
+        &beta,  out, CUDA_R_16F, M,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    return s == CUBLAS_STATUS_SUCCESS;
 }
 
 }  // namespace jllm

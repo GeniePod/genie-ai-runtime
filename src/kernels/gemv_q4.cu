@@ -2872,11 +2872,17 @@ __global__ void gemm_dense_batched_kernel(half* __restrict__ out,
 bool dense_tc_enabled();
 bool gemm_dense_tc(half* out, const void* Wdev, int wtype, const half* x,
                    int M, int N, int K, cudaStream_t stream);
+bool dense_cublas_enabled();
+bool gemm_dense_cublas(half* out, const void* Wdev, int wtype, const half* x,
+                       int M, int N, int K, cudaStream_t stream);
 
 void gemm_dense_batched(half* out, const void* W, int wtype, const half* x,
                         int M, int N, int K, cudaStream_t stream) {
     if (N == 1) { gemv_dense(out, W, wtype, x, M, K, stream); return; }
     const void* Wd = resolve_weight_device_ptr(W);
+    // cuBLAS tuned GEMM for F16/BF16 weights (big batched PLE projections);
+    // falls through to the wmma kernel for F32 or on failure.
+    if (dense_cublas_enabled() && gemm_dense_cublas(out, Wd, wtype, x, M, N, K, stream)) return;
     // Tensor-core path (W already device-resolved); falls back if shape unhandled.
     if (dense_tc_enabled() && gemm_dense_tc(out, Wd, wtype, x, M, N, K, stream)) return;
     const int rpb = gemv_rows_per_block();
