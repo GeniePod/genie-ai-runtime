@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.3.1 — 2026-06-22
+
+**Short-prefill TTFT win** — fused attention for short prompts.
+
+The default cuBLAS prefill attention has heavy per-call overhead (cuBLAS
+handle setup, ~70 batched-GEMM + softmax launches per layer, N×N score-buffer
+traffic) that dominates at small sequence length, making short-prompt prefill
+slow. The fused F32 query-tiled kernel (one launch per layer, no N×N
+materialization) is much faster there. `flash_attention_prefill_batched` now
+dispatches the fused kernel below a ~768-token crossover and cuBLAS above it
+(cuBLAS's tensor-core GEMMs win at long context). `JLLM_ATTN_SHORT_TILED=0`
+disables; `JLLM_ATTN_CROSSOVER` overrides the threshold.
+
+### Performance — Gemma 4 E2B Q4_K_M, Orin Nano Super (MAXN_SUPER)
+
+Prefill tok/s (cuBLAS-only → length-dispatch):
+
+| Prefill length | before | after | Δ |
+| -------------- | ------ | ----- | --- |
+| ~76   | 224 | **461** | **2.05×** |
+| ~236  | 475 | **690** | **1.45×** |
+| ~547  | 587 | **632** | 1.08× |
+| ~1547 | 640 | 639 | — (no regression) |
+| ~4096 | 624 | 624 | — |
+| ~9098 | 537 | 537 | — |
+
+A typical 50–300-token interactive prompt now prefills ~1.4–2× faster (better
+TTFT). Long-context prefill is unchanged. vs llama.cpp's real cold prompt-eval
+(`llama-simple`), genie short-prefill is 2–7× faster — llama pays a ~1–2 s
+warmup that genie does not.
+
+The dispatch keys on the total sequence length (`start_pos + N`), not the
+query-batch size: a late chunk of a long chunked-prefill prompt has a small
+query batch but a large key count, where cuBLAS still wins. Output is
+unchanged (the fused kernel was already a validated GQA/INT8 fallback).
+
 ## v1.3.0 — 2026-06-21
 
 **Split-K (flash-decoding) decode attention** — fixes genie's decode-at-depth
